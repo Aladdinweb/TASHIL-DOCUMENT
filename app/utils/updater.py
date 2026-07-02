@@ -1,7 +1,7 @@
 # COPYRIGHT ILINE TECH 2026 BY FERAK ALADDIN
 """
-Updater — Téléchargement et remplacement automatique
-Thread-safe, zéro blocage GUI.
+Updater TASHIL — Fix [Errno 13] Permission denied
+Télécharge dans %TEMP% au lieu du dossier exe.
 """
 import sys
 import os
@@ -12,7 +12,7 @@ import subprocess
 import datetime
 
 GITHUB_OWNER = "Aladdinweb"
-GITHUB_REPO  = "epsp-conge-manager"
+GITHUB_REPO  = "TASHIL-ES"
 GITHUB_API   = (
     f"https://api.github.com/repos/"
     f"{GITHUB_OWNER}/{GITHUB_REPO}"
@@ -21,24 +21,17 @@ GITHUB_API   = (
 
 
 def obtenir_derniere_version() -> dict | None:
-    """
-    Interroge l'API GitHub Releases.
-    Retourne dict ou None si erreur.
-    NE PAS appeler depuis le thread GUI.
-    """
     try:
         req = urllib.request.Request(
             GITHUB_API,
             headers={
-                "User-Agent": (
-                    "EPSP-CongeManager-Updater/1.0"),
-                "Accept": (
-                    "application/vnd.github+json"),
+                "User-Agent": "TASHIL-Updater/1.0",
+                "Accept": "application/vnd.github+json",
             })
         with urllib.request.urlopen(
                 req, timeout=12) as resp:
-            raw  = resp.read().decode("utf-8")
-            data = json.loads(raw)
+            data = json.loads(
+                resp.read().decode("utf-8"))
 
         tag    = data.get("tag_name", "")
         assets = data.get("assets", [])
@@ -53,19 +46,17 @@ def obtenir_derniere_version() -> dict | None:
                 break
 
         return {
-            "tag":    tag,
-            "url_exe":url_exe,
-            "taille": taille,
-            "notes":  data.get("body", "")[:400],
+            "tag":     tag,
+            "url_exe": url_exe,
+            "taille":  taille,
+            "notes":   data.get("body", "")[:400],
         }
-
     except Exception as ex:
         print(f"[Updater] API error: {ex}")
         return None
 
 
 def version_plus_recente(tag_distant: str) -> bool:
-    """Compare tag GitHub avec version locale."""
     try:
         from app.utils.version import get_version
 
@@ -81,63 +72,55 @@ def version_plus_recente(tag_distant: str) -> bool:
 
 
 def verifier_en_arriere_plan(callback):
-    """
-    Vérifie la version dans un thread daemon.
-    callback(info | None) appelé ensuite.
-    GUI doit router via root.after().
-    """
     def _worker():
         info = obtenir_derniere_version()
         callback(info)
-
-    t = threading.Thread(
-        target=_worker, daemon=True)
-    t.start()
+    threading.Thread(
+        target=_worker, daemon=True).start()
 
 
 def telecharger_et_remplacer(
         url_exe: str,
         callback_progres=None,
         callback_fin=None):
-    """
-    Télécharge le nouvel exe dans un thread daemon.
-    Crée un script .bat qui :
-      1. Attend la fermeture de l'app
-      2. Remplace l'exe
-      3. Relance automatiquement
-    callback_progres(int 0-100) : progression
-    callback_fin(bool ok, str err) : résultat
-    """
+
     def _worker():
         tmp_path = None
         bat_path = None
         try:
-            # ── Chemins ──────────────────────────
+            # ── Chemin exe actuel ─────────────
             if getattr(sys, 'frozen', False):
                 exe_actuel = sys.executable
             else:
-                # Mode dev : dossier courant
-                exe_actuel = os.path.join(
-                    os.path.dirname(
-                        os.path.abspath(__file__)),
-                    "..", "..",
-                    "EPSP_CongeManager.exe")
                 exe_actuel = os.path.abspath(
-                    exe_actuel)
+                    "EPSP_CongeManager.exe")
 
-            dossier  = os.path.dirname(exe_actuel)
-            today    = datetime.date.today().strftime(
-                "%Y%m%d")
+            exe_actuel   = os.path.abspath(exe_actuel)
+            dossier_exe  = os.path.dirname(exe_actuel)
+
+            # ── FIX [Errno 13] ────────────────
+            # Toujours télécharger dans %TEMP%
+            # jamais dans le dossier de l'exe
+            # (Desktop = permission denied)
+            temp_dir = (
+                os.environ.get("TEMP")
+                or os.environ.get("TMP")
+                or os.path.expanduser("~"))
+
+            today = datetime.datetime.now().strftime(
+                "%Y%m%d_%H%M%S")
+
             tmp_path = os.path.join(
-                dossier, "_update_downloading.exe")
-            bak_path = os.path.join(
-                dossier, f"_bak_{today}.exe")
+                temp_dir,
+                f"tashil_update_{today}.exe")
             bat_path = os.path.join(
-                dossier, "_update_launcher.bat")
+                temp_dir,
+                f"tashil_update_{today}.bat")
+            bak_path = os.path.join(
+                dossier_exe,
+                f"_bak_{today}.exe")
 
-            os.makedirs(dossier, exist_ok=True)
-
-            # ── Téléchargement ───────────────────
+            # ── Téléchargement dans TEMP ──────
             def _hook(count, block, total):
                 if callback_progres and total > 0:
                     pct = min(
@@ -152,91 +135,77 @@ def telecharger_et_remplacer(
             if callback_progres:
                 callback_progres(100)
 
-            # ── Vérifier que le fichier existe ───
+            # Vérifier intégrité
             if not os.path.exists(tmp_path):
                 raise FileNotFoundError(
                     "Fichier téléchargé introuvable.")
 
-            taille_dl = os.path.getsize(tmp_path)
-            if taille_dl < 1024 * 100:  # < 100 KB
+            taille = os.path.getsize(tmp_path)
+            if taille < 100 * 1024:
                 raise ValueError(
-                    f"Fichier trop petit "
-                    f"({taille_dl} octets). "
-                    "Téléchargement corrompu.")
+                    f"Fichier corrompu "
+                    f"({taille} octets).")
 
             if sys.platform != "win32":
                 if callback_fin:
                     callback_fin(
                         False,
-                        "Mise à jour auto Windows "
-                        "uniquement.")
+                        "MAJ auto Windows uniquement.")
                 return
 
-            # ── Script .bat ──────────────────────
-            bat = f"""@echo off
-chcp 65001 > nul
-title EPSP CongeManager - Mise a jour
+            # ── Script .bat robuste ───────────
+            bat = (
+                "@echo off\r\n"
+                "chcp 65001 > nul\r\n"
+                "title TASHIL - Mise a jour\r\n"
+                "echo ========================\r\n"
+                "echo  TASHIL - Installation\r\n"
+                "echo ========================\r\n"
+                "echo.\r\n"
+                "echo Attente fermeture TASHIL...\r\n"
+                "timeout /t 3 /nobreak > nul\r\n"
+                "\r\n"
+                ":WAIT\r\n"
+                "tasklist /fi \"IMAGENAME eq "
+                "EPSP_CongeManager.exe\" 2>nul"
+                " | find /i \"EPSP_CongeManager"
+                ".exe\" > nul\r\n"
+                "if %errorlevel% == 0 (\r\n"
+                "    timeout /t 1 /nobreak > nul\r\n"
+                "    goto WAIT\r\n"
+                ")\r\n"
+                "\r\n"
+                "echo Installation...\r\n"
+                f"if exist \"{exe_actuel}\" (\r\n"
+                f"    move /Y \"{exe_actuel}\""
+                f" \"{bak_path}\" > nul 2>&1\r\n"
+                ")\r\n"
+                "\r\n"
+                f"move /Y \"{tmp_path}\""
+                f" \"{exe_actuel}\" > nul 2>&1\r\n"
+                "if %errorlevel% neq 0 (\r\n"
+                "    echo ERREUR installation!\r\n"
+                f"    if exist \"{bak_path}\" (\r\n"
+                f"        move /Y \"{bak_path}\""
+                f" \"{exe_actuel}\" > nul 2>&1\r\n"
+                "    )\r\n"
+                "    pause\r\n"
+                "    goto END\r\n"
+                ")\r\n"
+                "\r\n"
+                "echo Reussi! Redemarrage...\r\n"
+                "timeout /t 2 /nobreak > nul\r\n"
+                f"start \"\" \"{exe_actuel}\"\r\n"
+                "\r\n"
+                ":END\r\n"
+                "del /f /q \"%~f0\" > nul 2>&1\r\n"
+            )
 
-echo ============================================
-echo  EPSP ES-SENIA - Mise a jour automatique
-echo ============================================
-echo.
-echo Attente de la fermeture de l'application...
-timeout /t 3 /nobreak > nul
-
-:WAIT_CLOSE
-tasklist /fi "IMAGENAME eq EPSP_CongeManager.exe" 2>nul | find /i "EPSP_CongeManager.exe" > nul
-if %errorlevel% == 0 (
-    timeout /t 1 /nobreak > nul
-    goto WAIT_CLOSE
-)
-
-echo Application fermee. Installation...
-
-if exist "{bak_path}" (
-    del /f /q "{bak_path}" 2>nul
-)
-
-if exist "{exe_actuel}" (
-    move /Y "{exe_actuel}" "{bak_path}" > nul 2>&1
-    if %errorlevel% neq 0 (
-        echo ERREUR: Impossible de sauvegarder l'ancien exe.
-        echo Restauration...
-        goto ERROR
-    )
-)
-
-move /Y "{tmp_path}" "{exe_actuel}" > nul 2>&1
-if %errorlevel% neq 0 (
-    echo ERREUR: Impossible de placer le nouvel exe.
-    if exist "{bak_path}" (
-        move /Y "{bak_path}" "{exe_actuel}" > nul 2>&1
-    )
-    goto ERROR
-)
-
-echo.
-echo Mise a jour reussie !
-echo Redemarrage dans 2 secondes...
-timeout /t 2 /nobreak > nul
-
-start "" "{exe_actuel}"
-del /f /q "%~f0" 2>nul
-exit /b 0
-
-:ERROR
-echo.
-echo La mise a jour a echoue.
-echo Veuillez relancer manuellement.
-pause
-del /f /q "%~f0" 2>nul
-exit /b 1
-"""
             with open(bat_path, "w",
-                      encoding="utf-8") as f:
+                      encoding="cp1252",
+                      errors="replace") as f:
                 f.write(bat)
 
-            # ── Lancer le .bat ───────────────────
             subprocess.Popen(
                 ["cmd.exe", "/c", bat_path],
                 creationflags=(
@@ -247,8 +216,8 @@ exit /b 1
                 callback_fin(True, "")
 
         except Exception as ex:
-            # Nettoyage fichier temp
-            if tmp_path and os.path.exists(tmp_path):
+            if tmp_path and os.path.exists(
+                    tmp_path):
                 try:
                     os.remove(tmp_path)
                 except Exception:
@@ -257,7 +226,5 @@ exit /b 1
             if callback_fin:
                 callback_fin(False, str(ex))
 
-    t = threading.Thread(
-        target=_worker, daemon=True)
-    t.start()
-    return t
+    threading.Thread(
+        target=_worker, daemon=True).start()
