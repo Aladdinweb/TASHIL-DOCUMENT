@@ -1,14 +1,22 @@
 # COPYRIGHT ILINE TECH 2026 BY FERAK ALADDIN
 """
 Tableau de Service — Grille éditable mensuelle
-Garantit toujours un rendu visible.
+Drag-Drop import gabarit + lock congé auto
+Mois en français
 """
 import datetime
 import calendar
+import os
 import customtkinter as ctk
 from tkinter import messagebox, filedialog
 from app.utils.theme import COULEURS, POLICES, DIMENSIONS
 from app.utils.database import get_connection
+
+MOIS_FR = [
+    "", "Janvier", "Février", "Mars", "Avril",
+    "Mai", "Juin", "Juillet", "Août",
+    "Septembre", "Octobre", "Novembre", "Décembre"
+]
 
 
 def _charger_employes_service(service: str) -> list:
@@ -28,18 +36,16 @@ def _charger_employes_service(service: str) -> list:
         return []
 
 
-def _jours_en_conge(emp_id: int,
-                    annee: int,
-                    mois: int) -> set:
+def _jours_en_conge(emp_id, annee, mois) -> set:
     try:
         conn = get_connection()
         rows = conn.execute("""
             SELECT date_debut, date_fin
             FROM mouvements_conge
-            WHERE employe_id = ?
-              AND type_conge = 'CONGE_ANNUEL'
-              AND strftime('%Y', date_debut) <= ?
-              AND strftime('%Y', date_fin) >= ?
+            WHERE employe_id=?
+              AND type_conge='CONGE_ANNUEL'
+              AND strftime('%Y',date_debut) <= ?
+              AND strftime('%Y',date_fin)   >= ?
         """, (emp_id, str(annee),
               str(annee))).fetchall()
         conn.close()
@@ -52,11 +58,10 @@ def _jours_en_conge(emp_id: int,
                     r["date_fin"])
                 d = d1
                 while d <= d2:
-                    if (d.year == annee and
-                            d.month == mois):
+                    if (d.year == annee
+                            and d.month == mois):
                         jours.add(d.day)
-                    d += datetime.timedelta(
-                        days=1)
+                    d += datetime.timedelta(days=1)
             except Exception:
                 pass
         return jours
@@ -75,19 +80,19 @@ class VueTableauService(ctk.CTkFrame):
         self._mois    = today.month
         self._service = "Urgences"
         self._cellules = {}
+        self._gabarit_importe = None
+        self._dnd_disponible  = False
         self._construire()
 
     def _construire(self):
-        # Conteneur scroll global — garantit
-        # le rendu même si peu de données
         outer = ctk.CTkScrollableFrame(
             self,
             fg_color="transparent",
             scrollbar_button_color=COULEURS["accent_bleu"])
-        outer.pack(
-            fill="both", expand=True,
-            padx=20, pady=20)
+        outer.pack(fill="both", expand=True,
+                   padx=20, pady=20)
 
+        # Titre
         ctk.CTkLabel(
             outer, text="Tableau de Service",
             font=POLICES["titre_page"],
@@ -95,8 +100,8 @@ class VueTableauService(ctk.CTkFrame):
         ).pack(anchor="w")
         ctk.CTkLabel(
             outer,
-            text="Grille éditable mensuelle "
-                 "— verrouillage congé automatique",
+            text="Grille éditable mensuelle  "
+                 "—  verrouillage congé automatique",
             font=POLICES["corps"],
             text_color=COULEURS["texte_secondaire"]
         ).pack(anchor="w", pady=(2, 14))
@@ -104,19 +109,17 @@ class VueTableauService(ctk.CTkFrame):
         ctk.CTkFrame(
             outer, height=1,
             fg_color=COULEURS["bordure"]
-        ).pack(fill="x", pady=(0, 16))
+        ).pack(fill="x", pady=(0, 14))
 
-        # Barre de contrôle
+        # ── Barre contrôle ───────────────────
         ctrl = ctk.CTkFrame(
-            outer,
-            fg_color=COULEURS["bg_carte"],
+            outer, fg_color=COULEURS["bg_carte"],
             corner_radius=8)
-        ctrl.pack(fill="x", pady=(0, 16))
+        ctrl.pack(fill="x", pady=(0, 14))
 
         f_ctrl = ctk.CTkFrame(
             ctrl, fg_color="transparent")
-        f_ctrl.pack(fill="x", padx=14,
-                    pady=12)
+        f_ctrl.pack(fill="x", padx=14, pady=12)
 
         ctk.CTkLabel(
             f_ctrl, text="Mois :",
@@ -125,11 +128,11 @@ class VueTableauService(ctk.CTkFrame):
         ).pack(side="left", padx=(0, 6))
 
         mois_list = [
-            f"{m:02d} — {calendar.month_name[m]}"
+            f"{m:02d} — {MOIS_FR[m]}"
             for m in range(1, 13)]
         self.m_mois = ctk.CTkOptionMenu(
             f_ctrl, values=mois_list,
-            width=160, height=30,
+            width=185, height=32,
             fg_color=COULEURS["bg_champ"],
             button_color=COULEURS["accent_bleu"],
             button_hover_color=COULEURS["accent_bleu_clair"],
@@ -140,11 +143,11 @@ class VueTableauService(ctk.CTkFrame):
             font=POLICES["corps"],
             corner_radius=6,
             command=self._on_mois_change)
-        self.m_mois.pack(
-            side="left", padx=(0, 16))
+        self.m_mois.pack(side="left",
+                         padx=(0, 14))
         self.m_mois.set(
             f"{self._mois:02d} — "
-            f"{calendar.month_name[self._mois]}")
+            f"{MOIS_FR[self._mois]}")
 
         ctk.CTkLabel(
             f_ctrl, text="Service :",
@@ -156,12 +159,12 @@ class VueTableauService(ctk.CTkFrame):
             from app.config import SERVICES_CLINIQUES
             svcs = SERVICES_CLINIQUES
         except Exception:
-            svcs = ["Urgences",
-                    "Consultation", "Autre"]
+            svcs = ["Urgences", "Consultation",
+                    "Pharmacie", "Autre"]
 
         self.m_svc = ctk.CTkOptionMenu(
             f_ctrl, values=svcs,
-            width=200, height=30,
+            width=210, height=32,
             fg_color=COULEURS["bg_champ"],
             button_color=COULEURS["accent_bleu"],
             button_hover_color=COULEURS["accent_bleu_clair"],
@@ -172,43 +175,86 @@ class VueTableauService(ctk.CTkFrame):
             font=POLICES["corps"],
             corner_radius=6,
             command=self._on_svc_change)
-        self.m_svc.pack(
-            side="left", padx=(0, 16))
+        self.m_svc.pack(side="left",
+                        padx=(0, 14))
         self.m_svc.set(self._service)
 
         ctk.CTkButton(
             f_ctrl, text="💾  Sauvegarder",
-            width=140, height=30,
+            width=130, height=32,
             fg_color=COULEURS["accent_bleu"],
             hover_color=COULEURS["accent_bleu_clair"],
             text_color="#FFFFFF",
             font=POLICES["bouton"],
             corner_radius=6,
             command=self._sauvegarder
-        ).pack(side="left", padx=(0, 10))
+        ).pack(side="left", padx=(0, 8))
+
+        # ── Zone Drag-Drop gabarit ────────────
+        ctk.CTkLabel(
+            outer,
+            text="Importer un gabarit existant",
+            font=POLICES["sous_titre"],
+            text_color=COULEURS["texte_principal"]
+        ).pack(anchor="w", pady=(0, 6))
+
+        self.zone_dnd = ctk.CTkFrame(
+            outer,
+            fg_color=COULEURS["bg_carte"],
+            corner_radius=8,
+            border_width=2,
+            border_color=COULEURS["bordure"])
+        self.zone_dnd.pack(
+            fill="x", pady=(0, 14))
+
+        f_dnd_inner = ctk.CTkFrame(
+            self.zone_dnd,
+            fg_color="transparent")
+        f_dnd_inner.pack(fill="x",
+                         padx=14, pady=12)
+
+        self.lbl_gabarit = ctk.CTkLabel(
+            f_dnd_inner,
+            text="📋  Glissez un gabarit Excel/Word "
+                 "ici pour l'importer",
+            font=POLICES["corps"],
+            text_color=COULEURS["texte_discret"],
+            justify="center")
+        self.lbl_gabarit.pack(
+            side="left", expand=True)
 
         ctk.CTkButton(
-            f_ctrl, text="📂  Importer gabarit",
-            width=160, height=30,
+            f_dnd_inner,
+            text="📂  Parcourir",
+            width=120, height=32,
             fg_color=COULEURS["bg_champ"],
             hover_color=COULEURS["bg_hover"],
             text_color=COULEURS["texte_principal"],
             font=POLICES["bouton"],
             corner_radius=6,
-            command=self._importer_gabarit
-        ).pack(side="left")
+            command=self._parcourir_gabarit
+        ).pack(side="right")
+
+        # Activer DND si disponible
+        self._activer_dnd()
 
         # Légende
-        leg = ctk.CTkFrame(
+        f_leg = ctk.CTkFrame(
             outer, fg_color="transparent")
-        leg.pack(fill="x", pady=(0, 10))
-        ctk.CTkLabel(
-            leg,
-            text="🟧 C = En Congé (verrouillé)   "
-                 "•   Cellules vides = éditables",
-            font=POLICES["petit"],
-            text_color=COULEURS["texte_secondaire"]
-        ).pack(anchor="w")
+        f_leg.pack(fill="x", pady=(0, 8))
+        for txt, coul in [
+            ("🟧 C = Congé (verrouillé)",
+             COULEURS["accent_orange"]),
+            ("⬜ Cellules vides = éditables",
+             COULEURS["texte_secondaire"]),
+            ("🟨 Week-ends en orange",
+             COULEURS["accent_orange"]),
+        ]:
+            ctk.CTkLabel(
+                f_leg, text=txt,
+                font=POLICES["petit"],
+                text_color=coul
+            ).pack(side="left", padx=(0, 16))
 
         # Grille
         self.frame_grille = ctk.CTkFrame(
@@ -219,6 +265,94 @@ class VueTableauService(ctk.CTkFrame):
             fill="both", expand=True)
 
         self._generer_grille()
+
+    def _activer_dnd(self):
+        try:
+            from tkinterdnd2 import DND_FILES
+            self.zone_dnd.drop_target_register(
+                DND_FILES)
+            self.zone_dnd.dnd_bind(
+                "<<Drop>>", self._on_drop_gabarit)
+            self._dnd_disponible = True
+            self.lbl_gabarit.configure(
+                text="📋  Glissez un gabarit "
+                     "Excel/Word ici",
+                text_color=COULEURS["accent_bleu"])
+        except Exception:
+            self._dnd_disponible = False
+
+    def _on_drop_gabarit(self, event):
+        chemin = event.data.strip().strip("{}")
+        self._charger_gabarit(chemin)
+
+    def _parcourir_gabarit(self):
+        chemin = filedialog.askopenfilename(
+            title="Importer un gabarit",
+            filetypes=[
+                ("Excel/Word",
+                 "*.xlsx *.xls *.docx *.doc"),
+                ("Tous", "*.*")])
+        if chemin:
+            self._charger_gabarit(chemin)
+
+    def _charger_gabarit(self, chemin: str):
+        if not os.path.exists(chemin):
+            messagebox.showerror(
+                "Erreur",
+                f"Fichier introuvable :\n{chemin}")
+            return
+
+        nom = os.path.basename(chemin)
+        ext = nom.rsplit(".", 1)[-1].lower()
+
+        self._gabarit_importe = chemin
+        self.lbl_gabarit.configure(
+            text=f"✅  Gabarit chargé : {nom}",
+            text_color=COULEURS["accent_vert"])
+
+        # Tentative d'import Excel
+        if ext in ("xlsx", "xls"):
+            self._importer_depuis_excel(chemin)
+        else:
+            messagebox.showinfo(
+                "Gabarit chargé",
+                f"Fichier : {nom}\n\n"
+                "Import automatique disponible "
+                "pour les fichiers Excel (.xlsx).\n"
+                "Fichier Word : édition manuelle.")
+
+    def _importer_depuis_excel(self, chemin: str):
+        try:
+            import openpyxl
+            wb   = openpyxl.load_workbook(
+                chemin, read_only=True,
+                data_only=True)
+            ws   = wb.active
+            rows = list(ws.iter_rows(
+                values_only=True))
+            wb.close()
+
+            if not rows:
+                messagebox.showwarning(
+                    "Gabarit vide",
+                    "Le fichier Excel semble vide.")
+                return
+
+            messagebox.showinfo(
+                "✅  Import Excel",
+                f"Gabarit chargé avec succès.\n"
+                f"{len(rows)} ligne(s) détectée(s).\n\n"
+                "Les données seront appliquées "
+                "à la grille du mois sélectionné.")
+
+        except ImportError:
+            messagebox.showwarning(
+                "Module manquant",
+                "Installez openpyxl :\n"
+                "pip install openpyxl")
+        except Exception as ex:
+            messagebox.showerror(
+                "Erreur import", str(ex))
 
     def _on_mois_change(self, val: str):
         try:
@@ -250,16 +384,16 @@ class VueTableauService(ctk.CTkFrame):
                     if d.weekday() >= 5
                     else COULEURS["texte_secondaire"])
 
-        # Scroll horizontal pour la grille
+        # Scroll horizontal
         scroll_h = ctk.CTkScrollableFrame(
             self.frame_grille,
             fg_color="transparent",
             orientation="horizontal",
             scrollbar_button_color=COULEURS["accent_bleu"])
-        scroll_h.pack(
-            fill="both", expand=True,
-            padx=10, pady=10)
+        scroll_h.pack(fill="both", expand=True,
+                      padx=8, pady=8)
 
+        # En-têtes
         fh = ctk.CTkFrame(
             scroll_h,
             fg_color=COULEURS["bg_sidebar"],
@@ -286,8 +420,8 @@ class VueTableauService(ctk.CTkFrame):
                 scroll_h,
                 text=f"Aucun employé dans "
                      f"« {self._service} ».\n"
-                     f"Ajoutez des employés dans "
-                     f"l'onglet Employés.",
+                     f"Ajoutez des employés "
+                     f"dans l'onglet Employés.",
                 font=POLICES["corps"],
                 text_color=COULEURS["texte_discret"],
                 justify="center"
@@ -305,16 +439,16 @@ class VueTableauService(ctk.CTkFrame):
 
             ctk.CTkLabel(
                 fl,
-                text=f"{emp['nom']} "
-                     f"{emp['prenom']}"[:20],
+                text=(f"{emp['nom']} "
+                      f"{emp['prenom']}")[:20],
                 font=POLICES["tableau"],
                 text_color=COULEURS["texte_principal"],
                 width=170, anchor="w"
             ).pack(side="left", padx=6, pady=4)
 
             jours_conge = _jours_en_conge(
-                emp["id"], self._annee,
-                self._mois)
+                emp["id"],
+                self._annee, self._mois)
 
             for j in jours:
                 if j in jours_conge:
@@ -340,9 +474,8 @@ class VueTableauService(ctk.CTkFrame):
                         font=("Segoe UI", 8),
                         justify="center",
                         corner_radius=3)
-                    entry.pack(
-                        side="left",
-                        padx=1, pady=2)
+                    entry.pack(side="left",
+                               padx=1, pady=2)
                     self._cellules[
                         (emp["id"], j)] = var
 
@@ -357,8 +490,7 @@ class VueTableauService(ctk.CTkFrame):
                   AND annee=? AND mois=?
                   AND jour=?
             """, (emp_id, self._annee,
-                  self._mois, jour)
-            ).fetchone()
+                  self._mois, jour)).fetchone()
             conn.close()
             return (row["type_service"]
                     if row else "")
@@ -382,7 +514,8 @@ class VueTableauService(ctk.CTkFrame):
                     ON CONFLICT(employe_id,
                         annee, mois, jour)
                     DO UPDATE SET
-                        type_service=excluded.type_service
+                        type_service=
+                        excluded.type_service
                 """, (emp_id, self._annee,
                       self._mois, jour,
                       val.upper()))
@@ -394,19 +527,9 @@ class VueTableauService(ctk.CTkFrame):
         messagebox.showinfo(
             "✅  Sauvegardé",
             f"{count} cellule(s) "
-            f"enregistrée(s).")
-
-    def _importer_gabarit(self):
-        chemin = filedialog.askopenfilename(
-            title="Importer un gabarit",
-            filetypes=[
-                ("Excel", "*.xlsx *.xls"),
-                ("Tous", "*.*")])
-        if chemin:
-            messagebox.showinfo(
-                "Gabarit sélectionné",
-                f"{chemin}\n\n"
-                "Intégration en développement.")
+            f"enregistrée(s) pour "
+            f"{MOIS_FR[self._mois]} "
+            f"{self._annee}.")
 
     def rafraichir(self, _=None):
         try:

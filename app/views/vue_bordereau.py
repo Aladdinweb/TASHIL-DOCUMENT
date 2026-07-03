@@ -1,9 +1,10 @@
 # COPYRIGHT ILINE TECH 2026 BY FERAK ALADDIN
 """
-Bordereau — Workspace FIFO automatique
-Scrollable, jamais vide.
+Bordereau d'envoi — Drag & Drop + FIFO automatique
+Dépendance : pip install tkinterdnd2
 """
 import datetime
+import os
 import customtkinter as ctk
 from tkinter import messagebox, filedialog
 from app.utils.theme import COULEURS, POLICES, DIMENSIONS
@@ -21,16 +22,13 @@ def _charger_mouvements() -> list:
                    d.nom as service,
                    ca.annee
             FROM mouvements_conge m
-            JOIN employes e
-                ON e.id = m.employe_id
-            JOIN departements d
-                ON d.id = e.departement_id
-            JOIN conges_annuels ca
-                ON ca.id = m.conge_id
+            JOIN employes e ON e.id = m.employe_id
+            JOIN departements d ON d.id = e.departement_id
+            JOIN conges_annuels ca ON ca.id = m.conge_id
             WHERE m.type_conge = 'CONGE_ANNUEL'
               AND e.actif = 1
             ORDER BY m.date_debut DESC
-            LIMIT 100
+            LIMIT 200
         """).fetchall()
         conn.close()
         return [dict(r) for r in rows]
@@ -45,21 +43,20 @@ class VueBordereau(ctk.CTkFrame):
             parent,
             fg_color=COULEURS["bg_principal"],
             corner_radius=0, **kwargs)
-        self._mouvements = []
+        self._mouvements    = []
+        self._fichiers_dnd  = []
+        self._dnd_disponible = False
         self._construire()
 
     def _construire(self):
-        # Scroll principal — garantit le rendu
-        # complet quelle que soit la résolution
         scroll = ctk.CTkScrollableFrame(
             self,
             fg_color="transparent",
             scrollbar_button_color=COULEURS["accent_bleu"])
-        scroll.pack(
-            fill="both", expand=True,
-            padx=20, pady=20)
+        scroll.pack(fill="both", expand=True,
+                    padx=20, pady=20)
 
-        # Titre
+        # ── Titre ────────────────────────────
         ctk.CTkLabel(
             scroll, text="Bordereau d'envoi",
             font=POLICES["titre_page"],
@@ -78,33 +75,29 @@ class VueBordereau(ctk.CTkFrame):
             fg_color=COULEURS["bordure"]
         ).pack(fill="x", pady=(0, 16))
 
-        # Panneau actions
-        action_f = ctk.CTkFrame(
-            scroll,
-            fg_color=COULEURS["bg_carte"],
+        # ── Actions ──────────────────────────
+        f_act = ctk.CTkFrame(
+            scroll, fg_color=COULEURS["bg_carte"],
             corner_radius=8)
-        action_f.pack(fill="x", pady=(0, 16))
+        f_act.pack(fill="x", pady=(0, 16))
 
         f_btns = ctk.CTkFrame(
-            action_f, fg_color="transparent")
-        f_btns.pack(fill="x", padx=16,
-                    pady=14)
+            f_act, fg_color="transparent")
+        f_btns.pack(fill="x", padx=16, pady=12)
 
         ctk.CTkButton(
-            f_btns,
-            height=40,
+            f_btns, height=38,
             text="🔍  Scanner & Vérifier FIFO",
             fg_color=COULEURS["accent_bleu"],
             hover_color=COULEURS["accent_bleu_clair"],
             text_color="#FFFFFF",
             font=POLICES["bouton"],
             corner_radius=DIMENSIONS["rayon_bouton"],
-            command=self._scanner_et_deduire
-        ).pack(side="left", padx=(0, 10))
+            command=self._scanner_fifo
+        ).pack(side="left", padx=(0, 8))
 
         ctk.CTkButton(
-            f_btns,
-            height=40,
+            f_btns, height=38,
             text="📥  Exporter Excel",
             fg_color=COULEURS["accent_vert"],
             hover_color="#059669",
@@ -112,45 +105,205 @@ class VueBordereau(ctk.CTkFrame):
             font=POLICES["bouton"],
             corner_radius=DIMENSIONS["rayon_bouton"],
             command=self._exporter_excel
-        ).pack(side="left", padx=(0, 10))
+        ).pack(side="left", padx=(0, 8))
 
         ctk.CTkButton(
-            f_btns,
-            height=40,
-            text="📂  Importer document externe",
+            f_btns, height=38,
+            text="📂  Parcourir fichier",
             fg_color=COULEURS["bg_champ"],
             hover_color=COULEURS["bg_hover"],
             text_color=COULEURS["texte_principal"],
             font=POLICES["bouton"],
             corner_radius=DIMENSIONS["rayon_bouton"],
-            command=self._importer_document
+            command=self._parcourir_fichier
         ).pack(side="left")
 
         self.lbl_resultat = ctk.CTkLabel(
-            action_f, text="",
+            f_act, text="",
             font=POLICES["corps"],
             text_color=COULEURS["accent_vert"],
             wraplength=700, justify="left")
         self.lbl_resultat.pack(
-            anchor="w", padx=16,
-            pady=(0, 12))
+            anchor="w", padx=16, pady=(0, 10))
 
-        # Liste mouvements
+        # ── Zone Drag & Drop ─────────────────
         ctk.CTkLabel(
             scroll,
-            text="Congés Annuels — "
-                 "Mouvements actifs",
+            text="Documents joints",
+            font=POLICES["sous_titre"],
+            text_color=COULEURS["texte_principal"]
+        ).pack(anchor="w", pady=(0, 6))
+
+        self.zone_dnd = ctk.CTkFrame(
+            scroll,
+            fg_color=COULEURS["bg_carte"],
+            corner_radius=8,
+            border_width=2,
+            border_color=COULEURS["bordure"])
+        self.zone_dnd.pack(
+            fill="x", pady=(0, 16))
+
+        self.lbl_dnd = ctk.CTkLabel(
+            self.zone_dnd,
+            text="📎  Glissez un fichier ici\n"
+                 "ou cliquez sur « Parcourir »\n"
+                 "(PDF, Word, Excel acceptés)",
+            font=POLICES["corps"],
+            text_color=COULEURS["texte_discret"],
+            justify="center")
+        self.lbl_dnd.pack(pady=30)
+
+        # Activer drag-drop si tkinterdnd2 dispo
+        self._activer_dnd()
+
+        # ── Liste fichiers attachés ───────────
+        self._frame_fichiers = ctk.CTkFrame(
+            scroll, fg_color="transparent")
+        self._frame_fichiers.pack(
+            fill="x", pady=(0, 16))
+
+        # ── Mouvements actifs ─────────────────
+        ctk.CTkLabel(
+            scroll,
+            text="Congés Annuels — Mouvements actifs",
             font=POLICES["sous_titre"],
             text_color=COULEURS["texte_principal"]
         ).pack(anchor="w", pady=(0, 8))
 
         self.liste_f = ctk.CTkFrame(
-            scroll,
-            fg_color=COULEURS["bg_carte"],
+            scroll, fg_color=COULEURS["bg_carte"],
             corner_radius=8)
         self.liste_f.pack(fill="x")
 
         self._charger_liste()
+
+    def _activer_dnd(self):
+        """Tente d'activer tkinterdnd2."""
+        try:
+            from tkinterdnd2 import DND_FILES
+            self.zone_dnd.drop_target_register(
+                DND_FILES)
+            self.zone_dnd.dnd_bind(
+                "<<Drop>>", self._on_drop)
+            self._dnd_disponible = True
+            self.lbl_dnd.configure(
+                text="📎  Glissez un fichier ici\n"
+                     "(PDF, Word, Excel acceptés)",
+                text_color=COULEURS["accent_bleu"])
+        except Exception:
+            # tkinterdnd2 non installé — fallback
+            self._dnd_disponible = False
+            self.lbl_dnd.configure(
+                text="📎  Cliquez sur « Parcourir »\n"
+                     "pour attacher un document\n"
+                     "(installez tkinterdnd2 pour "
+                     "le drag-drop)")
+
+    def _on_drop(self, event):
+        """Appelé quand un fichier est glissé."""
+        chemin = event.data.strip().strip("{}")
+        self._ajouter_fichier(chemin)
+
+    def _parcourir_fichier(self):
+        chemin = filedialog.askopenfilename(
+            title="Sélectionner un document",
+            filetypes=[
+                ("Documents",
+                 "*.pdf *.docx *.xlsx *.xls "
+                 "*.doc *.txt *.png *.jpg"),
+                ("Tous", "*.*"),
+            ])
+        if chemin:
+            self._ajouter_fichier(chemin)
+
+    def _ajouter_fichier(self, chemin: str):
+        """Ajoute un fichier à la liste."""
+        if not os.path.exists(chemin):
+            messagebox.showerror(
+                "Erreur",
+                f"Fichier introuvable :\n{chemin}")
+            return
+
+        nom     = os.path.basename(chemin)
+        taille  = os.path.getsize(chemin)
+        taille_s = (f"{taille // 1024} KB"
+                    if taille > 1024
+                    else f"{taille} B")
+
+        self._fichiers_dnd.append({
+            "nom":    nom,
+            "chemin": chemin,
+            "taille": taille_s,
+        })
+
+        # Mise à jour label zone DND
+        nb = len(self._fichiers_dnd)
+        self.lbl_dnd.configure(
+            text=f"📎  {nb} fichier(s) attaché(s)",
+            text_color=COULEURS["accent_vert"])
+
+        self._afficher_fichiers()
+
+    def _afficher_fichiers(self):
+        for w in self._frame_fichiers.winfo_children():
+            w.destroy()
+
+        for idx, fic in enumerate(
+                self._fichiers_dnd):
+            f = ctk.CTkFrame(
+                self._frame_fichiers,
+                fg_color=COULEURS["bg_champ"],
+                corner_radius=6)
+            f.pack(fill="x", pady=2)
+
+            ext = fic["nom"].rsplit(".", 1)[-1].lower()
+            icone = {
+                "pdf":  "📕",
+                "docx": "📘", "doc": "📘",
+                "xlsx": "📗", "xls": "📗",
+                "png":  "🖼", "jpg": "🖼",
+            }.get(ext, "📄")
+
+            ctk.CTkLabel(
+                f,
+                text=f"{icone}  {fic['nom']}",
+                font=POLICES["corps_bold"],
+                text_color=COULEURS["texte_principal"]
+            ).pack(side="left", padx=12, pady=8)
+
+            ctk.CTkLabel(
+                f, text=fic["taille"],
+                font=POLICES["petit"],
+                text_color=COULEURS["texte_discret"]
+            ).pack(side="left")
+
+            def _suppr(i=idx):
+                self._fichiers_dnd.pop(i)
+                self._afficher_fichiers()
+                nb = len(self._fichiers_dnd)
+                self.lbl_dnd.configure(
+                    text=(
+                        f"📎  {nb} fichier(s) "
+                        "attaché(s)"
+                        if nb > 0
+                        else "📎  Glissez un "
+                             "fichier ici\nou "
+                             "cliquez « Parcourir »"),
+                    text_color=(
+                        COULEURS["accent_vert"]
+                        if nb > 0
+                        else COULEURS["texte_discret"]))
+
+            ctk.CTkButton(
+                f, text="✕",
+                width=28, height=28,
+                fg_color="transparent",
+                hover_color=COULEURS["accent_rouge"],
+                text_color=COULEURS["texte_discret"],
+                font=("Segoe UI", 11),
+                corner_radius=4,
+                command=_suppr
+            ).pack(side="right", padx=10)
 
     def _charger_liste(self):
         for w in self.liste_f.winfo_children():
@@ -168,18 +321,16 @@ class VueBordereau(ctk.CTkFrame):
             ).pack(pady=40)
             return
 
+        # En-têtes
         fh = ctk.CTkFrame(
             self.liste_f,
             fg_color=COULEURS["bg_sidebar"],
             corner_radius=4)
         fh.pack(fill="x")
         for txt, w in [
-            ("Employé", 180),
-            ("Service", 140),
-            ("Du", 100),
-            ("Au", 100),
-            ("Jours", 60),
-            ("Année", 60),
+            ("Employé", 180), ("Service", 140),
+            ("Du", 100), ("Au", 100),
+            ("Jours", 60), ("Année", 60),
         ]:
             ctk.CTkLabel(
                 fh, text=txt,
@@ -188,8 +339,7 @@ class VueBordereau(ctk.CTkFrame):
                 width=w, anchor="w"
             ).pack(side="left", padx=8, pady=8)
 
-        for idx, m in enumerate(
-                self._mouvements):
+        for idx, m in enumerate(self._mouvements):
             bg = (COULEURS["bg_carte"]
                   if idx % 2 == 0
                   else COULEURS["bg_champ"])
@@ -224,26 +374,25 @@ class VueBordereau(ctk.CTkFrame):
                 ).pack(side="left",
                        padx=8, pady=6)
 
-    def _scanner_et_deduire(self):
+    def _scanner_fifo(self):
         if not self._mouvements:
             messagebox.showinfo(
-                "Info", "Aucun mouvement.")
+                "Info",
+                "Aucun mouvement à analyser.")
             return
 
-        traites = 0
         conn = get_connection()
+        traites = 0
         for m in self._mouvements:
             try:
-                solde = conn.execute("""
+                row = conn.execute("""
                     SELECT jours_initiaux
-                        - jours_utilises
-                        AS restant
+                         - jours_utilises AS restant
                     FROM conges_annuels
-                    WHERE employe_id=?
-                      AND annee=?
+                    WHERE employe_id=? AND annee=?
                 """, (m["employe_id"],
                       m["annee"])).fetchone()
-                if solde and solde["restant"] >= 0:
+                if row and row["restant"] >= 0:
                     traites += 1
             except Exception:
                 pass
@@ -264,8 +413,9 @@ class VueBordereau(ctk.CTkFrame):
                 defaultextension=".xlsx",
                 filetypes=[("Excel", "*.xlsx")],
                 title="Enregistrer le Bordereau",
-                initialfile=f"Bordereau_"
-                            f"{datetime.date.today()}.xlsx")
+                initialfile=(
+                    f"Bordereau_"
+                    f"{datetime.date.today()}.xlsx"))
             if not chemin:
                 return
             wb = openpyxl.Workbook()
@@ -288,23 +438,10 @@ class VueBordereau(ctk.CTkFrame):
             wb.save(chemin)
             messagebox.showinfo(
                 "✅  Export réussi",
-                f"Fichier : {chemin}")
+                f"Fichier :\n{chemin}")
         except Exception as ex:
             messagebox.showerror(
-                "Erreur", str(ex))
-
-    def _importer_document(self):
-        chemin = filedialog.askopenfilename(
-            title="Importer un document",
-            filetypes=[
-                ("Documents",
-                 "*.pdf *.docx *.xlsx"),
-                ("Tous", "*.*")])
-        if chemin:
-            messagebox.showinfo(
-                "Document attaché",
-                f"Fichier sélectionné :\n"
-                f"{chemin}")
+                "Erreur export", str(ex))
 
     def rafraichir(self, _=None):
         try:

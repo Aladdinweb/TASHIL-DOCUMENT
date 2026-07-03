@@ -1,92 +1,88 @@
 # COPYRIGHT ILINE TECH 2026 BY FERAK ALADDIN
 """
-Formulaire Employé — Validation assouplie
-Obligatoires : Nom, Prénom, Grade, Polyclinique
-Soldes : saisie du nombre restant uniquement
+Formulaire Employé TASHIL
+Champs obligatoires : Nom, Prénom, Grade, Polyclinique
+Soldes : sélecteur année explicite (pas auto année courante)
 """
 import datetime
 import customtkinter as ctk
-from app.views.dialogue_base import DialogueBase
+from app.utils.theme import COULEURS, POLICES, DIMENSIONS
+from app.utils.database import get_connection
 from app.utils import employes_dao
 from app.utils.polycliniques_dao import lister_polycliniques
-from app.utils.services import SERVICES_CLINIQUES, GRADES
-from app.utils.database import get_connection
-from app.utils.theme import COULEURS, POLICES, DIMENSIONS
 
-POSTES_PAR_GRADE = {
-    "Médecin": [
-        "Généraliste", "Médecin des Urgences",
-        "Médecin Spécialiste", "Médecin Chef",
-    ],
-    "Médecin Spécialiste": [
-        "Cardiologue", "Pneumologue",
-        "Pédiatre", "Gynécologue",
-        "Ophtalmologue", "Dermatologue",
-        "Neurologue", "Endocrinologue", "ORL",
-    ],
-    "Ambulancier (OP)": [
-        "Conducteur de niveau 1",
-        "Conducteur de niveau 2",
-        "Ambulancier Principal",
-    ],
-    "Agent de Sécurité (OP)": [
-        "Agent de Sécurité",
-        "Chef d'Équipe Sécurité",
-    ],
-    "Infirmière": [
-        "Infirmière de Soins",
-        "Infirmière Principale",
-        "Infirmière Chef",
-        "Infirmière des Urgences",
-    ],
-    "Infirmier": [
-        "Infirmier de Soins",
-        "Infirmier Principal",
-        "Infirmier Chef",
-    ],
-}
+try:
+    from app.config import (
+        SERVICES_CLINIQUES,
+        HIERARCHIE_GRADES as GRADES,
+        POSTES_PAR_GRADE,
+    )
+except Exception:
+    SERVICES_CLINIQUES = ["Urgences", "Consultation", "Autre"]
+    GRADES = ["Médecin", "Infirmier", "Ambulancier (OP)", "Autre"]
+    POSTES_PAR_GRADE = {}
 
 
-class DialogueEmploye(DialogueBase):
+class DialogueEmploye(ctk.CTkToplevel):
     def __init__(self, parent, emp_id=None,
                  callback_succes=None):
+        super().__init__(parent)
         self._emp_id   = emp_id
         self._callback = callback_succes
+        self._polys    = lister_polycliniques()
+        self._soldes_rows = []
         self._donnees  = (
             employes_dao.obtenir_employe(emp_id)
             if emp_id else None)
-        self._depts = employes_dao.lister_departements()
-        self._polys = lister_polycliniques()
-        self._soldes_rows = []  # lignes dynamiques
 
-        titre = ("Modifier" if emp_id
-                 else "＋  Nouvel employé")
-        super().__init__(parent, titre=titre,
-                         largeur=580, hauteur=760)
+        titre = ("✏  Modifier employé"
+                 if emp_id else
+                 "＋  Nouvel employé")
+        self.title(titre)
+        self.configure(
+            fg_color=COULEURS["bg_principal"])
+        self.resizable(False, True)
+        self.grab_set()
+        self.focus_set()
 
-    def _construire_corps(self):
-        pad  = 20
-        cors = self.frame_corps
+        w = 580
+        self.update_idletasks()
+        x = (self.winfo_screenwidth()  - w) // 2
+        y = 60
+        self.geometry(f"{w}x780+{x}+{y}")
 
-        def sep(t, c=None):
-            f = ctk.CTkFrame(cors,
-                             fg_color="transparent")
+        self._construire()
+
+    def _construire(self):
+        # Scroll global
+        scroll = ctk.CTkScrollableFrame(
+            self,
+            fg_color="transparent",
+            scrollbar_button_color=COULEURS["accent_bleu"])
+        scroll.pack(fill="both", expand=True)
+
+        pad = 20
+
+        def sep(texte, couleur=None):
+            c = couleur or COULEURS["accent_bleu"]
+            f = ctk.CTkFrame(
+                scroll, fg_color="transparent")
             f.pack(fill="x", padx=pad,
-                   pady=(14, 4))
+                   pady=(16, 4))
             ctk.CTkLabel(
-                f, text=t,
+                f, text=texte,
                 font=POLICES["sous_titre"],
-                text_color=c or COULEURS["accent_bleu"]
+                text_color=c
             ).pack(side="left")
             ctk.CTkFrame(
                 f, height=1,
-                fg_color=c or COULEURS["bordure_active"]
+                fg_color=COULEURS["bordure"]
             ).pack(side="left", fill="x",
                    expand=True, padx=(8, 0))
 
         def champ(label, ph="", req=False):
-            f = ctk.CTkFrame(cors,
-                             fg_color="transparent")
+            f = ctk.CTkFrame(
+                scroll, fg_color="transparent")
             f.pack(fill="x", padx=pad,
                    pady=(0, 8))
             ctk.CTkLabel(
@@ -107,9 +103,10 @@ class DialogueEmploye(DialogueBase):
             e.pack(fill="x", pady=(4, 0))
             return e
 
-        def menu(label, vals, req=False, cmd=None):
-            f = ctk.CTkFrame(cors,
-                             fg_color="transparent")
+        def menu_opt(label, vals, req=False,
+                     cmd=None, w=None):
+            f = ctk.CTkFrame(
+                scroll, fg_color="transparent")
             f.pack(fill="x", padx=pad,
                    pady=(0, 8))
             ctk.CTkLabel(
@@ -118,8 +115,7 @@ class DialogueEmploye(DialogueBase):
                 font=POLICES["corps_bold"],
                 text_color=COULEURS["texte_secondaire"]
             ).pack(anchor="w")
-            m = ctk.CTkOptionMenu(
-                f, values=vals,
+            kw = dict(
                 fg_color=COULEURS["bg_champ"],
                 button_color=COULEURS["accent_bleu"],
                 button_hover_color=COULEURS["accent_bleu_clair"],
@@ -130,82 +126,59 @@ class DialogueEmploye(DialogueBase):
                 font=POLICES["corps"],
                 dropdown_font=POLICES["corps"],
                 corner_radius=DIMENSIONS["rayon_bouton"],
-                height=36, command=cmd)
+                height=36)
+            if w:
+                kw["width"] = w
+            if cmd:
+                kw["command"] = cmd
+            m = ctk.CTkOptionMenu(f, values=vals, **kw)
             m.pack(fill="x", pady=(4, 0))
             return m
 
-        # ── Section 1 ─────────────────────────────
+        # ── Section 1 : Identification ────────
         sep("① Identification")
-        self.e_nom      = champ("Nom", "BENSALEM",
-                                req=True)
-        self.e_prenom   = champ("Prénom", "Kamel",
-                                req=True)
+        self.e_nom      = champ(
+            "Nom", "BENSALEM", req=True)
+        self.e_prenom   = champ(
+            "Prénom", "Kamel", req=True)
         self.e_matricule = champ(
-            "Matricule", "Ex : MR-001")
+            "Matricule", "Ex : MR-001  (optionnel)")
 
-        # Année entrée
-        f_ae = ctk.CTkFrame(cors,
-                            fg_color="transparent")
-        f_ae.pack(fill="x", padx=pad,
-                  pady=(0, 8))
-        ctk.CTkLabel(
-            f_ae, text="Année d'entrée",
-            font=POLICES["corps_bold"],
-            text_color=COULEURS["texte_secondaire"]
-        ).pack(anchor="w")
-        annees = [str(y) for y in range(
-            datetime.date.today().year,
-            datetime.date.today().year - 40, -1)]
-        self.m_annee_ent = ctk.CTkOptionMenu(
-            f_ae, values=annees,
-            fg_color=COULEURS["bg_champ"],
-            button_color=COULEURS["accent_bleu"],
-            button_hover_color=COULEURS["accent_bleu_clair"],
-            dropdown_fg_color=COULEURS["bg_carte"],
-            dropdown_hover_color=COULEURS["bg_hover"],
-            text_color=COULEURS["texte_principal"],
-            dropdown_text_color=COULEURS["texte_principal"],
-            font=POLICES["corps"],
-            corner_radius=DIMENSIONS["rayon_bouton"],
-            height=36)
-        self.m_annee_ent.pack(fill="x",
-                              pady=(4, 0))
-
-        # ── Section 2 ─────────────────────────────
+        # ── Section 2 : Affectation ───────────
         sep("② Affectation")
-
         noms_polys = (
             ["— Sélectionner —"] +
             [p["nom"] for p in self._polys])
-        self.m_poly = menu(
+        self.m_poly = menu_opt(
             "Polyclinique", noms_polys, req=True)
 
-        self.m_service = menu(
+        self.m_service = menu_opt(
             "Service clinique",
             SERVICES_CLINIQUES)
 
-        # ── Section 3 ─────────────────────────────
+        # ── Section 3 : Grade & Poste ─────────
         sep("③ Grade & Poste")
-        self.m_grade = menu(
+        self.m_grade = menu_opt(
             "Grade / Corps", GRADES, req=True,
-            cmd=self._on_grade)
+            cmd=self._on_grade_change)
 
         # Poste dynamique
-        f_ps = ctk.CTkFrame(cors,
-                            fg_color="transparent")
-        f_ps.pack(fill="x", padx=pad,
-                  pady=(0, 8))
+        f_poste = ctk.CTkFrame(
+            scroll, fg_color="transparent")
+        f_poste.pack(fill="x", padx=pad,
+                     pady=(0, 8))
         ctk.CTkLabel(
-            f_ps, text="Poste occupé",
+            f_poste, text="Poste occupé",
             font=POLICES["corps_bold"],
             text_color=COULEURS["texte_secondaire"]
         ).pack(anchor="w")
-        self.frame_poste_w = ctk.CTkFrame(
-            f_ps, fg_color="transparent")
-        self.frame_poste_w.pack(fill="x",
-                                pady=(4, 0))
+        self._frame_poste = ctk.CTkFrame(
+            f_poste, fg_color="transparent")
+        self._frame_poste.pack(
+            fill="x", pady=(4, 0))
+
         self.m_poste = ctk.CTkOptionMenu(
-            self.frame_poste_w,
+            self._frame_poste,
             values=["Poste principal"],
             fg_color=COULEURS["bg_champ"],
             button_color=COULEURS["accent_bleu"],
@@ -218,8 +191,9 @@ class DialogueEmploye(DialogueBase):
             corner_radius=DIMENSIONS["rayon_bouton"],
             height=36)
         self.m_poste.pack(fill="x")
+
         self.e_poste_libre = ctk.CTkEntry(
-            self.frame_poste_w,
+            self._frame_poste,
             placeholder_text="Saisir le poste…",
             fg_color=COULEURS["bg_champ"],
             border_color=COULEURS["bordure"],
@@ -227,90 +201,166 @@ class DialogueEmploye(DialogueBase):
             placeholder_text_color=COULEURS["texte_discret"],
             font=POLICES["corps"], height=36,
             corner_radius=DIMENSIONS["rayon_bouton"])
-        self.e_poste_libre.pack(fill="x")
-        self.e_poste_libre.pack_forget()
-        self._poste_mode = "menu"
-        self._on_grade(GRADES[0])
 
-        # ── Section 4 : Soldes dynamiques ─────────
+        self._poste_mode = "menu"
+        self._on_grade_change(GRADES[0])
+
+        # ── Section 4 : Soldes initiaux ───────
         if not self._emp_id:
-            sep("④ Soldes initiaux (jours restants)",
-                c=COULEURS["accent_vert"])
+            sep("④ Soldes de congé initiaux",
+                couleur=COULEURS["accent_vert"])
 
             ctk.CTkLabel(
-                cors,
-                text="Entrez uniquement le nombre "
-                     "de jours RESTANTS par année.",
+                scroll,
+                text="Saisissez uniquement le nombre "
+                     "de jours RESTANTS par année.\n"
+                     "Choisissez l'année dans le "
+                     "menu déroulant.",
                 font=POLICES["petit"],
                 text_color=COULEURS["texte_secondaire"],
-                wraplength=500
+                wraplength=520, justify="left"
             ).pack(anchor="w", padx=pad,
-                   pady=(0, 6))
+                   pady=(0, 8))
 
-            # Conteneur lignes soldes
-            self.frame_soldes_dyn = ctk.CTkFrame(
-                cors,
+            self._frame_soldes = ctk.CTkFrame(
+                scroll,
                 fg_color=COULEURS["bg_carte"],
                 corner_radius=8)
-            self.frame_soldes_dyn.pack(
-                fill="x", padx=pad, pady=(0, 6))
+            self._frame_soldes.pack(
+                fill="x", padx=pad,
+                pady=(0, 6))
 
-            # Années par défaut 2022→courante
+            ctk.CTkLabel(
+                self._frame_soldes,
+                text="Aucune année ajoutée.",
+                font=POLICES["corps"],
+                text_color=COULEURS["texte_discret"]
+            ).pack(pady=16)
+
+            # Bouton ajouter une année
+            # avec SÉLECTEUR d'année explicite
+            f_add = ctk.CTkFrame(
+                scroll, fg_color="transparent")
+            f_add.pack(fill="x", padx=pad,
+                       pady=(0, 12))
+
             annee_cour = datetime.date.today().year
-            for a in range(2022, annee_cour + 1):
-                self._ajouter_ligne_solde(a)
+            self._annees_dispo = [
+                str(a) for a in range(
+                    annee_cour, annee_cour - 15, -1)]
+            self._annee_select = ctk.CTkOptionMenu(
+                f_add,
+                values=self._annees_dispo,
+                width=120, height=32,
+                fg_color=COULEURS["bg_champ"],
+                button_color=COULEURS["accent_bleu"],
+                button_hover_color=COULEURS["accent_bleu_clair"],
+                dropdown_fg_color=COULEURS["bg_carte"],
+                dropdown_hover_color=COULEURS["bg_hover"],
+                text_color=COULEURS["texte_principal"],
+                dropdown_text_color=COULEURS["texte_principal"],
+                font=POLICES["corps"],
+                corner_radius=6)
+            self._annee_select.pack(
+                side="left", padx=(0, 8))
+            self._annee_select.set(
+                str(annee_cour))
 
-            # Bouton ajouter une ligne
             ctk.CTkButton(
-                cors,
-                text="＋  Ajouter une année",
+                f_add,
+                text="＋  Ajouter cette année",
+                height=32,
                 fg_color=COULEURS["bg_champ"],
                 hover_color=COULEURS["bg_hover"],
                 text_color=COULEURS["texte_secondaire"],
                 font=POLICES["corps"],
-                height=30,
                 corner_radius=DIMENSIONS["rayon_bouton"],
-                command=self._ajouter_ligne_solde
-            ).pack(anchor="w", padx=pad,
-                   pady=(0, 10))
+                command=self._ajouter_annee_selectee
+            ).pack(side="left")
 
-        # Erreur
-        self._lbl_erreur = ctk.CTkLabel(
-            cors, text="",
+        # Label erreur
+        self.lbl_err = ctk.CTkLabel(
+            scroll, text="",
             font=POLICES["corps"],
-            text_color=COULEURS["accent_rouge"],
-            fg_color="#2D1515", corner_radius=6)
-        self._lbl_erreur.pack(fill="x", padx=pad,
-                              pady=(4, 4))
+            text_color=COULEURS["accent_rouge"])
+        self.lbl_err.pack(padx=pad,
+                          pady=(4, 4))
 
-        self.btn_valider.configure(
-            text="💾  Enregistrer")
+        # Pied boutons
+        f_pied = ctk.CTkFrame(
+            self,
+            fg_color=COULEURS["bg_sidebar"],
+            corner_radius=0, height=58)
+        f_pied.pack(fill="x", side="bottom")
+        f_pied.pack_propagate(False)
+
+        ctk.CTkButton(
+            f_pied, text="✕  Annuler",
+            fg_color=COULEURS["bg_champ"],
+            hover_color=COULEURS["accent_rouge"],
+            text_color=COULEURS["texte_secondaire"],
+            font=POLICES["bouton"],
+            height=36, width=120,
+            corner_radius=DIMENSIONS["rayon_bouton"],
+            command=self.destroy
+        ).pack(side="right", padx=(6, 16),
+               pady=11)
+
+        ctk.CTkButton(
+            f_pied, text="💾  Enregistrer",
+            fg_color=COULEURS["accent_bleu"],
+            hover_color=COULEURS["accent_bleu_clair"],
+            text_color="#FFFFFF",
+            font=POLICES["bouton"],
+            height=36, width=160,
+            corner_radius=DIMENSIONS["rayon_bouton"],
+            command=self._valider
+        ).pack(side="right", padx=4, pady=11)
 
         if self._donnees:
             self._preremplir()
 
-    def _ajouter_ligne_solde(self, annee=None):
-        """Ajoute une ligne dynamique année + restant."""
-        if annee is None:
-            annee = datetime.date.today().year
+    def _ajouter_annee_selectee(self):
+        """Ajoute la ligne solde pour l'année choisie."""
+        annee_str = self._annee_select.get()
+        try:
+            annee = int(annee_str)
+        except ValueError:
+            return
 
-        f = ctk.CTkFrame(
-            self.frame_soldes_dyn,
-            fg_color="transparent")
-        f.pack(fill="x", padx=10, pady=3)
+        # Vérifier si déjà ajoutée
+        for row in self._soldes_rows:
+            if row[0] == annee:
+                self.lbl_err.configure(
+                    text=f"L'année {annee} "
+                         "est déjà ajoutée.")
+                return
+        self.lbl_err.configure(text="")
+
+        # Supprimer label "Aucune année"
+        for w in self._frame_soldes.winfo_children():
+            try:
+                w.destroy()
+            except Exception:
+                pass
 
         annee_cour = datetime.date.today().year
         is_old = annee < annee_cour
 
+        f = ctk.CTkFrame(
+            self._frame_soldes,
+            fg_color="transparent")
+        f.pack(fill="x", padx=10, pady=4)
+
         ctk.CTkLabel(
             f,
             text=f"{'🔴' if is_old else '✅'} "
-                 f"Année {annee} :",
+                 f"{annee} :",
             font=POLICES["corps_bold"],
             text_color=(COULEURS["accent_orange"]
                         if is_old
                         else COULEURS["accent_vert"]),
-            width=110, anchor="w"
+            width=80, anchor="w"
         ).pack(side="left")
 
         ctk.CTkLabel(
@@ -319,24 +369,31 @@ class DialogueEmploye(DialogueBase):
             text_color=COULEURS["texte_secondaire"]
         ).pack(side="left", padx=(8, 4))
 
-        e_restant = ctk.CTkEntry(
-            f, width=70,
+        e = ctk.CTkEntry(
+            f, width=80,
             fg_color=COULEURS["bg_champ"],
             border_color=COULEURS["bordure"],
             text_color=COULEURS["texte_principal"],
-            font=POLICES["corps"], height=30,
+            font=POLICES["corps"],
+            height=30,
             corner_radius=DIMENSIONS["rayon_bouton"])
-        e_restant.insert(0, "30")
-        e_restant.pack(side="left")
+        e.insert(0, "30")
+        e.pack(side="left")
 
-        # Bouton supprimer la ligne
-        def _suppr(frame=f, row=None):
+        row_ref = [annee, e]
+        self._soldes_rows.append(row_ref)
+
+        def _suppr(frame=f, row=row_ref):
             frame.destroy()
             if row in self._soldes_rows:
                 self._soldes_rows.remove(row)
-
-        row_ref = [annee, e_restant]
-        self._soldes_rows.append(row_ref)
+            if not self._soldes_rows:
+                ctk.CTkLabel(
+                    self._frame_soldes,
+                    text="Aucune année ajoutée.",
+                    font=POLICES["corps"],
+                    text_color=COULEURS["texte_discret"]
+                ).pack(pady=16)
 
         ctk.CTkButton(
             f, text="✕",
@@ -345,14 +402,13 @@ class DialogueEmploye(DialogueBase):
             text_color=COULEURS["texte_discret"],
             width=26, height=26,
             corner_radius=4,
-            command=lambda r=row_ref:
-                _suppr(f, r)
+            command=_suppr
         ).pack(side="left", padx=(6, 0))
 
-    def _on_grade(self, grade):
-        postes = POSTES_PAR_GRADE.get(grade)
-        for w in self.frame_poste_w.winfo_children():
+    def _on_grade_change(self, grade: str):
+        for w in self._frame_poste.winfo_children():
             w.pack_forget()
+        postes = POSTES_PAR_GRADE.get(grade)
         if postes:
             self.m_poste.configure(values=postes)
             self.m_poste.set(postes[0])
@@ -362,75 +418,92 @@ class DialogueEmploye(DialogueBase):
             self.e_poste_libre.pack(fill="x")
             self._poste_mode = "libre"
 
-    def _get_poste(self):
+    def _get_poste(self) -> str:
         if self._poste_mode == "menu":
             return self.m_poste.get()
         return self.e_poste_libre.get().strip()
 
     def _preremplir(self):
         d = self._donnees
-        self.e_nom.insert(0, d["nom"])
-        self.e_prenom.insert(0, d["prenom"])
+        self.e_nom.insert(0, d.get("nom", ""))
+        self.e_prenom.insert(0, d.get("prenom", ""))
         if d.get("matricule"):
-            self.e_matricule.insert(0, d["matricule"])
-        if d.get("annee_entree"):
-            self.m_annee_ent.set(
-                str(d["annee_entree"]))
+            self.e_matricule.insert(
+                0, d["matricule"])
         for p in self._polys:
             if p["id"] == d.get("polyclinique_id"):
                 self.m_poly.set(p["nom"])
                 break
         if d.get("grade") in GRADES:
             self.m_grade.set(d["grade"])
-            self._on_grade(d["grade"])
+            self._on_grade_change(d["grade"])
+
+    def _resoudre_dept(self, service: str) -> int:
+        conn = get_connection()
+        code = (service[:12].upper()
+                .replace(" ", "_")
+                .replace("/", "_"))
+        row = conn.execute(
+            "SELECT id FROM departements "
+            "WHERE code=?", (code,)).fetchone()
+        if row:
+            conn.close()
+            return row["id"]
+        cur = conn.execute(
+            "INSERT OR IGNORE INTO departements "
+            "(code, nom) VALUES (?,?)",
+            (code, service))
+        conn.commit()
+        rid = (cur.lastrowid or conn.execute(
+            "SELECT id FROM departements "
+            "WHERE code=?",
+            (code,)).fetchone()["id"])
+        conn.close()
+        return rid
 
     def _valider(self):
-        self._cacher_erreur()
+        self.lbl_err.configure(text="")
 
         nom    = self.e_nom.get().strip().upper()
         prenom = self.e_prenom.get().strip()
         grade  = self.m_grade.get()
         poly_s = self.m_poly.get()
 
-        # Obligatoires uniquement
         if not nom:
-            self._afficher_erreur("Nom obligatoire.")
+            self.lbl_err.configure(
+                text="Nom obligatoire.")
             return
         if not prenom:
-            self._afficher_erreur(
-                "Prénom obligatoire.")
+            self.lbl_err.configure(
+                text="Prénom obligatoire.")
             return
-        if not grade or grade == GRADES[-1]:
-            pass  # Autre accepté
-        if (not poly_s or
-                "Sélectionner" in poly_s):
-            self._afficher_erreur(
-                "Polyclinique obligatoire.")
+        if "Sélectionner" in poly_s:
+            self.lbl_err.configure(
+                text="Polyclinique obligatoire.")
             return
 
-        mat = self.e_matricule.get().strip().upper()
-        if mat and employes_dao.matricule_existe(
-                mat, exclure_id=self._emp_id):
-            self._afficher_erreur(
-                f"Matricule « {mat} » déjà utilisé.")
+        mat = (self.e_matricule.get()
+               .strip().upper())
+        if (mat and
+                employes_dao.matricule_existe(
+                    mat,
+                    exclure_id=self._emp_id)):
+            self.lbl_err.configure(
+                text=f"Matricule «{mat}» "
+                     "déjà utilisé.")
             return
 
         poly_id = next(
             (p["id"] for p in self._polys
              if p["nom"] == poly_s), None)
 
-        svc = self.m_service.get() \
-            if hasattr(self, "m_service") else ""
+        svc = (self.m_service.get()
+               if hasattr(self, "m_service")
+               else "Autre")
         dept_id = self._resoudre_dept(svc)
 
-        try:
-            annee_ent = int(
-                self.m_annee_ent.get())
-        except Exception:
-            annee_ent = None
-
         data = {
-            "matricule":       mat if mat else "",
+            "matricule":       mat or "",
             "nom":             nom,
             "prenom":          prenom,
             "grade":           grade,
@@ -439,8 +512,7 @@ class DialogueEmploye(DialogueBase):
             "polyclinique_id": poly_id,
             "est_manip_radio": (
                 1 if "Radio" in grade else 0),
-            "annee_entree":    annee_ent,
-            "actif":           True,
+            "actif": True,
         }
 
         try:
@@ -450,69 +522,42 @@ class DialogueEmploye(DialogueBase):
                 res = {"action": "modifie"}
             else:
                 nid = self._creer_avec_soldes(data)
-                res = {"action": "cree", "id": nid}
+                res = {"action": "cree",
+                       "id": nid}
 
             if self._callback:
                 self._callback(res)
-            # Fermeture propre
             self.destroy()
 
         except Exception as ex:
-            self._afficher_erreur(f"Erreur: {ex}")
-
-    def _resoudre_dept(self, service: str) -> int:
-        conn = get_connection()
-        code = (service[:12]
-                .upper()
-                .replace(" ", "_")
-                .replace("/", "_"))
-        row = conn.execute(
-            "SELECT id FROM departements "
-            "WHERE code=?", (code,)
-        ).fetchone()
-        if row:
-            conn.close()
-            return row["id"]
-        cur = conn.execute(
-            "INSERT OR IGNORE INTO departements "
-            "(code, nom) VALUES (?,?)",
-            (code, service))
-        conn.commit()
-        rid = cur.lastrowid or conn.execute(
-            "SELECT id FROM departements "
-            "WHERE code=?", (code,)
-        ).fetchone()["id"]
-        conn.close()
-        return rid
+            self.lbl_err.configure(
+                text=f"Erreur : {ex}")
 
     def _creer_avec_soldes(self, data) -> int:
         conn = get_connection()
-        cur  = conn.execute("""
+        cur = conn.execute("""
             INSERT INTO employes
                 (matricule, nom, prenom, grade,
                  poste, departement_id,
                  polyclinique_id, est_manip_radio,
-                 annee_entree, actif)
-            VALUES (?,?,?,?,?,?,?,?,?,1)
+                 actif)
+            VALUES (?,?,?,?,?,?,?,?,1)
         """, (
             data["matricule"], data["nom"],
             data["prenom"], data["grade"],
             data["poste"], data["departement_id"],
             data.get("polyclinique_id"),
             data.get("est_manip_radio", 0),
-            data.get("annee_entree"),
         ))
         emp_id = cur.lastrowid
 
         for row in self._soldes_rows:
             annee, e_restant = row
             try:
-                restant = float(
-                    e_restant.get().strip() or "0")
-                restant = max(0.0, restant)
+                restant = max(0.0, float(
+                    e_restant.get().strip() or "0"))
             except ValueError:
                 restant = 0.0
-
             if restant > 0:
                 conn.execute("""
                     INSERT OR IGNORE INTO
@@ -523,7 +568,6 @@ class DialogueEmploye(DialogueBase):
                     VALUES (?,?,?,0)
                 """, (emp_id, annee, restant))
 
-        # Année courante si aucun solde
         if not self._soldes_rows:
             annee = datetime.date.today().year
             conn.execute("""
