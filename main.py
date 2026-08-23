@@ -95,16 +95,36 @@ class TashilRoot(ctk.CTk):
     def _finish_boot(self, splash: SplashScreen):
         splash.destroy()
         self.deiconify()
+        self.update_idletasks()
+        self._force_repaint()
 
         if is_first_launch():
             self._launch_activation()
         else:
             self._launch_main_app()
 
+    def _force_repaint(self):
+        """
+        Windows/Tkinter sometimes leaves a freshly-deiconified window with
+        an unpainted client area (shows the raw OS background) until a
+        resize event fires. Nudging the geometry by 1px forces the window
+        manager to repaint immediately instead of waiting for the user to
+        touch the window.
+        """
+        try:
+            w = self.winfo_width()
+            h = self.winfo_height()
+            self.geometry(f"{w + 1}x{h + 1}")
+            self.after(10, lambda: self.geometry(f"{w}x{h}"))
+        except Exception:
+            pass
+
     def _launch_activation(self):
         # Local import avoids a circular import with app_principale at module load time
         from app.views.vue_activation import VueActivation
         VueActivation(self, on_complete=self._launch_main_app)
+        self.update_idletasks()
+        self._force_repaint()
 
     def _launch_main_app(self):
         for child in self.winfo_children():
@@ -112,6 +132,8 @@ class TashilRoot(ctk.CTk):
                 child.destroy()
         from app.views.app_principale import AppPrincipale
         AppPrincipale(self)
+        self.update_idletasks()
+        self._force_repaint()
 
 
 def main():

@@ -54,6 +54,11 @@ class AppPrincipale(ctk.CTkFrame):
         self._build_content_area()
         self._show_view("dashboard")
 
+        # Safety net: re-run the geometry pass once Tk has actually mapped
+        # the window, in case construction happened before real width/height
+        # were available (this is what caused the blank-screen-on-launch bug).
+        self.after(60, lambda: (self._reposition_header(), self._reposition_content()))
+
         check_for_update_async(self._on_update_check_result)
 
     # ------------------------------------------------------------------ #
