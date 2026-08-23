@@ -42,6 +42,7 @@ def _install_crash_handler():
 _install_crash_handler()
 
 import customtkinter as ctk  # noqa: E402  (import after crash handler is armed)
+from PIL import Image  # noqa: E402
 
 from app.config import APP_FLAG, APP_FULL_NAME  # noqa: E402
 from app.utils.database import initialize_database, is_first_launch, get_profile  # noqa: E402
@@ -56,13 +57,25 @@ class SplashScreen(ctk.CTkToplevel):
         self.configure(fg_color=pal["bg"])
         self.attributes("-topmost", True)
 
-        w, h = 420, 240
+        w, h = 420, 260
         sw = self.winfo_screenwidth()
         sh = self.winfo_screenheight()
         self.geometry(f"{w}x{h}+{(sw - w) // 2}+{(sh - h) // 2}")
 
-        ctk.CTkLabel(self, text=APP_FLAG, font=(FONTS["title"][0], 48)
-                      ).pack(pady=(40, 10))
+        logo_path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                  "app", "assets", "logo.png")
+        self._logo_img = None
+        if os.path.exists(logo_path):
+            try:
+                pil_logo = Image.open(logo_path).resize((90, 90), Image.LANCZOS)
+                self._logo_img = ctk.CTkImage(light_image=pil_logo, dark_image=pil_logo,
+                                               size=(90, 90))
+                ctk.CTkLabel(self, image=self._logo_img, text="").pack(pady=(28, 8))
+            except Exception:
+                ctk.CTkLabel(self, text=APP_FLAG, font=(FONTS["title"][0], 48)).pack(pady=(28, 8))
+        else:
+            ctk.CTkLabel(self, text=APP_FLAG, font=(FONTS["title"][0], 48)).pack(pady=(28, 8))
+
         ctk.CTkLabel(self, text=APP_FULL_NAME, font=FONTS["title"],
                       text_color=pal["primary"]).pack()
         ctk.CTkLabel(self, text="Démarrage en cours...", font=FONTS["body"],

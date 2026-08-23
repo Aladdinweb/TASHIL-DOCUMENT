@@ -6,7 +6,9 @@ Main application window: sidebar navigation across the 4 modules
 showing the app title and active institution.
 """
 
+import os
 import customtkinter as ctk
+from PIL import Image
 
 from app.config import APP_NAME, APP_FLAG, APP_FULL_NAME
 from app.utils.theme import get_palette, FONTS
@@ -72,8 +74,26 @@ class AppPrincipale(ctk.CTkFrame):
 
         brand = ctk.CTkFrame(self.sidebar_frame, fg_color="transparent", height=90)
         brand.pack(fill="x", padx=20, pady=(24, 10))
-        ctk.CTkLabel(brand, text=f"{APP_FLAG}  {APP_NAME}", font=FONTS["title"],
-                      text_color=pal["primary"]).pack(anchor="w")
+
+        logo_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                                  "assets", "logo.png")
+        if os.path.exists(logo_path):
+            try:
+                pil_logo = Image.open(logo_path).resize((36, 36), Image.LANCZOS)
+                self._brand_logo = ctk.CTkImage(light_image=pil_logo, dark_image=pil_logo,
+                                                 size=(36, 36))
+                logo_row = ctk.CTkFrame(brand, fg_color="transparent")
+                logo_row.pack(anchor="w")
+                ctk.CTkLabel(logo_row, image=self._brand_logo, text="").pack(side="left", padx=(0, 8))
+                ctk.CTkLabel(logo_row, text=APP_NAME, font=FONTS["title"],
+                              text_color=pal["primary"]).pack(side="left")
+            except Exception:
+                ctk.CTkLabel(brand, text=f"{APP_FLAG}  {APP_NAME}", font=FONTS["title"],
+                              text_color=pal["primary"]).pack(anchor="w")
+        else:
+            ctk.CTkLabel(brand, text=f"{APP_FLAG}  {APP_NAME}", font=FONTS["title"],
+                          text_color=pal["primary"]).pack(anchor="w")
+
         ctk.CTkLabel(brand, text=APP_FULL_NAME, font=FONTS["small"],
                       text_color=pal["text_muted"]).pack(anchor="w")
 
