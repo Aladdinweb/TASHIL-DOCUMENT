@@ -1,138 +1,172 @@
-# TASHIL: Smart Health Management System 🇩🇿
-## Documentation de traçabilité — v1.1.38
+# TASHIL DOCUMENT HUB — Documentation de traçabilité
+## v1.0.0 — REBOOT COMPLET (Option B : nouveau dépôt propre)
 
 **Copyright :** ILINE TECH 2026 BY FERAK ALADDIN
-**Dépôt :** https://github.com/Aladdinweb/TASHIL-ES
-**Date :** 2026-07-04
+**Dépôt :** https://github.com/Aladdinweb/TASHIL-Hub
+**Date :** 2026-08-23
 
 ---
 
 ## But de ce fichier
 
-Coller ce fichier au début d'une nouvelle conversation Claude
-pour restaurer le contexte complet du projet instantanément.
+Coller ce fichier au début d'une nouvelle conversation Claude pour
+restaurer le contexte complet du projet instantanément.
 Mettre à jour après chaque push.
+
+---
+
+## 0. ⚠️ Changement majeur
+
+L'ancien projet `epsp-conge-manager` / TASHIL-ES (Congés, FIFO, Employés,
+Reliquats, Rollover, Bordereau) est **abandonné**. Ce fichier documente le
+nouveau produit repartant de zéro : **TASHIL DOCUMENT HUB**, un outil
+d'échange de documents administratifs entre institutions de santé
+algériennes (EPSP, EPH, CHU, EHU, Polyclinique).
 
 ---
 
 ## 1. Vue d'ensemble
 
-- **Nom :** TASHIL — Smart Health Management System
-- **Type :** Application Windows desktop (PyInstaller)
-- **Stack :** Python 3.11 + CustomTkinter + SQLite
-- **CI/CD :** GitHub Actions → Release automatique
-- **Repo :** Aladdinweb/TASHIL-ES (branch: main)
-- **EXE :** EPSP_CongeManager.exe
-- **Version :** v1.1.38
+- **Nom :** TASHIL DOCUMENT HUB
+- **Type :** Application Windows desktop (PyInstaller, standalone)
+- **Stack :** Python 3.11 + CustomTkinter + SQLite + serveur HTTP embarqué
+- **CI/CD :** GitHub Actions (Windows runner) → Release automatique
+- **EXE :** TASHIL_DOCUMENT.exe
+- **Version :** v1.0.0
 
 ---
 
-## 2. Navigation — 2 onglets actifs
+## 2. Navigation — 4 modules (sidebar)
 
-| Onglet | Module | Contenu |
-|--------|--------|---------|
-| Tableau de bord | vue_dashboard.py | Stats, annuaire, alertes |
-| Administration | vue_administration.py | Messagerie, Rollover, Système |
+| Module | Fichier | Contenu |
+|--------|---------|---------|
+| Tableau de Bord | vue_dashboard.py | Stats (envoyés/reçus/en attente), activité récente |
+| Centre de Messagerie | vue_messagerie.py | Envoi, Réception, Pont Téléphone (QR) |
+| Administration & Archivage | vue_administration.py | Registre officiel des courriers |
+| Paramètres | vue_parametres.py | Profil, langue, notifications, thème, MAJ |
 
-### Modules supprimés (sur demande)
-- ~~Employés~~ — supprimé v1.1.38
-- ~~Congés~~ — supprimé v1.1.38
-- ~~Reliquats~~ — supprimé v1.1.38
-- ~~Bordereau~~ — supprimé v1.1.37
-- ~~Tableau Service~~ — supprimé v1.1.37
-
-### Administration — 4 sous-onglets
-1. **Boîte d'envoi** — Messages inter-polycliniques
-2. **Boîte de réception** — Messages reçus + badge non-lus
-3. **Rollover & Branches** — Rollover 1er Mai + 7 polycliniques
-4. **Système** — Infos, backup, réinitialisation
+### Onboarding (première utilisation)
+`vue_activation.py` — 3 étapes : Wilaya → Type/Nom établissement → Clé série
+générée (HMAC-SHA256, format `TSH-WW-TT-XXXX-CHK`).
 
 ---
 
-## 3. Architecture fichiers
+## 3. Architecture fichiers (état actuel)
 
 ```
-TASHIL-ES/
-├── main.py                    # Entrée, splash 🇩🇿, SmartHub
-├── STATE.md                   # Ce fichier
-├── epsp_conge.spec            # PyInstaller config
+TASHIL-Hub/
+├── main.py                        # Bootstrapper, splash 🇩🇿, crash dump, routing
+├── STATE.md                       # Ce fichier
+├── requirements.txt
+├── epsp_conge.spec                # PyInstaller config (nom conservé pour compat CI)
 ├── app/
-│   ├── config.py              # Branding, institutions, services
-│   ├── assets/
-│   │   └── create_icon.py     # Icône médicale croix verte
+│   ├── config.py                  # Branding, 58 wilayas, types d'institution, chemins
+│   ├── assets/                    # icon.ico (à générer / fournir)
 │   ├── utils/
-│   │   ├── database.py        # SQLite + backup auto
-│   │   ├── version.py         # v1.1.0, patch CI auto
-│   │   ├── migration.py       # Migrations schéma
-│   │   ├── services.py        # Import depuis config.py
-│   │   ├── deduction_engine.py # FIFO + rollover 1er Mai
-│   │   ├── employes_dao.py    # CRUD (conservé pour DB)
-│   │   ├── conges_dao.py      # CRUD (conservé pour DB)
-│   │   ├── polycliniques_dao.py
-│   │   ├── theme.py           # Palette COULEURS/POLICES
-│   │   └── updater.py         # MAJ auto TEMP
+│   │   ├── database.py            # SQLite: profile, messages, registre, phone_queue
+│   │   ├── theme.py                # Palette COULEURS Dark/Light, FONTS
+│   │   ├── version.py
+│   │   ├── serial_key.py          # Génération clé série chiffrée par wilaya/institution
+│   │   ├── notifications.py       # Toast overlay + son (winsound)
+│   │   ├── updater.py             # OTA via GitHub Releases API, download -> %TEMP%
+│   │   ├── archive_manager.py     # Routage fichiers -> C:\TASHIL\TASHIL_ARCHIVES\
+│   │   └── phone_bridge.py        # Serveur HTTP embarqué + QR code (pont sans fil)
 │   └── views/
-│       ├── app_principale.py  # Navigation 2 onglets
-│       ├── vue_dashboard.py   # Dashboard thread-safe
-│       ├── vue_administration.py # Admin pro 4 onglets
-│       └── vue_activation.py  # Première config
+│       ├── app_principale.py      # Fenêtre principale, sidebar, header, routing vues
+│       ├── vue_activation.py      # Assistant de configuration initiale
+│       ├── vue_dashboard.py       # Cartes stats + activité récente
+│       ├── vue_messagerie.py      # Onglets Envoi / Réception / Pont Téléphone
+│       ├── vue_administration.py  # Registre officiel (table filtrable)
+│       └── vue_parametres.py      # Profil, préférences, updater
 └── .github/workflows/
-    └── build_windows.yml
+    └── build_windows.yml          # Build + release automatique sur tag v*
 ```
 
 ---
 
-## 4. Règles IMMUABLES
+## 4. Règles IMMUABLES (CustomTkinter)
 
-### CustomTkinter place()
-- width/height dans constructeur UNIQUEMENT
-- place() = x/y/relwidth/relheight SEULEMENT
-
-### Frames racines
-- SEUL : place(x=0, y=0, relwidth=1, relheight=1)
-- INTERDIT : pack(fill="both") = écran noir
-
-### Sidebar
-- CTkScrollableFrame + pack() interne
-- Badge = emoji 🇩🇿, jamais texte "DZ"
-
-### DB init
-- initialize_database() AVANT ctk.CTk()
-
-### FIFO (conservé dans la DB même si non affiché)
-- deduction_engine.py intact
-- Rollover 1er Mai fonctionnel via Administration
-
-### Updater
-- Téléchargement dans %TEMP% uniquement
-
-### Crash dump
-- tashil_boot_error.txt avant sys.exit
+- `width` / `height` : constructeur **uniquement**, jamais dans `.place()`.
+- Frames racines des vues : `place(x=0, y=0, relwidth=1, relheight=1)`
+  **strictement** — jamais `pack(fill="both", expand=True)` (écran noir).
+- Sidebar : `CTkScrollableFrame` + `pack()` en interne.
+- Badge pays : emoji 🇩🇿 uniquement, jamais le texte "DZ".
+- `initialize_database()` doit s'exécuter **avant** `ctk.CTk()`.
+- Updater : téléchargement dans `%TEMP%` uniquement (jamais Desktop).
+- Crash dump : `tashil_boot_error.txt` écrit avant tout `sys.exit`.
 
 ---
 
-## 5. Polycliniques EPSP ES-SENIA (7)
+## 5. Archive locale isolée (CRUCIAL)
 
-| Code | Nom |
-|------|-----|
-| POLY_01 | POLYCLINIQUE ES SENIA |
-| POLY_02 | POLYCLINIQUE AADL AIN BEIDA MABROUK LOUCIF |
-| POLY_03 | POLYCLINIQUE AIN BEIDA 1 |
-| POLY_04 | POLYCLINIQUE AIN BEIDA 2 |
-| POLY_05 | POLYCLINIQUE SIDI MAAROUF |
-| POLY_06 | POLYCLINIQUE SIDI CHAHMI |
-| POLY_07 | POLYCLINIQUE EL KERMA |
+Tout fichier envoyé ou reçu — y compris via le pont téléphone — est copié
+automatiquement dans :
+
+```
+C:\TASHIL\TASHIL_ARCHIVES\
+├── Courrier_Sortant\   (copies des envois + scans téléphone)
+└── Courrier_Entrant\   (documents reçus téléchargés)
+```
+
+Nommage standardisé : `YYYYMMDD_HHMMSS_[INSTITUTION]_[FILENAME]`
+Implémenté dans `app/utils/archive_manager.py`.
+
+Les données applicatives (profil, base SQLite) sont séparées sous
+`C:\TASHIL\AppData\` pour ne jamais polluer les archives officielles.
 
 ---
 
-## 6. Historique corrections
+## 6. Pont Téléphone (transfert sans câble)
 
-| Version | Correction |
-|---------|------------|
-| v1.1.32 | Sidebar scrollable, modules rendus |
-| v1.1.33 | Mois FR, badge drapeau |
-| v1.1.34 | Migration TASHIL-ES |
-| v1.1.35 | Fix Errno 13 updater TEMP |
-| v1.1.36 | DnD, institutions EPSP/EPH/CHU/EHU |
-| v1.1.37 | Bordereau/TableauService supprimés |
-| v1.1.38 | Employés/Congés/Reliquats supprimés, Admin pro |
+- `phone_bridge.py` démarre un `ThreadingHTTPServer` local (port 8842 par
+  défaut, configurable dans `config.py`).
+- Un QR code (`qrcode` + `Pillow`) encode `http://<ip_lan>:8842/`.
+- Le téléphone scanne → page web minimaliste servie inline (aucune install
+  requise) → upload multipart vers `/upload`.
+- Le fichier est écrit directement dans `Courrier_Sortant` et une entrée
+  est ajoutée à `phone_bridge_queue` ; l'UI sonde cette file toutes les
+  2.5s et affiche un toast de confirmation.
+
+---
+
+## 7. 58 Wilayas & types d'institution
+
+Liste complète des 58 wilayas dans `app/config.py::WILAYAS`.
+Types d'institution : `EPSP`, `EPH`, `CHU`, `EHU`, `Polyclinique`.
+
+---
+
+## 8. État des livrables demandés (2026-08-23)
+
+| Fichier | Statut |
+|---------|--------|
+| `main.py` | ✅ Généré — bootstrap complet, splash, crash dump, routing |
+| `app/views/vue_activation.py` | ✅ Généré — wizard 3 étapes |
+| `app/views/app_principale.py` | ✅ Généré — sidebar 4 modules, header, routing |
+| `app/utils/phone_bridge.py` | ✅ Généré — serveur HTTP + QR |
+| `app/utils/archive_manager.py` | ✅ Généré — routage archive isolée |
+| `STATE.md` | ✅ Ce fichier, mis à jour |
+
+**Modules de support additionnels générés pour rendre le code exécutable**
+(non explicitement demandés mais requis par les imports ci-dessus) :
+`config.py`, `database.py`, `theme.py`, `version.py`, `serial_key.py`,
+`notifications.py`, `updater.py`, `vue_dashboard.py`, `vue_messagerie.py`,
+`vue_administration.py`, `vue_parametres.py`, `requirements.txt`,
+`epsp_conge.spec`, `.github/workflows/build_windows.yml`.
+
+---
+
+## 9. Prochaines étapes suggérées
+
+1. Fournir/générer `app/assets/icon.ico` (croix médicale verte, cf. ancien
+   projet) — actuellement référencé mais absent.
+2. Tester le premier lancement (`is_first_launch()` → wizard) sur Windows
+   réel (winsound, chemins `C:\TASHIL\...` sont Windows-only).
+3. Décider du vrai back-end de transmission inter-institutions (le
+   document de reboot mentionne "GitHub Releases/Repository comme pont de
+   transmission sécurisé" — à préciser : push vers un repo privé ? API
+   dédiée ? Actuellement les messages "envoyés" sont archivés localement
+   et enregistrés en DB, mais aucun transport réseau réel vers l'autre
+   institution n'est encore implémenté au-delà du pont téléphone local).
+4. `pip install -r requirements.txt` puis test local avant premier push
+   Termux → GitHub Actions.

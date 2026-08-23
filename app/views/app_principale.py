@@ -1,386 +1,190 @@
-# COPYRIGHT ILINE TECH 2026 BY FERAK ALADDIN
+# -*- coding: utf-8 -*-
 """
-AppPrincipale TASHIL v1.1.38
-2 onglets : Tableau de bord + Administration
-Interface professionnelle épurée
+TASHIL DOCUMENT HUB — app_principale.py
+Main application window: sidebar navigation across the 4 modules
+(Dashboard, Messagerie, Administration, Paramètres) plus a fixed header
+showing the app title and active institution.
 """
+
 import customtkinter as ctk
-from tkinter import messagebox
-import traceback
-from app.utils.theme import COULEURS, POLICES, DIMENSIONS
-from app.utils.database import get_config
-from app.utils.version import get_version
 
-try:
-    from app.config import APP_NAME, APP_TAGLINE
-except Exception:
-    APP_NAME    = "TASHIL"
-    APP_TAGLINE = "Smart Health Management System"
+from app.config import APP_NAME, APP_FLAG, APP_FULL_NAME
+from app.utils.theme import get_palette, FONTS
+from app.utils.database import get_profile, update_profile_field
+from app.utils.updater import check_for_update_async
+from app.utils.notifications import show_toast
 
-_SW = 240  # Largeur sidebar
+from app.views.vue_dashboard import VueDashboard
+from app.views.vue_messagerie import VueMessagerie
+from app.views.vue_administration import VueAdministration
+from app.views.vue_parametres import VueParametres
 
 
 class AppPrincipale(ctk.CTkFrame):
-    ONGLETS = [
-        ("dashboard", "Tableau de bord", "◉"),
-        ("admin",     "Administration",  "⚙"),
+    """
+    Root application shell. MUST be placed with
+    place(x=0, y=0, relwidth=1, relheight=1) — never packed.
+    """
+
+    NAV_ITEMS = [
+        ("dashboard", "📊  Tableau de Bord"),
+        ("messagerie", "📨  Centre de Messagerie"),
+        ("administration", "🗂️  Administration & Archivage"),
+        ("parametres", "⚙️  Paramètres"),
     ]
 
-    def __init__(self, parent, **kwargs):
-        super().__init__(
-            parent,
-            fg_color=COULEURS["bg_principal"],
-            corner_radius=0, **kwargs)
-        self._vue_active  = ""
-        self._boutons_nav = {}
-        self._vues_cache  = {}
-        self._sb = None
-        self._ct = None
-        self._construire()
-        self._verifier_rollover_auto()
-        self._naviguer("dashboard")
-        self.bind("<Configure>", self._resize)
+    def __init__(self, master):
+        profile = get_profile()
+        appearance_mode = profile["appearance_mode"] if profile else "Dark"
+        pal = get_palette(appearance_mode)
 
-    def _construire(self):
-        self._sb = ctk.CTkFrame(
-            self, width=_SW,
-            fg_color=COULEURS["bg_sidebar"],
-            corner_radius=0)
-        self._sb.place(x=0, y=0, relheight=1)
-        self._sb.pack_propagate(False)
+        super().__init__(master, fg_color=pal["bg"])
+        self.place(x=0, y=0, relwidth=1, relheight=1)
 
-        self._ct = ctk.CTkFrame(
-            self,
-            fg_color=COULEURS["bg_principal"],
-            corner_radius=0)
-        self._ct.place(
-            x=_SW, y=0,
-            relwidth=1, relheight=1)
+        self.master_window = master
+        self.pal = pal
+        self.appearance_mode = appearance_mode
+        self.profile = profile
+        self.active_view_name = "dashboard"
+        self.active_view = None
+        self.nav_buttons = {}
 
-        self._remplir_sidebar()
+        self._build_sidebar()
+        self._build_header()
+        self._build_content_area()
+        self._show_view("dashboard")
 
-    def _resize(self, _=None):
-        try:
-            self._ct.place(
-                x=_SW, y=0,
-                relwidth=1, relheight=1)
-        except Exception:
-            pass
+        check_for_update_async(self._on_update_check_result)
 
-    def _remplir_sidebar(self):
-        sb = self._sb
-        sc = ctk.CTkScrollableFrame(
-            sb, fg_color="transparent",
-            corner_radius=0,
-            scrollbar_button_color=COULEURS["bg_sidebar"],
-            scrollbar_button_hover_color=COULEURS["bg_hover"])
-        sc.pack(fill="both", expand=True)
+    # ------------------------------------------------------------------ #
+    # Sidebar
+    # ------------------------------------------------------------------ #
+    def _build_sidebar(self):
+        pal = self.pal
+        self.sidebar_frame = ctk.CTkFrame(self, fg_color=pal["sidebar"], width=250,
+                                           corner_radius=0)
+        self.sidebar_frame.place(x=0, y=0, relheight=1, width=250)
 
-        # ── Logo / En-tête ───────────────────
-        f_head = ctk.CTkFrame(
-            sc, fg_color="transparent")
-        f_head.pack(fill="x", padx=14,
-                    pady=(22, 0))
+        brand = ctk.CTkFrame(self.sidebar_frame, fg_color="transparent", height=90)
+        brand.pack(fill="x", padx=20, pady=(24, 10))
+        ctk.CTkLabel(brand, text=f"{APP_FLAG}  {APP_NAME}", font=FONTS["title"],
+                      text_color=pal["primary"]).pack(anchor="w")
+        ctk.CTkLabel(brand, text=APP_FULL_NAME, font=FONTS["small"],
+                      text_color=pal["text_muted"]).pack(anchor="w")
 
-        # Badge drapeau 🇩🇿
-        badge = ctk.CTkFrame(
-            f_head, width=52, height=52,
-            fg_color=COULEURS["accent_bleu"],
-            corner_radius=12)
-        badge.pack(side="left")
-        badge.pack_propagate(False)
-        ctk.CTkLabel(
-            badge, text="🇩🇿",
-            font=("Segoe UI Emoji", 26)
-        ).pack(expand=True)
+        # Scrollable nav — sidebar MUST use CTkScrollableFrame with pack() internally
+        self.nav_scroll = ctk.CTkScrollableFrame(self.sidebar_frame, fg_color="transparent",
+                                                   scrollbar_button_color=pal["card_border"])
+        self.nav_scroll.pack(fill="both", expand=True, padx=10, pady=10)
 
-        f_txt = ctk.CTkFrame(
-            f_head, fg_color="transparent")
-        f_txt.pack(
-            side="left", padx=(12, 0),
-            fill="both", expand=True)
-
-        ctk.CTkLabel(
-            f_txt, text=APP_NAME,
-            font=("Segoe UI", 18, "bold"),
-            text_color=COULEURS["texte_principal"]
-        ).pack(anchor="w")
-
-        ctk.CTkLabel(
-            f_txt, text=APP_TAGLINE,
-            font=("Segoe UI", 8),
-            text_color=COULEURS["texte_discret"],
-            wraplength=140, justify="left"
-        ).pack(anchor="w")
-
-        # Polyclinique active
-        poly = get_config("poly_nom") or "ES-SENIA"
-        short = (poly[:18] + "…"
-                 if len(poly) > 18 else poly)
-        ctk.CTkLabel(
-            sc, text=short,
-            font=("Segoe UI", 9, "bold"),
-            text_color=COULEURS["accent_bleu"],
-            wraplength=200, justify="left"
-        ).pack(anchor="w", padx=14,
-               pady=(8, 0))
-
-        # ── Séparateur ───────────────────────
-        ctk.CTkFrame(
-            sc, height=1,
-            fg_color=COULEURS["bordure"]
-        ).pack(fill="x", padx=14,
-               pady=(16, 10))
-
-        ctk.CTkLabel(
-            sc, text="NAVIGATION",
-            font=("Segoe UI", 9, "bold"),
-            text_color=COULEURS["texte_discret"]
-        ).pack(anchor="w", padx=18,
-               pady=(0, 10))
-
-        # ── Boutons navigation ────────────────
-        for cle, lib, ico in self.ONGLETS:
+        for key, label in self.NAV_ITEMS:
             btn = ctk.CTkButton(
-                sc, height=44,
-                text=f"  {ico}   {lib}",
-                anchor="w",
-                fg_color="transparent",
-                hover_color=COULEURS["bg_hover"],
-                text_color=COULEURS["sidebar_inact_txt"],
-                font=("Segoe UI", 13),
-                corner_radius=10,
-                command=lambda c=cle:
-                    self._naviguer(c))
-            btn.pack(fill="x", padx=10,
-                     pady=3)
-            self._boutons_nav[cle] = btn
+                self.nav_scroll, text=label, anchor="w", height=46,
+                font=FONTS["body"], corner_radius=10,
+                fg_color="transparent", hover_color=pal["card"],
+                text_color=pal["text"],
+                command=lambda k=key: self._show_view(k)
+            )
+            btn.pack(fill="x", pady=4)
+            self.nav_buttons[key] = btn
 
-        # ── Infos système ─────────────────────
-        ctk.CTkFrame(
-            sc, height=1,
-            fg_color=COULEURS["bordure"]
-        ).pack(fill="x", padx=14,
-               pady=(24, 10))
+        footer = ctk.CTkFrame(self.sidebar_frame, fg_color="transparent", height=50)
+        footer.pack(fill="x", padx=20, pady=16, side="bottom")
+        institution = self.profile["institution_name"] if self.profile else "—"
+        ctk.CTkLabel(footer, text=institution, font=FONTS["small"],
+                      text_color=pal["text_muted"], wraplength=210
+                      ).pack(anchor="w")
 
-        # Bouton MAJ
-        self.btn_maj = ctk.CTkButton(
-            sc, height=30,
-            text="🔄  Vérifier les mises à jour",
-            fg_color="transparent",
-            hover_color=COULEURS["bg_hover"],
-            text_color=COULEURS["texte_discret"],
-            font=("Segoe UI", 9),
-            corner_radius=6,
-            command=self._verifier_maj)
-        self.btn_maj.pack(
-            fill="x", padx=10, pady=(0, 8))
-
-        ctk.CTkLabel(
-            sc,
-            text=f"v{get_version()}\n"
-                 "ILINE TECH 2026\n"
-                 "BY FERAK ALADDIN",
-            font=("Segoe UI", 8),
-            text_color=COULEURS["texte_discret"],
-            justify="center"
-        ).pack(pady=(0, 20))
-
-    # ── Navigation ───────────────────────────
-    def _naviguer(self, cle: str):
-        if cle == self._vue_active:
-            return
-
-        for k, b in self._boutons_nav.items():
-            if k == cle:
-                b.configure(
-                    fg_color=COULEURS["sidebar_active_bg"],
-                    text_color=COULEURS["sidebar_active_txt"])
-            elif "⚠" not in b.cget("text"):
-                b.configure(
-                    fg_color="transparent",
-                    text_color=COULEURS["sidebar_inact_txt"])
-
-        if (self._vue_active and
-                self._vue_active in self._vues_cache):
-            try:
-                self._vues_cache[
-                    self._vue_active].place_forget()
-            except Exception:
-                pass
-
-        if cle not in self._vues_cache:
-            try:
-                vue = self._creer_vue(cle)
-                vue.place(x=0, y=0,
-                          relwidth=1, relheight=1)
-                self._vues_cache[cle] = vue
-            except Exception:
-                print(f"[ERR {cle}]\n"
-                      f"{traceback.format_exc()}")
-                return
-        else:
-            self._vues_cache[cle].place(
-                x=0, y=0,
-                relwidth=1, relheight=1)
-            try:
-                self._vues_cache[cle].rafraichir()
-            except Exception:
-                pass
-
-        self._vue_active = cle
-        try:
-            self._ct.update_idletasks()
-        except Exception:
-            pass
-
-    def _creer_vue(self, cle: str):
-        from app.views.vue_dashboard import (
-            VueDashboard)
-        from app.views.vue_administration import (
-            VueAdministration)
-
-        vues = {
-            "dashboard": VueDashboard,
-            "admin":     VueAdministration,
-        }
-        cls = vues.get(cle)
-        if not cls:
-            raise ValueError(
-                f"Vue inconnue: {cle}")
-        return cls(self._ct)
-
-    def _verifier_rollover_auto(self):
-        try:
-            from app.utils.deduction_engine import (
-                verifier_rollover_necessaire)
-            if verifier_rollover_necessaire():
-                b = self._boutons_nav.get("admin")
-                if b:
-                    b.configure(
-                        text="  ⚙   Administration ⚠",
-                        text_color=COULEURS["accent_orange"])
-        except Exception:
-            pass
-
-    def _verifier_maj(self):
-        self.btn_maj.configure(
-            state="disabled",
-            text="⏳  Vérification…")
-        from app.utils.updater import (
-            verifier_en_arriere_plan,
-            version_plus_recente)
-
-        def _cb(info):
-            self.after(0, lambda:
-                self.btn_maj.configure(
-                    state="normal",
-                    text="🔄  Vérifier les mises à jour"))
-            if not info:
-                self.after(0, lambda:
-                    messagebox.showwarning(
-                        "Mise à jour",
-                        "Pas de connexion."))
-                return
-            tag = info.get("tag", "")
-            if version_plus_recente(tag):
-                self.after(0, lambda:
-                    self._proposer_maj(info))
+    def _highlight_active_nav(self, active_key: str):
+        pal = self.pal
+        for key, btn in self.nav_buttons.items():
+            if key == active_key:
+                btn.configure(fg_color=pal["primary"], text_color="#FFFFFF")
             else:
-                self.after(0, lambda:
-                    messagebox.showinfo(
-                        "✅  À jour",
-                        f"v{get_version()}\n"
-                        f"Distante : {tag}"))
+                btn.configure(fg_color="transparent", text_color=pal["text"])
 
-        verifier_en_arriere_plan(_cb)
+    # ------------------------------------------------------------------ #
+    # Header
+    # ------------------------------------------------------------------ #
+    def _build_header(self):
+        pal = self.pal
+        self.header_frame = ctk.CTkFrame(self, fg_color=pal["bg"], height=60,
+                                          corner_radius=0)
+        self.header_frame.place(x=250, y=0, relwidth=1, height=60,
+                                 relx=0)  # positioned via update below
+        self._reposition_header()
 
-    def _proposer_maj(self, info: dict):
-        from app.utils.updater import (
-            telecharger_et_remplacer)
-        tag     = info.get("tag", "")
-        url_exe = info.get("url_exe", "")
-        taille  = round(
-            info.get("taille", 0) / 1024 / 1024, 1)
-        if not url_exe:
-            messagebox.showerror(
-                "Erreur", "Aucun .exe trouvé.")
-            return
-        if not messagebox.askyesno(
-                f"🆕  {tag}",
-                f"Version : {tag}\n"
-                f"Taille : {taille} MB\n\n"
-                "Installer maintenant ?"):
-            return
+        institution = self.profile["institution_name"] if self.profile else "Non configuré"
+        ctk.CTkLabel(self.header_frame, text=f"TASHIL  —  {institution}",
+                      font=FONTS["subtitle"], text_color=pal["text"]
+                      ).place(relx=0.98, rely=0.5, anchor="e")
 
-        dlg = ctk.CTkToplevel(self)
-        dlg.title("Mise à jour…")
-        dlg.configure(
-            fg_color=COULEURS["bg_principal"])
-        dlg.resizable(False, False)
-        dlg.grab_set()
-        dlg.attributes("-topmost", True)
-        dlg.protocol(
-            "WM_DELETE_WINDOW", lambda: None)
-        dlg.geometry("400x140")
+        self.bind("<Configure>", lambda e: self._reposition_header())
 
-        ctk.CTkLabel(
-            dlg,
-            text=f"Téléchargement {tag}…",
-            font=POLICES["sous_titre"],
-            text_color=COULEURS["texte_principal"]
-        ).pack(pady=(20, 10))
+    def _reposition_header(self):
+        self.header_frame.place_configure(x=250, y=0, width=self.winfo_width() - 250, height=60)
 
-        barre = ctk.CTkProgressBar(
-            dlg, height=12,
-            mode="determinate",
-            fg_color=COULEURS["bg_champ"],
-            progress_color=COULEURS["accent_bleu"],
-            corner_radius=6)
-        barre.pack(fill="x", padx=30,
-                   pady=(0, 6))
-        barre.set(0)
+    # ------------------------------------------------------------------ #
+    # Content area / view switching
+    # ------------------------------------------------------------------ #
+    def _build_content_area(self):
+        pal = self.pal
+        self.content_frame = ctk.CTkFrame(self, fg_color=pal["bg"], corner_radius=0)
+        self.content_frame.place(x=250, y=60, relwidth=1, relheight=1)
+        self._reposition_content()
+        self.bind("<Configure>", lambda e: (self._reposition_header(), self._reposition_content()))
 
-        lbl = ctk.CTkLabel(
-            dlg, text="0 %",
-            font=POLICES["corps_bold"],
-            text_color=COULEURS["accent_bleu"])
-        lbl.pack()
+    def _reposition_content(self):
+        w = max(self.winfo_width() - 250, 200)
+        h = max(self.winfo_height() - 60, 200)
+        self.content_frame.place_configure(x=250, y=60, width=w, height=h)
 
-        def _p(pct):
-            self.after(0, lambda p=pct: (
-                barre.set(p / 100),
-                lbl.configure(text=f"{p} %")))
+    def _show_view(self, view_name: str):
+        if self.active_view is not None:
+            self.active_view.destroy()
 
-        def _f(ok, err):
-            self.after(0, lambda:
-                self._fin_maj(dlg, ok, err))
+        self._highlight_active_nav(view_name)
+        self.active_view_name = view_name
 
-        telecharger_et_remplacer(
-            url_exe, _p, _f)
+        view_classes = {
+            "dashboard": VueDashboard,
+            "messagerie": VueMessagerie,
+            "administration": VueAdministration,
+            "parametres": VueParametres,
+        }
+        view_cls = view_classes[view_name]
 
-    def _fin_maj(self, dlg, ok, err):
-        try:
-            dlg.destroy()
-        except Exception:
-            pass
-        if ok:
-            messagebox.showinfo(
-                "✅", "Redémarrage en cours…")
-            self.after(600, self._quitter_maj)
+        if view_name == "parametres":
+            self.active_view = view_cls(self.content_frame, self.appearance_mode,
+                                         on_appearance_change=self._on_appearance_change)
         else:
-            messagebox.showerror(
-                "❌  Échec", str(err))
+            self.active_view = view_cls(self.content_frame, self.appearance_mode)
 
-    def _quitter_maj(self):
-        try:
-            from app.utils.database import (
-                faire_backup)
-            faire_backup("avant_maj")
-        except Exception:
-            pass
-        import os
-        os._exit(0)
+        # All main view frames must use place(), never pack(fill='both', expand=True)
+        self.active_view.place(x=0, y=0, relwidth=1, relheight=1)
 
-    def rafraichir(self):
-        pass
+    # ------------------------------------------------------------------ #
+    # Appearance mode live switching
+    # ------------------------------------------------------------------ #
+    def _on_appearance_change(self, new_mode: str):
+        self.appearance_mode = new_mode
+        update_profile_field("appearance_mode", new_mode)
+        ctk.set_appearance_mode(new_mode)
+        self.pal = get_palette(new_mode)
+        self.configure(fg_color=self.pal["bg"])
+        # Rebuild the whole shell so every widget picks up the new palette
+        for child in self.winfo_children():
+            child.destroy()
+        self._build_sidebar()
+        self._build_header()
+        self._build_content_area()
+        self._show_view(self.active_view_name)
+
+    # ------------------------------------------------------------------ #
+    # OTA update notice
+    # ------------------------------------------------------------------ #
+    def _on_update_check_result(self, result):
+        if result is None:
+            return
+        show_toast(self, f"Nouvelle version disponible : {result['version']}",
+                    kind="info", appearance_mode=self.appearance_mode)

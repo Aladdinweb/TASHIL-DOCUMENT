@@ -1,130 +1,47 @@
-# COPYRIGHT ILINE TECH 2026 BY FERAK ALADDIN
-name: Build TASHIL Windows EXE
+name: Build TASHIL DOCUMENT HUB (Windows)
 
 on:
   push:
-    branches: [ main ]
+    branches: [main]
+    tags: ["v*"]
   workflow_dispatch:
-
-permissions:
-  contents: write
 
 jobs:
   build:
     runs-on: windows-latest
-    timeout-minutes: 45
-
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
 
-      - name: Setup Python 3.11
+      - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-          cache: "pip"
 
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install customtkinter tkinterdnd2 openpyxl pillow pyinstaller darkdetect packaging
+          pip install -r requirements.txt
 
-      - name: Get patch number
-        id: patch
+      - name: Build with PyInstaller
         run: |
-          $p = (git rev-list --count HEAD)
-          echo "PATCH=$p" >> $env:GITHUB_OUTPUT
-          Write-Host "Patch: $p"
+          pyinstaller epsp_conge.spec
 
-      - name: Inject version v1.1.PATCH
+      - name: Rename artifact
         run: |
-          $p = "${{ steps.patch.outputs.PATCH }}"
-          $c = Get-Content app/utils/version.py -Raw
-          $c = $c -replace 'VERSION_BUILD = \d+', "VERSION_BUILD = $p"
-          Set-Content app/utils/version.py $c
-          Write-Host "TASHIL v1.1.$p"
+          copy dist\TASHIL_DOCUMENT.exe TASHIL_DOCUMENT.exe
 
-      - name: Generate icon
-        run: python app/assets/create_icon.py
-        continue-on-error: true
-
-      - name: Build EXE
-        run: |
-          pyinstaller epsp_conge.spec --clean --noconfirm --log-level WARN
-
-      - name: Verify EXE
-        run: |
-          if (Test-Path "dist\EPSP_CongeManager.exe") {
-            $s = (Get-Item "dist\EPSP_CongeManager.exe").Length/1MB
-            Write-Host "EXE: $([math]::Round($s,1)) MB"
-          } else {
-            Write-Error "EXE not found"
-            exit 1
-          }
-
-      - name: Decode certificate
-        env:
-          SIGNING_CERT_B64: ${{ secrets.SIGNING_CERT_B64 }}
-        run: |
-          if ("$env:SIGNING_CERT_B64" -ne "") {
-            $b = [Convert]::FromBase64String($env:SIGNING_CERT_B64)
-            [IO.File]::WriteAllBytes("signing_cert.pfx", $b)
-          }
-        continue-on-error: true
-
-      - name: Sign EXE
-        env:
-          SIGNING_PASSWORD: ${{ secrets.SIGNING_CERT_PASSWORD }}
-        run: |
-          if (Test-Path "signing_cert.pfx") {
-            $t = @(
-              "C:\Program Files (x86)\Windows Kits\10\bin\10.0.22621.0\x64\signtool.exe",
-              "C:\Program Files (x86)\Windows Kits\10\bin\10.0.19041.0\x64\signtool.exe"
-            ) | Where-Object {Test-Path $_} | Select-Object -First 1
-            if ($t) {
-              & $t sign /f "signing_cert.pfx" /p "$env:SIGNING_PASSWORD" `
-                /fd SHA256 /tr http://timestamp.digicert.com /td SHA256 `
-                /d "TASHIL Smart Health Management System" `
-                "dist\EPSP_CongeManager.exe"
-            }
-            Remove-Item "signing_cert.pfx" -Force
-          }
-        continue-on-error: true
-
-      - name: Upload artifact
+      - name: Upload build artifact
         uses: actions/upload-artifact@v4
         with:
-          name: TASHIL_v1.1.${{ steps.patch.outputs.PATCH }}
-          path: dist/EPSP_CongeManager.exe
-          retention-days: 30
+          name: TASHIL_DOCUMENT
+          path: TASHIL_DOCUMENT.exe
 
-      - name: Create Release
+      - name: Create GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: v1.1.${{ steps.patch.outputs.PATCH }}
-          name: "TASHIL v1.1.${{ steps.patch.outputs.PATCH }}"
-          body: |
-            ## TASHIL: Smart Health Management System
-            **v1.1.${{ steps.patch.outputs.PATCH }}**
-            *COPYRIGHT ILINE TECH 2026 BY FERAK ALADDIN*
-
-            ### Installation
-            1. Télécharger `EPSP_CongeManager.exe`
-            2. Placer dans `C:\TASHIL\`
-            3. Double-cliquer pour lancer
-
-            ### Fonctionnalités
-            - Dashboard TASHIL avec 4 tuiles cliquables
-            - 18 services cliniques EPSP
-            - Onglets Congé et Reliquat séparés
-            - FIFO déduction automatique
-            - Rollover 1er Mai
-            - Backup automatique SQLite
-            - Mise à jour automatique in-app
-          draft: false
-          prerelease: false
-          files: dist/EPSP_CongeManager.exe
+          files: TASHIL_DOCUMENT.exe
+          generate_release_notes: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
