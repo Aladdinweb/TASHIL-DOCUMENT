@@ -1,6 +1,10 @@
 # -*- mode: python ; coding: utf-8 -*-
+import os
 
 block_cipher = None
+
+_icon_path = os.path.join('app', 'assets', 'icon.ico')
+_icon = _icon_path if os.path.exists(_icon_path) else None
 
 a = Analysis(
     ['main.py'],
@@ -39,5 +43,5 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
-    icon='app/assets/icon.ico',
+    icon=_icon,
 )
