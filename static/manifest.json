@@ -1,0 +1,16 @@
+{
+  "name": "TASHIL DOCUMENT HUB",
+  "short_name": "TASHIL",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#0F1419",
+  "theme_color": "#0F1419",
+  "icons": [
+    {
+      "src": "/static/assets/logo.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "any maskable"
+    }
+  ]
+}

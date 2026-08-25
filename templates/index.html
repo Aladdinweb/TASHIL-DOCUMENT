@@ -1,0 +1,165 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>TASHIL DOCUMENT HUB</title>
+<link rel="manifest" href="/manifest.json">
+<link rel="icon" href="/static/assets/logo.png">
+<link rel="apple-touch-icon" href="/static/assets/logo.png">
+<meta name="theme-color" content="#0F1419">
+<link rel="stylesheet" href="/static/css/style.css">
+</head>
+<body>
+
+<!-- Onboarding modal (first launch only) -->
+<div id="onboarding-overlay" class="overlay hidden">
+  <div class="onboarding-card">
+    <img src="/static/assets/logo.png" alt="TASHIL" class="onboarding-logo">
+    <h1>TASHIL DOCUMENT HUB</h1>
+    <p class="muted">Configuration initiale de l'établissement</p>
+
+    <div id="onboarding-step-1" class="onboarding-step">
+      <label>Wilaya</label>
+      <select id="ob-wilaya"></select>
+      <label>Type d'établissement</label>
+      <select id="ob-type"></select>
+      <label>Nom de l'établissement</label>
+      <input id="ob-name" type="text" placeholder="ex: EPH AADL Ain Beida">
+      <button class="btn btn-primary" id="ob-submit">Activer TASHIL</button>
+      <p id="ob-error" class="error hidden"></p>
+    </div>
+  </div>
+</div>
+
+<!-- App shell -->
+<div id="app" class="app hidden">
+
+  <header class="topbar">
+    <div class="brand">
+      <img src="/static/assets/logo.png" alt="TASHIL" class="brand-logo">
+      <div class="brand-text">
+        <span class="brand-title">TASHIL</span>
+        <span class="brand-subtitle" id="institution-name">—</span>
+      </div>
+    </div>
+    <button id="theme-toggle" class="icon-btn" title="Changer le thème">🌓</button>
+  </header>
+
+  <nav class="tabbar" id="tabbar">
+    <button class="tab active" data-view="dashboard">
+      <span class="tab-icon">📊</span><span class="tab-label">Tableau de Bord</span>
+    </button>
+    <button class="tab" data-view="messagerie">
+      <span class="tab-icon">📨</span><span class="tab-label">Messagerie</span>
+    </button>
+    <button class="tab" data-view="registre">
+      <span class="tab-icon">🗂️</span><span class="tab-label">Registre</span>
+    </button>
+    <button class="tab" data-view="parametres">
+      <span class="tab-icon">⚙️</span><span class="tab-label">Paramètres</span>
+    </button>
+  </nav>
+
+  <main class="content">
+
+    <!-- Dashboard -->
+    <section id="view-dashboard" class="view active">
+      <h2>Tableau de Bord</h2>
+      <div class="stat-grid">
+        <div class="stat-card">
+          <span class="stat-icon">📤</span>
+          <span class="stat-value" id="stat-sent">0</span>
+          <span class="stat-label">Total Envoyés</span>
+        </div>
+        <div class="stat-card">
+          <span class="stat-icon">📥</span>
+          <span class="stat-value" id="stat-received">0</span>
+          <span class="stat-label">Total Reçus</span>
+        </div>
+        <div class="stat-card">
+          <span class="stat-icon">⏳</span>
+          <span class="stat-value" id="stat-pending">0</span>
+          <span class="stat-label">En Attente</span>
+        </div>
+      </div>
+      <h3>Activité Récente</h3>
+      <div class="card list-card" id="recent-activity">
+        <p class="empty-state">Aucune activité pour le moment.</p>
+      </div>
+    </section>
+
+    <!-- Messagerie -->
+    <section id="view-messagerie" class="view">
+      <h2>Centre de Messagerie</h2>
+      <div class="subtabs">
+        <button class="subtab active" data-subview="envoi">Boîte d'envoi</button>
+        <button class="subtab" data-subview="reception">Boîte de réception</button>
+        <button class="subtab" data-subview="reseau">Accès réseau</button>
+      </div>
+
+      <div id="sub-envoi" class="subview active">
+        <div class="card">
+          <div class="drop-zone" id="drop-zone">
+            <span id="drop-zone-text">📎 Glissez un fichier ici ou cliquez pour choisir</span>
+            <input type="file" id="file-input" hidden>
+          </div>
+          <label>Institution destinataire</label>
+          <input type="text" id="msg-recipient" placeholder="ex: EPH AADL Ain Beida">
+          <label>Objet</label>
+          <input type="text" id="msg-subject">
+          <label>Message</label>
+          <textarea id="msg-body" rows="4"></textarea>
+          <button class="btn btn-success" id="msg-send-btn">📤 Envoyer</button>
+          <p id="msg-send-status" class="status-line"></p>
+        </div>
+      </div>
+
+      <div id="sub-reception" class="subview">
+        <div class="card list-card" id="inbox-list">
+          <p class="empty-state">Boîte de réception vide.</p>
+        </div>
+      </div>
+
+      <div id="sub-reseau" class="subview">
+        <div class="card">
+          <p>Ouvrez cette adresse depuis un téléphone connecté au même Wi-Fi pour accéder à TASHIL :</p>
+          <p class="lan-url" id="lan-url">—</p>
+          <p class="muted">Aucune installation nécessaire — le navigateur suffit.</p>
+        </div>
+      </div>
+    </section>
+
+    <!-- Registre -->
+    <section id="view-registre" class="view">
+      <h2>Administration &amp; Archivage</h2>
+      <p class="muted">Registre Officiel des Courriers</p>
+      <div class="subtabs">
+        <button class="subtab active" data-filter="tous">Tous</button>
+        <button class="subtab" data-filter="entrant">Entrant</button>
+        <button class="subtab" data-filter="sortant">Sortant</button>
+      </div>
+      <div class="card list-card" id="registre-list">
+        <p class="empty-state">Aucun enregistrement.</p>
+      </div>
+    </section>
+
+    <!-- Paramètres -->
+    <section id="view-parametres" class="view">
+      <h2>Paramètres</h2>
+      <div class="card">
+        <h3>🏥 Profil de l'établissement</h3>
+        <p id="pf-wilaya">Wilaya : —</p>
+        <p id="pf-type">Type : —</p>
+        <p id="pf-name">Nom : —</p>
+        <label>Clé de licence</label>
+        <div class="key-box" id="pf-serial">—</div>
+      </div>
+    </section>
+
+  </main>
+</div>
+
+<script src="/static/js/app.js"></script>
+</body>
+</html>
