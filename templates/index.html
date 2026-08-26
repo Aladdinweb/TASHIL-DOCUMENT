@@ -105,7 +105,9 @@
             <input type="file" id="file-input" hidden>
           </div>
           <label>Institution destinataire</label>
-          <input type="text" id="msg-recipient" placeholder="ex: EPH AADL Ain Beida">
+          <input type="text" id="msg-recipient" list="institutions-list"
+                 placeholder="Tapez pour rechercher (ex: EPH, Polyclinique...)" autocomplete="off">
+          <datalist id="institutions-list"></datalist>
           <label>Objet</label>
           <input type="text" id="msg-subject">
           <label>Message</label>
@@ -154,6 +156,19 @@
         <p id="pf-name">Nom : —</p>
         <label>Clé de licence</label>
         <div class="key-box" id="pf-serial">—</div>
+      </div>
+
+      <div class="card">
+        <h3>🔄 Mise à jour du logiciel</h3>
+        <p class="muted">Version actuelle : <span id="current-version">—</span></p>
+        <div id="update-banner" class="update-banner hidden">
+          <p id="update-message"></p>
+          <a id="update-download-link" class="btn btn-success" href="#" target="_blank" rel="noopener">
+            ⬇️ Télécharger la mise à jour
+          </a>
+        </div>
+        <button class="btn btn-primary" id="check-update-btn">🔍 Vérifier les mises à jour</button>
+        <p id="update-status" class="status-line"></p>
       </div>
     </section>
 

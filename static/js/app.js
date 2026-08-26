@@ -99,10 +99,24 @@ function showApp() {
   setupNav();
   setupThemeToggle();
   setupMessaging();
+  setupUpdateChecker();
   renderParametres();
   loadDashboard();
+  loadInstitutions();
 
   document.getElementById("lan-url").textContent = state.meta.lan_url;
+  document.getElementById("current-version").textContent = `v${state.meta.app_version}`;
+}
+
+async function loadInstitutions() {
+  try {
+    const data = await fetch("/api/institutions").then(r => r.json());
+    const datalist = document.getElementById("institutions-list");
+    datalist.innerHTML = data.institutions.map(name =>
+      `<option value="${escapeHtml(name)}"></option>`).join("");
+  } catch (err) {
+    // Datalist is a progressive enhancement — free typing still works if this fails
+  }
 }
 
 function setupNav() {
@@ -298,6 +312,63 @@ function renderParametres() {
   document.getElementById("pf-type").textContent = `Type : ${state.profile.institution_type}`;
   document.getElementById("pf-name").textContent = `Nom : ${state.profile.institution_name}`;
   document.getElementById("pf-serial").textContent = state.profile.serial_key;
+}
+
+// ------------------------------------------------------------------ //
+// OTA update checker (GitHub Releases API)
+// ------------------------------------------------------------------ //
+function setupUpdateChecker() {
+  document.getElementById("check-update-btn").addEventListener("click", checkForUpdate);
+}
+
+function parseVersion(tag) {
+  // Accepts "v2.1.0" or "2.1.0"; returns [2,1,0] for comparison
+  const clean = tag.replace(/^v/i, "");
+  return clean.split(".").map(n => parseInt(n, 10) || 0);
+}
+
+function isNewer(remote, current) {
+  for (let i = 0; i < Math.max(remote.length, current.length); i++) {
+    const r = remote[i] || 0;
+    const c = current[i] || 0;
+    if (r > c) return true;
+    if (r < c) return false;
+  }
+  return false;
+}
+
+async function checkForUpdate() {
+  const statusEl = document.getElementById("update-status");
+  const banner = document.getElementById("update-banner");
+  statusEl.className = "status-line";
+  statusEl.textContent = "Recherche en cours...";
+  banner.classList.add("hidden");
+
+  try {
+    const res = await fetch(
+      `https://api.github.com/repos/${state.meta.github_repo}/releases/latest`,
+      { headers: { "Accept": "application/vnd.github+json" } }
+    );
+    if (!res.ok) throw new Error(`GitHub a répondu avec le statut ${res.status}`);
+    const release = await res.json();
+
+    const remoteVersion = parseVersion(release.tag_name || "0.0.0");
+    const currentVersion = parseVersion(state.meta.app_version);
+
+    if (isNewer(remoteVersion, currentVersion)) {
+      const asset = (release.assets || []).find(a => a.name.endsWith(".exe"));
+      document.getElementById("update-message").textContent =
+        `Nouvelle version disponible : ${release.tag_name} (actuelle : v${state.meta.app_version})`;
+      document.getElementById("update-download-link").href =
+        asset ? asset.browser_download_url : release.html_url;
+      banner.classList.remove("hidden");
+      statusEl.textContent = "";
+    } else {
+      statusEl.textContent = "✅ TASHIL est à jour.";
+    }
+  } catch (err) {
+    statusEl.textContent = `⛔ Impossible de vérifier les mises à jour : ${err.message}`;
+  }
 }
 
 // ------------------------------------------------------------------ //

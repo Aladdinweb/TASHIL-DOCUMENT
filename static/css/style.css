@@ -178,6 +178,14 @@ textarea { resize: vertical; }
   margin-top: 6px; word-break: break-all;
 }
 
+.update-banner {
+  background: var(--input-bg); border: 1px solid var(--primary);
+  border-radius: 10px; padding: 14px; margin: 14px 0;
+}
+.update-banner p { margin: 0 0 10px; }
+.update-banner .btn { width: auto; display: inline-block; text-decoration: none;
+  text-align: center; margin-top: 0; padding: 10px 18px; }
+
 label { display: block; font-size: 13px; color: var(--text-muted); margin: 12px 0 4px; }
 label:first-child { margin-top: 0; }
 

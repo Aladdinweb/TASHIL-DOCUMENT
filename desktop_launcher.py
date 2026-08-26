@@ -3,15 +3,18 @@
 TASHIL DOCUMENT HUB — desktop_launcher.py
 Copyright ILINE TECH 2026 BY FERAK ALADDIN
 
-Windows entry point. Deliberately minimal: starts the Flask server on a
-background thread, waits for it to be ready, then opens it in the
-system's default browser. There is no custom window, no manual widget
-positioning, no PyInstaller icon dependency for the UI itself — the
-browser renders everything, which is exactly what makes this reliable
-where the old CustomTkinter build was not.
+Windows entry point. Starts the Flask server on a background thread,
+waits for it to be ready, then shows it in a native desktop window via
+pywebview (its own title bar and icon, no external Chrome/Edge tab).
 
-Any failure is shown in a native Windows message box (not just logged),
-so nothing can fail silently.
+⚠️ Reliability note: pywebview on Windows depends on the Microsoft Edge
+WebView2 runtime and its own bundled DLLs — this is a real dependency
+that the old browser-tab approach didn't have. If pywebview fails to
+import or the native window fails to start for any reason (WebView2
+missing, DLL not bundled correctly, etc.), this launcher automatically
+falls back to opening the default browser — the same approach already
+confirmed working — so a WebView2 problem can never again produce a
+silent blank or frozen window like the old CustomTkinter build did.
 """
 
 import os
@@ -22,6 +25,9 @@ import socket
 import threading
 import traceback
 import webbrowser
+
+
+APP_URL = "http://127.0.0.1:5000/"
 
 
 def _dump_path() -> str:
@@ -51,6 +57,43 @@ def _port_is_open(port: int) -> bool:
         return s.connect_ex(("127.0.0.1", port)) == 0
 
 
+def _wait_for_server(port: int, attempts: int = 40, interval: float = 0.25) -> bool:
+    for _ in range(attempts):  # up to ~10s
+        if _port_is_open(port):
+            return True
+        time.sleep(interval)
+    return False
+
+
+def _try_native_window(icon_path: str | None) -> bool:
+    """
+    Attempts to show the app in a native pywebview window. Returns True if
+    the window ran and closed normally, False if it could not start at all
+    (caller should fall back to the browser in that case).
+    """
+    try:
+        import webview
+    except Exception:
+        return False  # pywebview not available in this build — fall back silently
+
+    try:
+        window_kwargs = dict(
+            title="TASHIL DOCUMENT HUB",
+            url=APP_URL,
+            width=1180,
+            height=720,
+            min_size=(980, 620),
+            text_select=True,
+        )
+        webview.create_window(**window_kwargs)
+        webview.start(icon=icon_path) if icon_path else webview.start()
+        return True
+    except Exception:
+        # WebView2 runtime missing, DLL bundling issue, etc. — don't crash,
+        # let main() fall back to the browser instead.
+        return False
+
+
 def main():
     try:
         # When frozen by PyInstaller, app.py and its templates/static folders
@@ -69,17 +112,19 @@ def main():
         )
         server_thread.start()
 
-        # Wait for the server to actually be listening before opening the browser
-        for _ in range(40):  # up to ~10s
-            if _port_is_open(5000):
-                break
-            time.sleep(0.25)
+        if not _wait_for_server(5000):
+            raise RuntimeError("Le serveur local TASHIL n'a pas démarré à temps.")
 
-        webbrowser.open("http://127.0.0.1:5000/")
+        icon_path = os.path.join(base_dir, "static", "assets", "icon.ico")
+        icon_path = icon_path if os.path.exists(icon_path) else None
 
-        # Keep the process alive as long as the server thread is running
-        while server_thread.is_alive():
-            time.sleep(1)
+        opened_native = _try_native_window(icon_path)
+
+        if not opened_native:
+            # Fallback: proven-reliable browser-tab approach.
+            webbrowser.open(APP_URL)
+            while server_thread.is_alive():
+                time.sleep(1)
 
     except Exception as exc:  # noqa: BLE001 — deliberately broad: this is the top-level guard
         _show_fatal_error(exc)

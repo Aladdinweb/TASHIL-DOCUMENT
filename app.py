@@ -38,6 +38,8 @@ os.makedirs(ARCHIVE_SORTANT, exist_ok=True)
 os.makedirs(ARCHIVE_ENTRANT, exist_ok=True)
 
 APP_ROOT = os.path.dirname(os.path.abspath(__file__))
+APP_VERSION = "2.1.0"
+GITHUB_REPO = "Aladdinweb/TASHIL-ES"  # used by the in-app OTA update checker
 
 app = Flask(__name__,
             template_folder=os.path.join(APP_ROOT, "templates"),
@@ -63,6 +65,43 @@ WILAYAS = [
     (54, "In Guezzam"), (55, "Touggourt"), (56, "Djanet"),
     (57, "El M'Ghair"), (58, "El Meniaa"),
 ]
+
+# --------------------------------------------------------------------------- #
+# Institution directory (autocomplete source for "Institution destinataire").
+#
+# ⚠️ STARTER LIST, NOT AN OFFICIAL REGISTRY: there is no verified national
+# database of every Algerian health institution built into this app. This
+# list seeds the autocomplete with (a) your real EPSP ES-SENIA network and
+# (b) a generic "<Type> <Wilaya>" pattern for institution types that exist
+# in nearly every wilaya. CHU entries are limited to wilayas that are
+# publicly known to actually host one — still worth double-checking.
+# Edit this list directly with your real inter-institution contact list
+# as it grows; the datalist also accepts free typing for anything not
+# listed here.
+# --------------------------------------------------------------------------- #
+_REAL_ESSENIA_POLYCLINICS = [
+    "POLYCLINIQUE ES SENIA",
+    "POLYCLINIQUE AADL AIN BEIDA MABROUK LOUCIF",
+    "POLYCLINIQUE AIN BEIDA 1",
+    "POLYCLINIQUE AIN BEIDA 2",
+    "POLYCLINIQUE SIDI MAAROUF",
+    "POLYCLINIQUE SIDI CHAHMI",
+    "POLYCLINIQUE EL KERMA",
+]
+_CHU_WILAYAS = {"Alger", "Oran", "Constantine", "Annaba", "Tlemcen", "Sétif",
+                "Batna", "Blida", "Béjaïa", "Sidi Bel Abbès", "Tizi Ouzou"}
+
+def _build_institutions_directory():
+    entries = list(_REAL_ESSENIA_POLYCLINICS)
+    for _, wilaya_name in WILAYAS:
+        entries.append(f"EPSP {wilaya_name}")
+        entries.append(f"EPH {wilaya_name}")
+        entries.append(f"Polyclinique {wilaya_name}")
+        if wilaya_name in _CHU_WILAYAS:
+            entries.append(f"CHU {wilaya_name}")
+    return sorted(set(entries))
+
+INSTITUTIONS_DIRECTORY = _build_institutions_directory()
 
 
 # --------------------------------------------------------------------------- #
@@ -168,7 +207,14 @@ def api_meta():
         "wilayas": WILAYAS,
         "institution_types": INSTITUTION_TYPES,
         "lan_url": f"http://{get_lan_ip()}:5000/",
+        "app_version": APP_VERSION,
+        "github_repo": GITHUB_REPO,
     })
+
+
+@app.route("/api/institutions", methods=["GET"])
+def api_institutions():
+    return jsonify({"institutions": INSTITUTIONS_DIRECTORY})
 
 
 @app.route("/api/profile", methods=["GET"])
