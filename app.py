@@ -38,7 +38,7 @@ os.makedirs(ARCHIVE_SORTANT, exist_ok=True)
 os.makedirs(ARCHIVE_ENTRANT, exist_ok=True)
 
 APP_ROOT = os.path.dirname(os.path.abspath(__file__))
-APP_VERSION = "2.1.0"
+APP_VERSION = "2.2.0"
 GITHUB_REPO = "Aladdinweb/TASHIL-ES"  # used by the in-app OTA update checker
 
 app = Flask(__name__,
@@ -277,6 +277,20 @@ def api_set_theme():
     return jsonify({"ok": True})
 
 
+@app.route("/api/profile/logout", methods=["POST"])
+def api_logout():
+    """
+    Clears the local profile so the onboarding wizard reappears on next
+    load. Deliberately does NOT touch messages/archives — logout resets
+    who this installation is registered as, not the data it holds.
+    """
+    conn = get_db()
+    conn.execute("DELETE FROM profile WHERE id = 1")
+    conn.commit()
+    conn.close()
+    return jsonify({"ok": True})
+
+
 # --------------------------------------------------------------------------- #
 # API — Dashboard
 # --------------------------------------------------------------------------- #
@@ -357,6 +371,52 @@ def api_download_message(message_id):
         abort(404)
     return send_file(row["file_path"], as_attachment=True,
                       download_name=row["file_original_name"] or "document")
+
+
+@app.route("/api/messages/<int:message_id>/status", methods=["POST"])
+def api_update_message_status(message_id):
+    """
+    Used for the 'accusé de réception' action: the recipient confirms a
+    received document. Also usable generically for any status change.
+    """
+    data = request.get_json(force=True)
+    status = data.get("status", "").strip()
+    if status not in ("envoye", "recu", "accuse", "en_attente"):
+        return jsonify({"error": "Statut invalide."}), 400
+
+    conn = get_db()
+    row = conn.execute("SELECT * FROM messages WHERE id = ?", (message_id,)).fetchone()
+    if row is None:
+        conn.close()
+        return jsonify({"error": "Message introuvable."}), 404
+
+    conn.execute("UPDATE messages SET status = ? WHERE id = ?", (status, message_id))
+    conn.commit()
+    updated = conn.execute("SELECT * FROM messages WHERE id = ?", (message_id,)).fetchone()
+    conn.close()
+    return jsonify({"ok": True, "message": dict(updated)})
+
+
+@app.route("/api/messages/<int:message_id>", methods=["DELETE"])
+def api_delete_message(message_id):
+    conn = get_db()
+    row = conn.execute("SELECT * FROM messages WHERE id = ?", (message_id,)).fetchone()
+    if row is None:
+        conn.close()
+        return jsonify({"error": "Message introuvable."}), 404
+
+    file_path = row["file_path"]
+    conn.execute("DELETE FROM messages WHERE id = ?", (message_id,))
+    conn.commit()
+    conn.close()
+
+    if file_path and os.path.exists(file_path):
+        try:
+            os.remove(file_path)
+        except OSError:
+            pass  # DB record is already gone; a leftover file is not fatal
+
+    return jsonify({"ok": True})
 
 
 # --------------------------------------------------------------------------- #

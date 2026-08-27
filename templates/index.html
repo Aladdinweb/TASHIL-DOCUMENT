@@ -12,6 +12,9 @@
 </head>
 <body>
 
+<!-- Toast notifications -->
+<div id="toast-container" class="toast-container"></div>
+
 <!-- Onboarding modal (first launch only) -->
 <div id="onboarding-overlay" class="overlay hidden">
   <div class="onboarding-card">
@@ -170,7 +173,21 @@
         <button class="btn btn-primary" id="check-update-btn">🔍 Vérifier les mises à jour</button>
         <p id="update-status" class="status-line"></p>
       </div>
+
+      <div class="card">
+        <h3>🚪 Session</h3>
+        <p class="muted">
+          Réinitialise l'identité de cet appareil (Wilaya, établissement, clé
+          de licence) et relance la configuration initiale. Les messages et
+          archives déjà enregistrés ne sont pas supprimés.
+        </p>
+        <button class="btn btn-danger" id="logout-btn">🚪 Déconnexion / Réinitialiser le profil</button>
+      </div>
     </section>
+
+    <footer class="app-footer">
+      <p>© ILINE TECH BY FERAK ALADDIN</p>
+    </footer>
 
   </main>
 </div>

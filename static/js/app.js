@@ -5,6 +5,8 @@ const state = {
   profile: null,
   meta: null,
   currentView: "dashboard",
+  lastKnownReceived: null,
+  notifyPermissionAsked: false,
 };
 
 // ------------------------------------------------------------------ //
@@ -100,12 +102,78 @@ function showApp() {
   setupThemeToggle();
   setupMessaging();
   setupUpdateChecker();
+  setupLogout();
   renderParametres();
   loadDashboard();
   loadInstitutions();
+  requestNotificationPermission();
+  startBackgroundPolling();
 
   document.getElementById("lan-url").textContent = state.meta.lan_url;
   document.getElementById("current-version").textContent = `v${state.meta.app_version}`;
+}
+
+// ------------------------------------------------------------------ //
+// Toast notifications
+// ------------------------------------------------------------------ //
+function showToast(message, kind = "info") {
+  const container = document.getElementById("toast-container");
+  const toast = document.createElement("div");
+  toast.className = `toast ${kind}`;
+  toast.textContent = message;
+  container.appendChild(toast);
+  setTimeout(() => toast.remove(), 4500);
+}
+
+function requestNotificationPermission() {
+  if (state.notifyPermissionAsked) return;
+  state.notifyPermissionAsked = true;
+  try {
+    if ("Notification" in window && Notification.permission === "default") {
+      Notification.requestPermission().catch(() => {});
+    }
+  } catch (err) {
+    // Notification API unsupported in this environment — toasts still work
+  }
+}
+
+function showSystemNotification(title, body) {
+  try {
+    if ("Notification" in window && Notification.permission === "granted") {
+      new Notification(title, { body, icon: "/static/assets/logo.png" });
+    }
+  } catch (err) {
+    // Silently ignore — the in-app toast already covers this
+  }
+}
+
+// ------------------------------------------------------------------ //
+// Background polling — surfaces new received messages as notifications
+// without requiring the user to be on the Messagerie tab.
+// ------------------------------------------------------------------ //
+function startBackgroundPolling() {
+  setInterval(async () => {
+    try {
+      const data = await fetch("/api/dashboard").then(r => r.json());
+      if (state.lastKnownReceived === null) {
+        state.lastKnownReceived = data.total_received;
+      } else if (data.total_received > state.lastKnownReceived) {
+        const diff = data.total_received - state.lastKnownReceived;
+        state.lastKnownReceived = data.total_received;
+        showToast(`📥 ${diff} nouveau(x) message(s) reçu(s)`, "success");
+        showSystemNotification("TASHIL DOCUMENT HUB", `${diff} nouveau(x) message(s) reçu(s)`);
+        if (state.currentView === "dashboard") loadDashboard();
+        if (state.currentView === "messagerie") loadInbox();
+      }
+      if (state.currentView === "dashboard") {
+        document.getElementById("stat-sent").textContent = data.total_sent;
+        document.getElementById("stat-received").textContent = data.total_received;
+        document.getElementById("stat-pending").textContent = data.pending;
+      }
+    } catch (err) {
+      // Silent — this is a background convenience poll, not a critical path
+    }
+  }, 8000);
 }
 
 async function loadInstitutions() {
@@ -159,6 +227,7 @@ async function loadDashboard() {
   document.getElementById("stat-sent").textContent = data.total_sent;
   document.getElementById("stat-received").textContent = data.total_received;
   document.getElementById("stat-pending").textContent = data.pending;
+  if (state.lastKnownReceived === null) state.lastKnownReceived = data.total_received;
 
   const container = document.getElementById("recent-activity");
   if (!data.recent.length) {
@@ -172,8 +241,57 @@ async function loadDashboard() {
         <span class="list-row-sub">${escapeHtml(row.subject || "(sans objet)")}</span>
       </div>
       <span class="list-row-badge">${escapeHtml(row.status)}</span>
+      <div class="list-row-actions">
+        ${row.file_path ? `<button class="row-btn" data-download="${row.id}" title="Télécharger">📥</button>` : ""}
+        <button class="row-btn danger" data-delete="${row.id}" data-scope="dashboard" title="Supprimer">🗑️</button>
+      </div>
     </div>
   `).join("");
+  wireRowActions(container, loadDashboard);
+}
+
+// ------------------------------------------------------------------ //
+// Shared row actions — download, delete, accusé de réception
+// ------------------------------------------------------------------ //
+function wireRowActions(container, onChanged) {
+  container.querySelectorAll("[data-download]").forEach(btn => {
+    btn.addEventListener("click", () => {
+      window.open(`/api/messages/${btn.dataset.download}/download`, "_blank");
+    });
+  });
+
+  container.querySelectorAll("[data-delete]").forEach(btn => {
+    btn.addEventListener("click", async () => {
+      if (!confirm("Supprimer définitivement ce document et son archive ?")) return;
+      try {
+        const res = await fetch(`/api/messages/${btn.dataset.delete}`, { method: "DELETE" });
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.error || "Échec de la suppression.");
+        showToast("🗑️ Document supprimé", "success");
+        if (onChanged) onChanged();
+      } catch (err) {
+        showToast(`⛔ ${err.message}`, "error");
+      }
+    });
+  });
+
+  container.querySelectorAll("[data-ack]").forEach(btn => {
+    btn.addEventListener("click", async () => {
+      try {
+        const res = await fetch(`/api/messages/${btn.dataset.ack}/status`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ status: "accuse" }),
+        });
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.error || "Échec de la confirmation.");
+        showToast("✅ Réception confirmée", "success");
+        if (onChanged) onChanged();
+      } catch (err) {
+        showToast(`⛔ ${err.message}`, "error");
+      }
+    });
+  });
 }
 
 // ------------------------------------------------------------------ //
@@ -250,6 +368,8 @@ function setupMessaging() {
 
       statusEl.textContent = `✅ Document transmis — ${data.tracking_number}`;
       statusEl.classList.add("ok");
+      showToast(`📤 Document envoyé — ${data.tracking_number}`, "success");
+      showSystemNotification("TASHIL DOCUMENT HUB", `Document envoyé — ${data.tracking_number}`);
 
       selectedFile = null;
       fileInput.value = "";
@@ -278,8 +398,16 @@ async function loadInbox() {
         <span class="list-row-title">📥 ${escapeHtml(row.tracking_number)} — ${escapeHtml(row.subject || "(sans objet)")}</span>
         <span class="list-row-sub">De : ${escapeHtml(row.sender_institution || "—")}</span>
       </div>
+      <div class="list-row-actions">
+        ${row.status === "accuse"
+          ? `<span class="list-row-badge">✅ accusé</span>`
+          : `<button class="row-btn ack" data-ack="${row.id}" title="Confirmer réception">✅ Accusé</button>`}
+        ${row.file_path ? `<button class="row-btn" data-download="${row.id}" title="Télécharger">📥</button>` : ""}
+        <button class="row-btn danger" data-delete="${row.id}" title="Supprimer">🗑️</button>
+      </div>
     </div>
   `).join("");
+  wireRowActions(container, loadInbox);
 }
 
 // ------------------------------------------------------------------ //
@@ -299,8 +427,13 @@ async function loadRegistre(filter) {
         <span class="list-row-sub">${escapeHtml(row.recipient_institution || row.sender_institution || "—")} — ${escapeHtml(row.subject || "(sans objet)")}</span>
       </div>
       <span class="list-row-badge">${row.created_at.slice(0, 16).replace("T", " ")}</span>
+      <div class="list-row-actions">
+        ${row.file_path ? `<button class="row-btn" data-download="${row.id}" title="Télécharger">📥</button>` : ""}
+        <button class="row-btn danger" data-delete="${row.id}" title="Supprimer">🗑️</button>
+      </div>
     </div>
   `).join("");
+  wireRowActions(container, () => loadRegistre(filter));
 }
 
 // ------------------------------------------------------------------ //
@@ -369,6 +502,25 @@ async function checkForUpdate() {
   } catch (err) {
     statusEl.textContent = `⛔ Impossible de vérifier les mises à jour : ${err.message}`;
   }
+}
+
+// ------------------------------------------------------------------ //
+// Logout / reset profile
+// ------------------------------------------------------------------ //
+function setupLogout() {
+  document.getElementById("logout-btn").addEventListener("click", async () => {
+    if (!confirm("Réinitialiser le profil de cet appareil ? Vous devrez reconfigurer " +
+                 "la Wilaya et l'établissement. Les messages et archives ne seront pas supprimés.")) {
+      return;
+    }
+    try {
+      const res = await fetch("/api/profile/logout", { method: "POST" });
+      if (!res.ok) throw new Error("Échec de la déconnexion.");
+      location.reload();
+    } catch (err) {
+      showToast(`⛔ ${err.message}`, "error");
+    }
+  });
 }
 
 // ------------------------------------------------------------------ //

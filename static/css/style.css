@@ -74,6 +74,8 @@ textarea { resize: vertical; }
 .btn-primary { background: var(--primary); color: white; }
 .btn-primary:hover { background: var(--primary-hover); }
 .btn-success { background: var(--success); color: white; }
+.btn-danger { background: transparent; color: var(--danger); border: 1px solid var(--danger); }
+.btn-danger:hover { background: var(--danger); color: white; }
 
 /* ---------------- App shell ---------------- */
 .app { display: flex; flex-direction: column; min-height: 100vh; }
@@ -136,13 +138,22 @@ textarea { resize: vertical; }
   padding: 12px 14px; border-bottom: 1px solid var(--border); gap: 10px;
 }
 .list-row:last-child { border-bottom: none; }
-.list-row-main { display: flex; flex-direction: column; gap: 2px; overflow: hidden; }
+.list-row-main { display: flex; flex-direction: column; gap: 2px; overflow: hidden; flex: 1; }
 .list-row-title { font-weight: 600; font-size: 14px; }
 .list-row-sub { font-size: 12px; color: var(--text-muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .list-row-badge {
   font-size: 11px; padding: 3px 8px; border-radius: 20px; white-space: nowrap;
   background: var(--input-bg); color: var(--primary);
 }
+.list-row-actions { display: flex; align-items: center; gap: 6px; flex-shrink: 0; }
+.row-btn {
+  background: var(--input-bg); border: 1px solid var(--border); border-radius: 8px;
+  padding: 6px 9px; font-size: 13px; cursor: pointer; color: var(--text);
+  white-space: nowrap;
+}
+.row-btn:hover { border-color: var(--primary); }
+.row-btn.danger:hover { border-color: var(--danger); color: var(--danger); }
+.row-btn.ack { color: var(--success); border-color: var(--success); }
 
 .subtabs { display: flex; gap: 8px; margin-bottom: 16px; overflow-x: auto; }
 .subtab {
@@ -188,6 +199,33 @@ textarea { resize: vertical; }
 
 label { display: block; font-size: 13px; color: var(--text-muted); margin: 12px 0 4px; }
 label:first-child { margin-top: 0; }
+
+/* ---------------- Toast notifications ---------------- */
+.toast-container {
+  position: fixed; top: 16px; right: 16px; z-index: 200;
+  display: flex; flex-direction: column; gap: 8px; max-width: 320px;
+}
+.toast {
+  background: var(--card); border: 1px solid var(--border); border-left: 4px solid var(--primary);
+  border-radius: 10px; padding: 12px 14px; font-size: 13px; color: var(--text);
+  box-shadow: 0 4px 16px rgba(0,0,0,0.25);
+  animation: toast-in 0.2s ease-out;
+}
+.toast.success { border-left-color: var(--success); }
+.toast.error { border-left-color: var(--danger); }
+@keyframes toast-in {
+  from { opacity: 0; transform: translateY(-8px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+/* ---------------- Footer ---------------- */
+.app-footer {
+  text-align: center; padding: 20px 0 8px; margin-top: 12px;
+  border-top: 1px solid var(--border);
+}
+.app-footer p {
+  font-size: 12px; color: var(--text-muted); margin: 0;
+}
 
 /* ---------------- Responsive: mobile bottom nav ---------------- */
 @media (max-width: 640px) {
