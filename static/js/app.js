@@ -4,9 +4,14 @@
 const state = {
   profile: null,
   meta: null,
+  session: null,
   currentView: "dashboard",
   lastKnownReceived: null,
   notifyPermissionAsked: false,
+  pendingUnlockKey: null,   // institution_key currently shown on the PIN screen
+  pendingUnlockNeedsSetup: false,
+  appInitialized: false,    // event listeners wired only once (see showApp)
+  selectedFile: null,       // currently attached file in the Envoi form
 };
 
 // ------------------------------------------------------------------ //
@@ -16,27 +21,32 @@ async function boot() {
   const theme = localStorage.getItem("tashil_theme") || "dark";
   document.documentElement.setAttribute("data-theme", theme);
 
-  const [metaRes, profileRes] = await Promise.all([
+  const [metaRes, sessionRes] = await Promise.all([
     fetch("/api/meta").then(r => r.json()),
-    fetch("/api/profile").then(r => r.json()),
+    fetch("/api/session").then(r => r.json()),
   ]);
   state.meta = metaRes;
-  state.profile = profileRes.profile;
+  state.session = sessionRes;
 
-  if (profileRes.first_launch) {
-    showOnboarding();
-  } else {
+  if (sessionRes.first_launch) {
+    showOnboarding({ allowCancel: false });
+  } else if (sessionRes.active) {
+    state.profile = sessionRes.active;
     showApp();
+  } else {
+    showLockScreen();
   }
 }
 
 // ------------------------------------------------------------------ //
-// Onboarding
+// Onboarding (creating a NEW institution profile)
 // ------------------------------------------------------------------ //
-function showOnboarding() {
+function showOnboarding({ allowCancel }) {
+  document.getElementById("lock-overlay").classList.add("hidden");
   document.getElementById("onboarding-overlay").classList.remove("hidden");
 
   const wilayaSelect = document.getElementById("ob-wilaya");
+  wilayaSelect.innerHTML = "";
   state.meta.wilayas.forEach(([code, name]) => {
     const opt = document.createElement("option");
     opt.value = code;
@@ -46,6 +56,7 @@ function showOnboarding() {
   });
 
   const typeSelect = document.getElementById("ob-type");
+  typeSelect.innerHTML = "";
   state.meta.institution_types.forEach(t => {
     const opt = document.createElement("option");
     opt.value = t;
@@ -53,24 +64,95 @@ function showOnboarding() {
     typeSelect.appendChild(opt);
   });
 
-  document.getElementById("ob-submit").addEventListener("click", submitOnboarding);
+  wilayaSelect.addEventListener("change", refreshOnboardingInstitutions);
+  typeSelect.addEventListener("change", refreshOnboardingInstitutions);
+  refreshOnboardingInstitutions();
+
+  document.getElementById("ob-submit").onclick = submitOnboarding;
+
+  const cancelBtn = document.getElementById("ob-cancel");
+  if (allowCancel) {
+    cancelBtn.classList.remove("hidden");
+    cancelBtn.onclick = () => {
+      document.getElementById("onboarding-overlay").classList.add("hidden");
+      showLockScreen();
+    };
+  } else {
+    cancelBtn.classList.add("hidden");
+  }
+}
+
+async function refreshOnboardingInstitutions() {
+  const wilayaCode = parseInt(document.getElementById("ob-wilaya").value, 10);
+  const institutionType = document.getElementById("ob-type").value;
+  const nameSelect = document.getElementById("ob-name-select");
+  const nameManual = document.getElementById("ob-name-manual");
+
+  nameSelect.innerHTML = `<option value="">Chargement...</option>`;
+  try {
+    const data = await fetch(
+      `/api/institutions/onboarding?wilaya_code=${wilayaCode}&institution_type=${encodeURIComponent(institutionType)}`
+    ).then(r => r.json());
+
+    nameSelect.innerHTML = "";
+    (data.institutions || []).forEach(name => {
+      const opt = document.createElement("option");
+      opt.value = name;
+      opt.textContent = name;
+      nameSelect.appendChild(opt);
+    });
+    const otherOpt = document.createElement("option");
+    otherOpt.value = "__other__";
+    otherOpt.textContent = "Autre (saisir manuellement)";
+    nameSelect.appendChild(otherOpt);
+
+    nameSelect.onchange = () => {
+      const manual = nameSelect.value === "__other__";
+      nameManual.classList.toggle("hidden", !manual);
+      if (manual) nameManual.focus();
+    };
+    nameManual.classList.add("hidden");
+  } catch (err) {
+    nameSelect.innerHTML = `<option value="__other__">Autre (saisir manuellement)</option>`;
+    nameManual.classList.remove("hidden");
+  }
 }
 
 async function submitOnboarding() {
   const errorEl = document.getElementById("ob-error");
   errorEl.classList.add("hidden");
 
-  const payload = {
-    wilaya_code: parseInt(document.getElementById("ob-wilaya").value, 10),
-    institution_type: document.getElementById("ob-type").value,
-    institution_name: document.getElementById("ob-name").value.trim(),
-  };
+  const nameSelect = document.getElementById("ob-name-select");
+  const nameManual = document.getElementById("ob-name-manual");
+  const institutionName = nameSelect.value === "__other__"
+    ? nameManual.value.trim()
+    : nameSelect.value;
 
-  if (!payload.institution_name) {
-    errorEl.textContent = "Veuillez saisir le nom de l'établissement.";
+  const pin = document.getElementById("ob-pin").value.trim();
+  const pinConfirm = document.getElementById("ob-pin-confirm").value.trim();
+
+  if (!institutionName) {
+    errorEl.textContent = "Veuillez indiquer le nom de l'établissement.";
     errorEl.classList.remove("hidden");
     return;
   }
+  if (!/^\d{4,6}$/.test(pin)) {
+    errorEl.textContent = "Le code PIN doit contenir 4 à 6 chiffres.";
+    errorEl.classList.remove("hidden");
+    return;
+  }
+  if (pin !== pinConfirm) {
+    errorEl.textContent = "Les deux codes PIN ne correspondent pas.";
+    errorEl.classList.remove("hidden");
+    return;
+  }
+
+  const payload = {
+    wilaya_code: parseInt(document.getElementById("ob-wilaya").value, 10),
+    institution_type: document.getElementById("ob-type").value,
+    institution_name: institutionName,
+    pin,
+  };
 
   try {
     const res = await fetch("/api/profile", {
@@ -91,26 +173,180 @@ async function submitOnboarding() {
 }
 
 // ------------------------------------------------------------------ //
+// Lock screen — profile picker + PIN entry
+// ------------------------------------------------------------------ //
+async function showLockScreen() {
+  document.getElementById("app").classList.add("hidden");
+  document.getElementById("onboarding-overlay").classList.add("hidden");
+  document.getElementById("lock-overlay").classList.remove("hidden");
+  document.getElementById("lock-pin-step").classList.add("hidden");
+
+  const session = await fetch("/api/session").then(r => r.json());
+  state.session = session;
+  renderProfileList(session.profiles);
+
+  document.getElementById("lock-add-profile-btn").onclick = () => {
+    document.getElementById("lock-overlay").classList.add("hidden");
+    showOnboarding({ allowCancel: session.profiles.length > 0 });
+  };
+}
+
+function renderProfileList(profiles) {
+  const container = document.getElementById("lock-profile-list");
+  if (!profiles.length) {
+    container.innerHTML = "";
+    return;
+  }
+  container.innerHTML = profiles.map(p => `
+    <div class="profile-item" data-key="${escapeHtml(p.institution_key)}">
+      <div>
+        <div class="profile-item-name">${escapeHtml(p.institution_name)}</div>
+        <div class="profile-item-sub">${escapeHtml(p.wilaya_name)} — ${escapeHtml(p.institution_type)}</div>
+      </div>
+      <span class="profile-item-badge">${p.pin_set ? "🔒" : "⚙️ à configurer"}</span>
+    </div>
+  `).join("");
+
+  container.querySelectorAll(".profile-item").forEach(el => {
+    el.addEventListener("click", () => selectProfileForUnlock(el.dataset.key, profiles));
+  });
+}
+
+function selectProfileForUnlock(key, profiles) {
+  const profile = profiles.find(p => p.institution_key === key);
+  state.pendingUnlockKey = key;
+  state.pendingUnlockNeedsSetup = !profile.pin_set;
+
+  document.getElementById("lock-profile-list").classList.add("hidden");
+  document.getElementById("lock-add-profile-btn").classList.add("hidden");
+  const pinStep = document.getElementById("lock-pin-step");
+  pinStep.classList.remove("hidden");
+
+  const pinInput = document.getElementById("lock-pin-input");
+  const pinConfirmInput = document.getElementById("lock-pin-confirm-input");
+  pinInput.value = "";
+  pinConfirmInput.value = "";
+  document.getElementById("lock-error").classList.add("hidden");
+
+  if (state.pendingUnlockNeedsSetup) {
+    document.getElementById("lock-pin-label").textContent =
+      `Créez un code PIN pour ${profile.institution_name}`;
+    pinConfirmInput.classList.remove("hidden");
+    document.getElementById("lock-unlock-btn").textContent = "✅ Définir le code PIN";
+  } else {
+    document.getElementById("lock-pin-label").textContent =
+      `Code PIN — ${profile.institution_name}`;
+    pinConfirmInput.classList.add("hidden");
+    document.getElementById("lock-unlock-btn").textContent = "🔓 Déverrouiller";
+  }
+  pinInput.focus();
+
+  document.getElementById("lock-unlock-btn").onclick = submitUnlock;
+  document.getElementById("lock-back-btn").onclick = () => {
+    pinStep.classList.add("hidden");
+    document.getElementById("lock-profile-list").classList.remove("hidden");
+    document.getElementById("lock-add-profile-btn").classList.remove("hidden");
+  };
+}
+
+async function submitUnlock() {
+  const errorEl = document.getElementById("lock-error");
+  errorEl.classList.add("hidden");
+
+  const pin = document.getElementById("lock-pin-input").value.trim();
+  if (!/^\d{4,6}$/.test(pin)) {
+    errorEl.textContent = "Le code PIN doit contenir 4 à 6 chiffres.";
+    errorEl.classList.remove("hidden");
+    return;
+  }
+
+  try {
+    let res, data;
+    if (state.pendingUnlockNeedsSetup) {
+      const pinConfirm = document.getElementById("lock-pin-confirm-input").value.trim();
+      if (pin !== pinConfirm) {
+        errorEl.textContent = "Les deux codes PIN ne correspondent pas.";
+        errorEl.classList.remove("hidden");
+        return;
+      }
+      res = await fetch("/api/session/set-pin", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ institution_key: state.pendingUnlockKey, pin }),
+      });
+    } else {
+      res = await fetch("/api/session/unlock", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ institution_key: state.pendingUnlockKey, pin }),
+      });
+    }
+    data = await res.json();
+    if (!res.ok) throw new Error(data.error || "Échec du déverrouillage.");
+
+    state.profile = data.profile;
+    document.getElementById("lock-overlay").classList.add("hidden");
+    showApp();
+  } catch (err) {
+    errorEl.textContent = err.message;
+    errorEl.classList.remove("hidden");
+  }
+}
+
+// ------------------------------------------------------------------ //
 // App shell
 // ------------------------------------------------------------------ //
 function showApp() {
+  document.getElementById("lock-overlay").classList.add("hidden");
   document.getElementById("app").classList.remove("hidden");
   document.getElementById("institution-name").textContent =
     state.profile ? state.profile.institution_name : "—";
 
-  setupNav();
-  setupThemeToggle();
-  setupMessaging();
-  setupUpdateChecker();
-  setupLogout();
+  // One-time event wiring only — re-running this on every unlock would
+  // stack duplicate listeners (double sends, double toasts) and spawn
+  // multiple concurrent polling intervals, since locking no longer
+  // reloads the page.
+  if (!state.appInitialized) {
+    setupNav();
+    setupThemeToggle();
+    setupMessaging();
+    setupUpdateChecker();
+    setupLogout();
+    setupLockButton();
+    startBackgroundPolling();
+    state.appInitialized = true;
+  }
+
+  // Per-unlock refresh: must never carry over from a previously active
+  // profile (this is the actual data-isolation guarantee on the frontend
+  // side — the backend already isolates storage, this ensures the UI
+  // doesn't show stale counts from the last institution either).
+  state.lastKnownReceived = null;
+  resetMessagingForm();
   renderParametres();
   loadDashboard();
   loadInstitutions();
   requestNotificationPermission();
-  startBackgroundPolling();
+  switchView("dashboard");
 
   document.getElementById("lan-url").textContent = state.meta.lan_url;
   document.getElementById("current-version").textContent = `v${state.meta.app_version}`;
+}
+
+function setupLockButton() {
+  document.getElementById("lock-btn").onclick = lockSession;
+}
+
+async function lockSession() {
+  try {
+    await fetch("/api/session/lock", { method: "POST" });
+  } catch (err) {
+    // Even if the request fails, still send the user to the lock screen —
+    // never leave archives visible on an uncertain network error.
+  }
+  state.profile = null;
+  document.getElementById("app").classList.add("hidden");
+  showLockScreen();
 }
 
 // ------------------------------------------------------------------ //
@@ -297,6 +533,16 @@ function wireRowActions(container, onChanged) {
 // ------------------------------------------------------------------ //
 // Messaging
 // ------------------------------------------------------------------ //
+function resetMessagingForm() {
+  state.selectedFile = null;
+  const fileInput = document.getElementById("file-input");
+  if (fileInput) fileInput.value = "";
+  const dropText = document.getElementById("drop-zone-text");
+  if (dropText) dropText.textContent = "📎 Glissez un fichier ici ou cliquez pour choisir";
+  const statusEl = document.getElementById("msg-send-status");
+  if (statusEl) { statusEl.textContent = ""; statusEl.className = "status-line"; }
+}
+
 function setupMessaging() {
   document.querySelectorAll(".subtab[data-subview]").forEach(btn => {
     btn.addEventListener("click", () => {
@@ -318,13 +564,12 @@ function setupMessaging() {
 
   const dropZone = document.getElementById("drop-zone");
   const fileInput = document.getElementById("file-input");
-  let selectedFile = null;
 
   dropZone.addEventListener("click", () => fileInput.click());
   fileInput.addEventListener("change", () => {
     if (fileInput.files.length) {
-      selectedFile = fileInput.files[0];
-      document.getElementById("drop-zone-text").textContent = `📎 ${selectedFile.name}`;
+      state.selectedFile = fileInput.files[0];
+      document.getElementById("drop-zone-text").textContent = `📎 ${state.selectedFile.name}`;
     }
   });
   dropZone.addEventListener("dragover", e => { e.preventDefault(); dropZone.classList.add("dragover"); });
@@ -333,8 +578,8 @@ function setupMessaging() {
     e.preventDefault();
     dropZone.classList.remove("dragover");
     if (e.dataTransfer.files.length) {
-      selectedFile = e.dataTransfer.files[0];
-      document.getElementById("drop-zone-text").textContent = `📎 ${selectedFile.name}`;
+      state.selectedFile = e.dataTransfer.files[0];
+      document.getElementById("drop-zone-text").textContent = `📎 ${state.selectedFile.name}`;
     }
   });
 
@@ -344,7 +589,7 @@ function setupMessaging() {
     statusEl.textContent = "";
 
     const recipient = document.getElementById("msg-recipient").value.trim();
-    if (!selectedFile) {
+    if (!state.selectedFile) {
       statusEl.textContent = "Veuillez sélectionner un fichier.";
       statusEl.classList.add("err");
       return;
@@ -356,7 +601,7 @@ function setupMessaging() {
     }
 
     const formData = new FormData();
-    formData.append("file", selectedFile);
+    formData.append("file", state.selectedFile);
     formData.append("recipient", recipient);
     formData.append("subject", document.getElementById("msg-subject").value.trim());
     formData.append("body", document.getElementById("msg-body").value.trim());
@@ -371,9 +616,7 @@ function setupMessaging() {
       showToast(`📤 Document envoyé — ${data.tracking_number}`, "success");
       showSystemNotification("TASHIL DOCUMENT HUB", `Document envoyé — ${data.tracking_number}`);
 
-      selectedFile = null;
-      fileInput.value = "";
-      document.getElementById("drop-zone-text").textContent = "📎 Glissez un fichier ici ou cliquez pour choisir";
+      resetMessagingForm();
       document.getElementById("msg-recipient").value = "";
       document.getElementById("msg-subject").value = "";
       document.getElementById("msg-body").value = "";
@@ -505,22 +748,15 @@ async function checkForUpdate() {
 }
 
 // ------------------------------------------------------------------ //
-// Logout / reset profile
+// Logout = lock (switch institutions without deleting anything)
 // ------------------------------------------------------------------ //
 function setupLogout() {
-  document.getElementById("logout-btn").addEventListener("click", async () => {
-    if (!confirm("Réinitialiser le profil de cet appareil ? Vous devrez reconfigurer " +
-                 "la Wilaya et l'établissement. Les messages et archives ne seront pas supprimés.")) {
+  document.getElementById("logout-btn").onclick = () => {
+    if (!confirm("Verrouiller cet établissement et revenir à l'écran de sélection ?")) {
       return;
     }
-    try {
-      const res = await fetch("/api/profile/logout", { method: "POST" });
-      if (!res.ok) throw new Error("Échec de la déconnexion.");
-      location.reload();
-    } catch (err) {
-      showToast(`⛔ ${err.message}`, "error");
-    }
-  });
+    lockSession();
+  };
 }
 
 // ------------------------------------------------------------------ //

@@ -1,8 +1,8 @@
 # TASHIL DOCUMENT HUB — WEB EDITION
-## Documentation de traçabilité — v2.2.0
+## Documentation de traçabilité — v2.3.0
 
 **Copyright :** ILINE TECH 2026 BY FERAK ALADDIN
-**Date :** 2026-08-27
+**Date :** 2026-08-28
 
 ---
 
@@ -102,7 +102,10 @@ sur Windows et `/data/data/com.termux/files/home/` sur Termux/Android —
 | Registre officiel (filtrable Entrant/Sortant/Tous) | ✅ Testé, confirmé sur build Windows réel |
 | Téléchargement + suppression (Tableau de Bord, Réception, Registre) | ✅ Testé — voir section 8 |
 | Notifications (toast + navigateur) envoi/réception | ✅ Testé — voir section 8 |
-| Déconnexion / réinitialisation du profil | ✅ Testé — voir section 8 |
+| Verrouillage / changement d'établissement (multi-profils) | ✅ Testé — voir section 10 |
+| Code PIN par établissement + écran de verrouillage | ✅ Testé — voir section 10 |
+| Isolation stricte des données entre établissements | ✅ Testé — voir section 10 |
+| Dropdown dynamique Nom de l'établissement (onboarding) | ✅ Testé — voir section 10 |
 | Thème clair/sombre | ✅ Fonctionnel, persisté en base + localStorage |
 | PWA installable sur Android | ✅ manifest.json présent |
 | Fenêtre native de bureau (pywebview) | ✅ Confirmé fonctionnel sur build Windows réel (v2.1.0) |
@@ -250,3 +253,117 @@ contient les 7 vraies polycliniques EPSP ES-SENIA et un gabarit
 `<Type> <Wilaya>` pour le reste. À éditer avec de vrais contacts au fur
 et à mesure — le champ accepte aussi la saisie libre pour tout ce qui
 n'y figure pas encore.
+
+---
+
+## 10. v2.3.0 — Multi-tenant, code PIN, écran de verrouillage (2026-08-28)
+
+Changement d'architecture significatif, entièrement testé en réel (serveur
+lancé, chaque route/scénario vérifié via `curl` avant livraison — voir le
+détail des tests en fin de section) : l'appareil peut désormais héberger
+**plusieurs profils d'établissement isolés**, chacun protégé par son propre
+code PIN.
+
+### 10.1 Répertoire d'onboarding dynamique (dropdown)
+
+Le champ "Nom de l'établissement" de l'assistant de configuration est
+maintenant un `<select>` peuplé dynamiquement selon la Wilaya + le Type
+choisis (`GET /api/institutions/onboarding?wilaya_code=&institution_type=`).
+Seule la Wilaya 31 (Oran) contient des entrées réelles confirmées :
+- **EPSP / Polyclinique** → les 7 vraies polycliniques EPSP ES-SENIA.
+- **EPH** → `EPH AIN TURCK`.
+- **CHU** → `CHU ORAN`.
+- **EHU** → `EHU ORAN`.
+
+Toute autre combinaison Wilaya/Type retombe sur une entrée générique
+`<Type> <Wilaya>`. Une option **"Autre (saisir manuellement)"** est
+toujours présente en dernier recours, avec un champ texte qui apparaît
+dynamiquement — personne n'est jamais bloqué par une liste incomplète.
+⚠️ Toujours pas un registre officiel vérifié, même remarque qu'en section 9.
+
+### 10.2 Code PIN & écran de verrouillage
+
+- Le formulaire d'onboarding exige désormais un **code PIN à 4-6 chiffres**
+  (+ confirmation), stocké **hashé** (`werkzeug.security.generate_password_hash`
+  — jamais en clair) dans la table `profiles` du registre.
+- **Écran de verrouillage** (`lock-overlay`) affiché à chaque démarrage de
+  l'application tant qu'aucun profil n'est déverrouillé : liste des
+  établissements enregistrés sur l'appareil → sélection → saisie du PIN.
+- Bouton 🔒 dans la barre supérieure + carte "Session" dans Paramètres
+  permettent de verrouiller manuellement à tout moment sans fermer
+  l'application (SPA — pas de rechargement de page).
+- ⚠️ **Honnêteté sur le niveau de sécurité** : ce PIN est un verrou d'écran
+  contre le survol/accès physique occasionnel sur un appareil partagé — ce
+  n'est **pas** un chiffrement des données. Quiconque a un accès direct au
+  système de fichiers (`~/TASHIL_DATA/profiles/<clé>/`) peut toujours lire
+  les archives et la base SQLite directement, PIN ou non.
+- ⚠️ **Limite de concurrence** : la session active est une simple variable
+  en mémoire côté serveur — conçu pour une personne, un appareil, qui
+  change de casquette, pas pour plusieurs utilisateurs simultanés sur le
+  même processus serveur.
+
+### 10.3 Isolation stricte multi-tenant
+
+Nouvelle architecture de stockage :
+```
+~/TASHIL_DATA/
+├── registry.db                          # Registre maître (profils, PIN hashés, thème)
+└── profiles/
+    └── <institution_key>/
+        ├── tashil.db                    # Base de messages ISOLÉE à ce profil
+        └── archives/
+            ├── Courrier_Sortant/
+            └── Courrier_Entrant/
+```
+`institution_key` est dérivé de la Wilaya + du Type + du nom (ex.
+`31_EP_EPSP_ES_SENIA`), avec suffixe anti-collision si nécessaire.
+
+**Déconnexion repensée** : "Déconnexion" ne supprime plus le profil (ancien
+comportement v2.0-v2.2, jugé destructif). Elle **verrouille** simplement la
+session — les données de l'établissement restent intactes et isolées,
+récupérables en se reconnectant avec le PIN. Une nouvelle route
+`POST /api/session/lock` remplace `POST /api/profile/logout` (supprimée).
+
+**Migration automatique** : si une ancienne base `~/TASHIL_DATA/tashil.db`
+(structure mono-profil pré-v2.3.0) est détectée au démarrage et qu'aucun
+profil n'existe encore dans le registre, elle est **déplacée** (pas copiée)
+vers `profiles/<clé>/` avec ses archives, sans PIN initial — l'écran de
+verrouillage détecte ce cas (`pin_set: false`) et invite à **créer** un PIN
+plutôt que d'en demander un qui n'a jamais existé. Rien n'est perdu.
+
+### 10.4 Tests réels effectués avant livraison
+
+Tous testés en lançant le serveur réel et en appelant les routes via `curl`
+(pas seulement relus) :
+- ✅ Session vide → `first_launch: true`
+- ✅ Dropdown onboarding Oran/EPSP → 7 vraies polycliniques ; Oran/EPH →
+  `EPH AIN TURCK` seul ; Adrar/EPSP → repli générique `EPSP Adrar`
+- ✅ Création de profil A avec PIN → activation automatique, `pin_hash`
+  jamais renvoyé au frontend
+- ✅ Accès aux routes de données pendant que la session est verrouillée →
+  `423` partout
+- ✅ Mauvais PIN → `401` ; bon PIN → déverrouillage réussi
+- ✅ **Isolation croisée** : création du profil B (CHU ORAN) → tableau de
+  bord immédiatement à 0 message (aucune fuite depuis A) ; reverrouillage
+  puis redéverrouillage de A → son message envoyé plus tôt est toujours là
+- ✅ Séparation physique des dossiers vérifiée sur disque
+  (`profiles/31_EP_.../` vs `profiles/31_CU_.../`)
+- ✅ Migration héritée : base + archives pré-v2.3.0 simulées, migration
+  automatique confirmée (fichiers physiquement déplacés, message hérité
+  intact, PIN à créer détecté correctement, ancien chemin bien supprimé)
+- ✅ Vérification statique croisée : chaque `getElementById(...)` de
+  `app.js` correspond à un `id` réellement présent dans `index.html` (0
+  référence orpheline — script de vérification automatisé, pas juste une
+  relecture)
+- ✅ Bug de listeners dupliqués anticipé et corrigé : comme le
+  verrouillage/déverrouillage ne recharge plus la page, le câblage des
+  événements (`setupNav`, `setupMessaging`, etc.) et `startBackgroundPolling`
+  ne s'exécutent maintenant qu'**une seule fois** (`state.appInitialized`),
+  pour éviter l'empilement de gestionnaires d'événements ou d'intervalles
+  concurrents au fil des changements de profil dans une même session
+  d'application.
+
+**Fichiers modifiés :** `app.py` (réécriture substantielle),
+`templates/index.html`, `static/css/style.css`, `static/js/app.js`.
+Aucune fonctionnalité antérieure retirée — voir sections 1 à 9 pour
+l'historique complet, toujours valable.

@@ -15,23 +15,59 @@
 <!-- Toast notifications -->
 <div id="toast-container" class="toast-container"></div>
 
-<!-- Onboarding modal (first launch only) -->
+<!-- Onboarding modal (creating a NEW institution profile) -->
 <div id="onboarding-overlay" class="overlay hidden">
   <div class="onboarding-card">
     <img src="/static/assets/logo.png" alt="TASHIL" class="onboarding-logo">
     <h1>TASHIL DOCUMENT HUB</h1>
-    <p class="muted">Configuration initiale de l'établissement</p>
+    <p class="muted">Configuration d'un établissement</p>
 
     <div id="onboarding-step-1" class="onboarding-step">
       <label>Wilaya</label>
       <select id="ob-wilaya"></select>
+
       <label>Type d'établissement</label>
       <select id="ob-type"></select>
+
       <label>Nom de l'établissement</label>
-      <input id="ob-name" type="text" placeholder="ex: EPH AADL Ain Beida">
+      <select id="ob-name-select"></select>
+      <input id="ob-name-manual" type="text" placeholder="Nom de l'établissement" class="hidden">
+
+      <label>Code PIN (4 à 6 chiffres)</label>
+      <input id="ob-pin" type="password" inputmode="numeric" pattern="\d*" maxlength="6"
+             placeholder="••••" autocomplete="new-password">
+      <label>Confirmer le code PIN</label>
+      <input id="ob-pin-confirm" type="password" inputmode="numeric" pattern="\d*" maxlength="6"
+             placeholder="••••" autocomplete="new-password">
+      <p class="muted small-note">Ce code PIN protège l'accès à cet établissement sur cet appareil.</p>
+
       <button class="btn btn-primary" id="ob-submit">Activer TASHIL</button>
+      <button class="btn btn-secondary hidden" id="ob-cancel">← Annuler</button>
       <p id="ob-error" class="error hidden"></p>
     </div>
+  </div>
+</div>
+
+<!-- Lock screen: profile picker + PIN entry (shown whenever the session is locked) -->
+<div id="lock-overlay" class="overlay hidden">
+  <div class="onboarding-card">
+    <img src="/static/assets/logo.png" alt="TASHIL" class="onboarding-logo">
+    <h1>TASHIL DOCUMENT HUB</h1>
+
+    <div id="lock-profile-list" class="profile-list"></div>
+
+    <div id="lock-pin-step" class="onboarding-step hidden">
+      <p class="muted" id="lock-pin-label">Entrez le code PIN</p>
+      <input id="lock-pin-input" type="password" inputmode="numeric" pattern="\d*" maxlength="6"
+             placeholder="••••" autocomplete="off">
+      <input id="lock-pin-confirm-input" type="password" inputmode="numeric" pattern="\d*" maxlength="6"
+             placeholder="Confirmer" class="hidden" autocomplete="off">
+      <button class="btn btn-primary" id="lock-unlock-btn">🔓 Déverrouiller</button>
+      <button class="btn btn-secondary" id="lock-back-btn">← Changer d'établissement</button>
+      <p id="lock-error" class="error hidden"></p>
+    </div>
+
+    <button class="btn btn-secondary" id="lock-add-profile-btn">➕ Ajouter un nouvel établissement</button>
   </div>
 </div>
 
@@ -47,6 +83,7 @@
       </div>
     </div>
     <button id="theme-toggle" class="icon-btn" title="Changer le thème">🌓</button>
+    <button id="lock-btn" class="icon-btn" title="Verrouiller">🔒</button>
   </header>
 
   <nav class="tabbar" id="tabbar">
@@ -177,11 +214,11 @@
       <div class="card">
         <h3>🚪 Session</h3>
         <p class="muted">
-          Réinitialise l'identité de cet appareil (Wilaya, établissement, clé
-          de licence) et relance la configuration initiale. Les messages et
-          archives déjà enregistrés ne sont pas supprimés.
+          Verrouille cet établissement et revient à l'écran de sélection.
+          Vos messages et archives restent intacts et isolés — vous pourrez
+          les retrouver en vous reconnectant avec le code PIN.
         </p>
-        <button class="btn btn-danger" id="logout-btn">🚪 Déconnexion / Réinitialiser le profil</button>
+        <button class="btn btn-danger" id="logout-btn">🔒 Verrouiller / Changer d'établissement</button>
       </div>
     </section>
 
