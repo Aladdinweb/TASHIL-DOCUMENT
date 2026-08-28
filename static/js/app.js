@@ -313,6 +313,7 @@ function showApp() {
     setupUpdateChecker();
     setupLogout();
     setupLockButton();
+    setupCopyLanUrl();
     startBackgroundPolling();
     state.appInitialized = true;
   }
@@ -330,11 +331,25 @@ function showApp() {
   switchView("dashboard");
 
   document.getElementById("lan-url").textContent = state.meta.lan_url;
+  document.getElementById("network-qr-img").src = `/api/network-qr.png?t=${Date.now()}`;
   document.getElementById("current-version").textContent = `v${state.meta.app_version}`;
 }
 
 function setupLockButton() {
   document.getElementById("lock-btn").onclick = lockSession;
+}
+
+function setupCopyLanUrl() {
+  document.getElementById("copy-lan-url-btn").addEventListener("click", async () => {
+    try {
+      await navigator.clipboard.writeText(state.meta.lan_url);
+      showToast("📋 Lien copié", "success");
+    } catch (err) {
+      // Clipboard API can be unavailable in some webview contexts —
+      // the URL is already shown as plain text as a fallback.
+      showToast("⛔ Impossible de copier automatiquement — copiez le lien affiché.", "error");
+    }
+  });
 }
 
 async function lockSession() {

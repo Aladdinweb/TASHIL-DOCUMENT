@@ -60,7 +60,8 @@ body {
 .onboarding-step { text-align: left; margin-top: 20px; }
 .onboarding-step label { display: block; font-size: 13px; color: var(--text-muted); margin: 14px 0 4px; }
 
-select, input[type="text"], textarea {
+select, input[type="text"], input[type="password"], input[type="tel"],
+input[type="number"], input[type="email"], textarea {
   width: 100%; padding: 10px 12px; border-radius: 8px;
   border: 1px solid var(--border); background: var(--input-bg);
   color: var(--text); font-size: 15px; font-family: inherit;
@@ -81,6 +82,12 @@ textarea { resize: vertical; }
 }
 .btn-secondary:hover { border-color: var(--primary); color: var(--primary); }
 .small-note { font-size: 12px; margin: 6px 0 0; }
+
+.pin-input {
+  text-align: center; font-size: 28px; letter-spacing: 14px;
+  font-family: "Courier New", monospace; font-weight: 700;
+  padding: 14px 12px 14px 26px; /* extra left padding compensates letter-spacing visual drift */
+}
 
 .profile-list { text-align: left; margin: 16px 0; display: flex; flex-direction: column; gap: 8px; }
 .profile-item {
@@ -198,6 +205,14 @@ textarea { resize: vertical; }
   background: var(--input-bg); padding: 10px 14px; border-radius: 8px;
   word-break: break-all;
 }
+
+.qr-card { text-align: center; }
+.qr-image {
+  width: 220px; height: 220px; background: white; padding: 12px;
+  border-radius: 12px; margin: 16px auto; display: block;
+}
+.qr-card .lan-url { display: inline-block; margin: 4px auto 12px; }
+.qr-card .btn { width: auto; display: inline-block; padding: 10px 20px; margin-top: 0; }
 
 .key-box {
   font-family: monospace; font-weight: 700; color: var(--primary);

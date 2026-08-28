@@ -1,5 +1,5 @@
 # TASHIL DOCUMENT HUB — WEB EDITION
-## Documentation de traçabilité — v2.3.0
+## Documentation de traçabilité — v2.3.1
 
 **Copyright :** ILINE TECH 2026 BY FERAK ALADDIN
 **Date :** 2026-08-28
@@ -367,3 +367,92 @@ Tous testés en lançant le serveur réel et en appelant les routes via `curl`
 `templates/index.html`, `static/css/style.css`, `static/js/app.js`.
 Aucune fonctionnalité antérieure retirée — voir sections 1 à 9 pour
 l'historique complet, toujours valable.
+
+---
+
+## 11. v2.3.1 — Corrections réelles suite à retour utilisateur (2026-08-28)
+
+Deux signalements utilisateur après test sur build Windows réel, tous deux
+identifiés comme de **vrais bugs**, pas des préférences cosmétiques.
+
+### 11.1 🐛 Champs PIN non stylés (bug CSS réel)
+
+**Cause :** la règle CSS de style des champs de formulaire ne ciblait que
+`input[type="text"]` — or les 4 champs de code PIN utilisent
+`type="password"`, donc ils ne recevaient AUCUN style personnalisé et
+s'affichaient avec l'apparence par défaut du navigateur/WebView.
+
+**Correctif :**
+- Sélecteur CSS élargi à `input[type="password"]`, `input[type="tel"]`,
+  `input[type="number"]`, `input[type="email"]` (pas seulement `text`).
+- Nouvelle classe `.pin-input` appliquée aux 4 champs PIN (onboarding +
+  écran de verrouillage) : grande taille de police, espacement des
+  lettres, police monospace, centré — apparence "code d'accès" moderne
+  plutôt qu'un champ texte générique.
+
+### 11.2 🐛 Accès réseau non fonctionnel sur le build Windows (bug réel, pas juste UX)
+
+**Cause racine :** `desktop_launcher.py` démarrait le serveur Flask avec
+`host="127.0.0.1"` (boucle locale uniquement) — alors que
+`app.py` (utilisé pour `python app.py` en Termux) utilise correctement
+`host="0.0.0.0"`. Résultat : **sur le build Windows réel testé par
+l'utilisateur, aucun appareil du réseau local ne pouvait jamais atteindre
+le serveur**, quel que soit le Wi-Fi. Ce n'était pas "une mauvaise
+méthode" comme perçu, mais un vrai bug de liaison réseau introduit lors
+de l'écriture du lanceur desktop.
+
+**Correctifs :**
+1. `desktop_launcher.py` : `host="127.0.0.1"` → `host="0.0.0.0"`.
+2. **QR code ajouté** (nouvelle demande implicite : "façon simple d'envoyer
+   depuis mon téléphone sans tracas") — nouvelle route
+   `GET /api/network-qr.png` qui génère à la volée un QR code encodant
+   l'URL LAN (bibliothèque `qrcode` + `Pillow`, déjà utilisées avec succès
+   dans l'ancienne version CustomTkinter du projet). L'onglet "Accès
+   réseau" affiche maintenant ce QR code à scanner directement, plus un
+   bouton "📋 Copier le lien" (Clipboard API), en plus du texte de l'URL
+   conservé en repli.
+3. Import `qrcode` protégé par `try/except ImportError` — si la
+   dépendance venait à manquer sur un build, la route retourne `501`
+   proprement au lieu de faire planter toute l'application au démarrage
+   (leçon tirée des incidents précédents : ne jamais laisser une
+   dépendance optionnelle bloquer tout le reste).
+4. Note ajoutée dans l'interface : au tout premier lancement, **Windows
+   Defender Firewall peut bloquer la connexion entrante** et afficher une
+   invite — l'utilisateur doit cliquer "Autoriser l'accès" (réseaux
+   privés) pour que le téléphone puisse réellement se connecter, même
+   après le correctif de liaison réseau. Ce point était probablement une
+   partie du problème observé, en plus du bug `127.0.0.1`.
+5. `tashil_web.spec` : ajout de `collect_all('qrcode')` et
+   `collect_all('PIL')`, même traitement que pour `pywebview` — évite les
+   problèmes de sous-modules manquants dans l'exe empaqueté.
+
+### 11.3 Tests effectués
+
+- ✅ Route `/api/network-qr.png` testée réellement : HTTP 200, bon
+  `Content-Type: image/png`, image PNG valide et décodable (vérifié avec
+  Pillow). La bibliothèque `qrcode` elle-même n'a pas pu être installée
+  dans le bac à sable de développement (pas d'accès PyPI en direct) — un
+  module de substitution local a été utilisé uniquement pour valider la
+  mécanique de la route Flask (BytesIO, mimetype, `send_file`). La
+  bibliothèque réelle est la même que celle déjà éprouvée dans la version
+  CustomTkinter précédente du projet.
+- ✅ Comportement de repli sans `qrcode` installé : l'application démarre
+  normalement, toutes les autres routes fonctionnent, seule la route QR
+  renvoie `501` proprement (pas de plantage global).
+- ✅ Vérification croisée de tous les `getElementById(...)` de `app.js`
+  contre les `id` réels de `index.html` — 0 référence orpheline, refaite
+  après ces modifications.
+- ✅ Piège de listener dupliqué anticipé pendant cette modification même :
+  `setupCopyLanUrl()` a été placé par erreur en dehors du bloc
+  d'initialisation unique (`state.appInitialized`) puis corrigé avant
+  livraison — sans ce correctif, chaque verrouillage/déverrouillage aurait
+  réempilé un gestionnaire de clic supplémentaire sur le bouton copier.
+- ⚠️ **Reste à vérifier par l'utilisateur** : le scan réel du QR code
+  depuis un téléphone (impossible à tester depuis cet environnement de
+  développement sans caméra/téléphone physique) — c'est le test le plus
+  important restant avant de considérer ce correctif définitivement validé.
+
+**Fichiers modifiés :** `app.py`, `desktop_launcher.py`,
+`templates/index.html`, `static/css/style.css`, `static/js/app.js`,
+`requirements.txt`, `tashil_web.spec`. Aucune fonctionnalité antérieure
+retirée.

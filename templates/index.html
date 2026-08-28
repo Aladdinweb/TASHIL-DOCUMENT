@@ -35,10 +35,10 @@
 
       <label>Code PIN (4 à 6 chiffres)</label>
       <input id="ob-pin" type="password" inputmode="numeric" pattern="\d*" maxlength="6"
-             placeholder="••••" autocomplete="new-password">
+             placeholder="····" autocomplete="new-password" class="pin-input">
       <label>Confirmer le code PIN</label>
       <input id="ob-pin-confirm" type="password" inputmode="numeric" pattern="\d*" maxlength="6"
-             placeholder="••••" autocomplete="new-password">
+             placeholder="····" autocomplete="new-password" class="pin-input">
       <p class="muted small-note">Ce code PIN protège l'accès à cet établissement sur cet appareil.</p>
 
       <button class="btn btn-primary" id="ob-submit">Activer TASHIL</button>
@@ -59,9 +59,9 @@
     <div id="lock-pin-step" class="onboarding-step hidden">
       <p class="muted" id="lock-pin-label">Entrez le code PIN</p>
       <input id="lock-pin-input" type="password" inputmode="numeric" pattern="\d*" maxlength="6"
-             placeholder="••••" autocomplete="off">
+             placeholder="····" autocomplete="off" class="pin-input">
       <input id="lock-pin-confirm-input" type="password" inputmode="numeric" pattern="\d*" maxlength="6"
-             placeholder="Confirmer" class="hidden" autocomplete="off">
+             placeholder="Confirmer" class="hidden pin-input" autocomplete="off">
       <button class="btn btn-primary" id="lock-unlock-btn">🔓 Déverrouiller</button>
       <button class="btn btn-secondary" id="lock-back-btn">← Changer d'établissement</button>
       <p id="lock-error" class="error hidden"></p>
@@ -164,10 +164,21 @@
       </div>
 
       <div id="sub-reseau" class="subview">
-        <div class="card">
-          <p>Ouvrez cette adresse depuis un téléphone connecté au même Wi-Fi pour accéder à TASHIL :</p>
+        <div class="card qr-card">
+          <p>Scannez ce code avec l'appareil photo de votre téléphone pour ouvrir
+             TASHIL instantanément — aucune saisie d'adresse nécessaire :</p>
+          <img id="network-qr-img" class="qr-image" alt="QR code d'accès réseau">
           <p class="lan-url" id="lan-url">—</p>
-          <p class="muted">Aucune installation nécessaire — le navigateur suffit.</p>
+          <button class="btn btn-secondary" id="copy-lan-url-btn">📋 Copier le lien</button>
+          <p class="muted">Le téléphone doit être connecté au même réseau Wi-Fi que
+             cet ordinateur. Aucune installation nécessaire — le navigateur suffit.</p>
+          <p class="muted small-note">
+            ⚠️ Si le scan ne fonctionne pas : au tout premier lancement, Windows
+            affiche parfois une fenêtre "Le Pare-feu Windows Defender a bloqué
+            certaines fonctionnalités de cette application" — il faut cliquer sur
+            <strong>Autoriser l'accès</strong> (réseaux privés) pour que le téléphone
+            puisse se connecter.
+          </p>
         </div>
       </div>
     </section>

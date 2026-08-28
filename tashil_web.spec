@@ -14,16 +14,23 @@ _icon = _icon_path if os.path.exists(_icon_path) else None
 # the package ships so the frozen exe has what it needs at runtime.
 webview_datas, webview_binaries, webview_hiddenimports = collect_all('webview')
 
+# Same treatment for qrcode + Pillow (network-access QR code feature) —
+# Pillow in particular has plugin/codec submodules that plain
+# hiddenimports can miss.
+qrcode_datas, qrcode_binaries, qrcode_hiddenimports = collect_all('qrcode')
+pil_datas, pil_binaries, pil_hiddenimports = collect_all('PIL')
+
 a = Analysis(
     ['desktop_launcher.py'],
     pathex=[],
-    binaries=webview_binaries,
+    binaries=webview_binaries + qrcode_binaries + pil_binaries,
     datas=[
         ('templates', 'templates'),
         ('static', 'static'),
         ('app.py', '.'),
-    ] + webview_datas,
-    hiddenimports=['flask', 'werkzeug', 'jinja2'] + webview_hiddenimports,
+    ] + webview_datas + qrcode_datas + pil_datas,
+    hiddenimports=['flask', 'werkzeug', 'jinja2'] + webview_hiddenimports
+                  + qrcode_hiddenimports + pil_hiddenimports,
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],

@@ -40,12 +40,19 @@ import shutil
 import hashlib
 import hmac
 import base64
+from io import BytesIO
 from datetime import datetime
 
 from flask import (Flask, request, jsonify, send_from_directory,
                     send_file, render_template, abort)
 from werkzeug.utils import secure_filename
 from werkzeug.security import generate_password_hash, check_password_hash
+
+try:
+    import qrcode
+    _QRCODE_AVAILABLE = True
+except ImportError:
+    _QRCODE_AVAILABLE = False
 
 # --------------------------------------------------------------------------- #
 # Paths — cross-platform, no admin rights required (works on Windows AND
@@ -64,7 +71,7 @@ _LEGACY_ARCHIVE_ENTRANT = os.path.join(BASE_DIR, "archives", "Courrier_Entrant")
 os.makedirs(PROFILES_DIR, exist_ok=True)
 
 APP_ROOT = os.path.dirname(os.path.abspath(__file__))
-APP_VERSION = "2.3.0"
+APP_VERSION = "2.3.1"
 GITHUB_REPO = "Aladdinweb/TASHIL-ES"  # used by the in-app OTA update checker
 
 app = Flask(__name__,
@@ -386,6 +393,22 @@ def index():
 def manifest():
     return send_from_directory(app.static_folder, "manifest.json",
                                 mimetype="application/manifest+json")
+
+
+@app.route("/api/network-qr.png")
+def api_network_qr():
+    """
+    Generates a QR code encoding this device's LAN URL, so a phone can
+    open TASHIL by scanning instead of typing an IP address by hand.
+    """
+    if not _QRCODE_AVAILABLE:
+        abort(501)  # Not Implemented — dependency missing on this build
+    url = f"http://{get_lan_ip()}:5000/"
+    img = qrcode.make(url)
+    buf = BytesIO()
+    img.save(buf, format="PNG")
+    buf.seek(0)
+    return send_file(buf, mimetype="image/png")
 
 
 # --------------------------------------------------------------------------- #
