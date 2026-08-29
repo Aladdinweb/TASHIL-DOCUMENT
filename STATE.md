@@ -1,8 +1,8 @@
 # TASHIL DOCUMENT HUB — WEB EDITION
-## Documentation de traçabilité — v2.3.1
+## Documentation de traçabilité — v2.4.0
 
 **Copyright :** ILINE TECH 2026 BY FERAK ALADDIN
-**Date :** 2026-08-28
+**Date :** 2026-08-29
 
 ---
 
@@ -456,3 +456,127 @@ de l'écriture du lanceur desktop.
 `templates/index.html`, `static/css/style.css`, `static/js/app.js`,
 `requirements.txt`, `tashil_web.spec`. Aucune fonctionnalité antérieure
 retirée.
+
+---
+
+## 12. v2.4.0 — Livraison réelle des messages entre institutions (2026-08-29)
+
+Signalement utilisateur : un message envoyé de EPSP ES SENIA vers
+POLYCLINIQUE AADL AIN BEIDA MABROUK LOUCIF n'apparaissait jamais dans la
+boîte de réception du destinataire. **Diagnostic confirmé : ce n'était pas
+un bug, mais une fonctionnalité jamais construite.** L'isolation stricte
+multi-tenant (v2.3.0) empêchait délibérément toute fuite entre profils,
+mais la contrepartie — livrer réellement un message envoyé dans la boîte
+du destinataire — n'existait pas encore. Envoyer un document n'écrivait
+que dans le journal ET l'archive de l'expéditeur ; rien n'était jamais
+transmis nulle part.
+
+Deux mécanismes de livraison ont été ajoutés, correspondant aux deux
+scénarios réels identifiés avec l'utilisateur.
+
+### 12.1 Livraison locale (même appareil)
+
+Quand l'expéditeur et le destinataire sont deux profils configurés sur
+**le même ordinateur**, `POST /api/messages/send` recherche maintenant si
+le nom du destinataire correspond à un autre profil enregistré localement
+(`find_local_profile_by_name`, comparaison insensible à la casse/espaces).
+Si trouvé :
+- Le fichier est copié physiquement dans le `Courrier_Entrant` isolé du
+  destinataire.
+- Une entrée `entrant` est insérée dans la base SQLite propre au
+  destinataire (complètement séparée de celle de l'expéditeur).
+- Le même numéro de suivi (`tracking_number`) est utilisé des deux côtés
+  pour la traçabilité — avec repli automatique en cas de collision rare
+  entre deux bases indépendantes (`sqlite3.IntegrityError` → suffixe
+  aléatoire, testé).
+
+**Correctif de fond associé** : les numéros de suivi intègrent maintenant
+un code d'institution court (`TASHIL-31EP-S-2026-000001` au lieu de
+`TASHIL-S-2026-000001`) — nécessaire car un même numéro généré
+indépendamment par deux institutions différentes aurait pu entrer en
+collision une fois copié dans la base d'une seconde institution (les
+compteurs `COUNT(*)` sont locaux à chaque base isolée).
+
+**Testé réellement** : profil A créé, profil B créé, message envoyé de A
+vers B, confirmé dans le tableau de bord de B (`total_received: 1`),
+confirmé dans sa boîte de réception (expéditeur/objet corrects), fichier
+physiquement présent dans son dossier d'archive isolé.
+
+### 12.2 Cloud Bridge — livraison distante via GitHub (institutions sur des ordinateurs différents)
+
+Pour les institutions sur des machines séparées, nouveau mécanisme de
+transport utilisant un dépôt GitHub **privé** dédié comme file d'attente,
+implémenté avec `urllib` de la bibliothèque standard uniquement (aucune
+nouvelle dépendance pip, pour éviter tout nouveau risque d'empaquetage
+PyInstaller comme rencontré avec pywebview).
+
+**⚠️ Modèle de sécurité — à comprendre clairement avant utilisation :**
+- Les documents sont commités en clair dans le dépôt — **aucun chiffrement
+  de bout en bout**. La confidentialité du dépôt (privé) et le contrôle
+  des accès qui y ont droit constituent la SEULE protection.
+- L'application **refuse de sauvegarder une configuration pointant vers un
+  dépôt public** — vérifié en direct via l'API GitHub
+  (`GET /repos/{owner}/{repo}`, champ `private`) avant tout enregistrement.
+  Testé : tentative contre un dépôt public simulé → rejetée avec `HTTP 400`
+  et message explicite.
+- Le jeton d'accès personnel GitHub est stocké tel quel (non chiffré) dans
+  `registry.db` local — jamais renvoyé au frontend une fois enregistré
+  (vérifié : `GET /api/bridge/config` n'inclut jamais `github_token`).
+- Recommandation donnée à l'utilisateur : dépôt séparé et dédié,
+  **jamais** le dépôt de code source `TASHIL-ES` lui-même (mélange de
+  préoccupations, risque d'exposition si le dépôt de code est public).
+
+**Fonctionnement :**
+- `bridge_slug()` normalise le nom d'établissement en une adresse stable
+  (ex. `POLYCLINIQUE_AADL_AIN_BEIDA_MABROUK_LOUCIF`) — chaque établissement
+  possède ainsi un "dossier" prévisible dans le dépôt
+  (`bridge/<adresse>/`), sans étape d'appairage manuelle. ⚠️ Adressage par
+  nom uniquement (même limite que la livraison locale) — deux
+  établissements différents portant exactement le même nom entreraient en
+  collision ; à corriger si le sélecteur de destinataire devient un jour
+  structuré (Wilaya + Type + Nom) plutôt qu'un texte libre.
+- À l'envoi (`push_to_bridge`), si aucun profil local ne correspond ET que
+  le Cloud Bridge est activé : métadonnées (JSON) + pièce jointe (base64)
+  sont commitées dans `bridge/<adresse_destinataire>/<tracking>.json` et
+  `bridge/<adresse_destinataire>/<tracking><ext>`.
+- Côté destinataire (`POST /api/bridge/poll`, manuel ou automatique toutes
+  les 45s en arrière-plan tant que le Bridge est activé) : liste le
+  dossier `bridge/<sa_propre_adresse>/`, télécharge chaque entrée non
+  déjà connue (vérification par `tracking_number` — idempotent, sûr à
+  rappeler), l'insère comme message entrant isolé, PUIS supprime les
+  fichiers consommés du dépôt (évite une file d'attente qui grossit
+  indéfiniment).
+
+**Nouvelle carte Paramètres** : "🌉 Cloud Bridge" — configuration
+Propriétaire/Dépôt/Jeton, statut, bouton de vérification manuelle,
+bouton de désactivation. Avertissement de sécurité affiché directement
+dans l'interface, pas seulement en documentation.
+
+**Testé réellement (avec un serveur GitHub Contents API factice construit
+spécifiquement pour ce test, car cet environnement de développement n'a
+pas d'accès réseau réel à api.github.com) :**
+- ✅ Configuration acceptée contre un dépôt "privé" simulé
+- ✅ Jeton jamais renvoyé par `GET /api/bridge/config`
+- ✅ Envoi vers un destinataire SANS profil local → `delivered_via_bridge:
+  true`, fichiers effectivement "commités" (stockés) sur le faux serveur
+- ✅ **Cycle complet aller-retour** : profil A envoie → profil B (créé
+  après coup, simulant un second appareil) interroge le Bridge → message
+  correctement inséré dans SA propre base isolée avec expéditeur/objet/
+  corps corrects → fichier physiquement présent dans son archive
+- ✅ Re-sondage après réception → `new_messages: 0` (idempotence + nettoyage
+  confirmés, pas de doublons)
+- ✅ Configuration contre un dépôt PUBLIC simulé → refusée (`HTTP 400`)
+- ✅ Non-régression : la livraison locale (section 12.1) fonctionne
+  toujours après ces changements
+- ⚠️ **Ce qui reste à vérifier par l'utilisateur, impossible à tester
+  depuis ce bac à sable sans accès réseau réel** : le comportement contre
+  la vraie API `api.github.com` (formats de réponse réels, limites de
+  débit réelles, comportement du jeton réel). Le serveur factice reproduit
+  fidèlement la forme des réponses GitHub documentées, mais un test avec
+  un vrai dépôt privé et un vrai jeton reste la validation finale
+  nécessaire avant usage en production.
+
+**Fichiers modifiés :** `app.py` (ajouts substantiels : livraison locale,
+client GitHub minimal, configuration et sondage du Cloud Bridge),
+`templates/index.html`, `static/js/app.js`. Aucune fonctionnalité
+antérieure retirée.

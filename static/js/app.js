@@ -12,6 +12,7 @@ const state = {
   pendingUnlockNeedsSetup: false,
   appInitialized: false,    // event listeners wired only once (see showApp)
   selectedFile: null,       // currently attached file in the Envoi form
+  bridgeEnabled: false,
 };
 
 // ------------------------------------------------------------------ //
@@ -314,6 +315,7 @@ function showApp() {
     setupLogout();
     setupLockButton();
     setupCopyLanUrl();
+    setupCloudBridge();
     startBackgroundPolling();
     state.appInitialized = true;
   }
@@ -425,6 +427,11 @@ function startBackgroundPolling() {
       // Silent — this is a background convenience poll, not a critical path
     }
   }, 8000);
+
+  // Separate, slower interval for the Cloud Bridge — GitHub API calls,
+  // spaced further apart than the local dashboard poll to stay well
+  // within rate limits. Only does anything once bridge is configured.
+  setInterval(() => pollBridge(false), 45000);
 }
 
 async function loadInstitutions() {
@@ -626,10 +633,19 @@ function setupMessaging() {
       const data = await res.json();
       if (!res.ok) throw new Error(data.error || "Échec de l'envoi.");
 
-      statusEl.textContent = `✅ Document transmis — ${data.tracking_number}`;
-      statusEl.classList.add("ok");
-      showToast(`📤 Document envoyé — ${data.tracking_number}`, "success");
-      showSystemNotification("TASHIL DOCUMENT HUB", `Document envoyé — ${data.tracking_number}`);
+      if (data.delivered_locally) {
+        statusEl.textContent = `✅ Document transmis et reçu — ${data.tracking_number}`;
+        statusEl.classList.add("ok");
+        showToast(`📤 Document remis à ${recipient}`, "success");
+        showSystemNotification("TASHIL DOCUMENT HUB", `Document remis à ${recipient}`);
+      } else {
+        statusEl.textContent = `📦 Document archivé — ${data.tracking_number}. ` +
+          `Aucun profil "${recipient}" trouvé sur cet appareil : le document est enregistré ` +
+          `ici mais n'a pas pu être transmis. La transmission vers un autre ordinateur / ` +
+          `réseau n'est pas encore disponible (voir Paramètres).`;
+        statusEl.classList.add("err");
+        showToast(`📦 Archivé — non transmis (${recipient} n'a pas de profil ici)`, "info");
+      }
 
       resetMessagingForm();
       document.getElementById("msg-recipient").value = "";
@@ -759,6 +775,101 @@ async function checkForUpdate() {
     }
   } catch (err) {
     statusEl.textContent = `⛔ Impossible de vérifier les mises à jour : ${err.message}`;
+  }
+}
+
+// ------------------------------------------------------------------ //
+// Cloud Bridge (GitHub-backed remote transmission)
+// ------------------------------------------------------------------ //
+function setupCloudBridge() {
+  document.getElementById("bridge-save-btn").addEventListener("click", saveBridgeConfig);
+  document.getElementById("bridge-poll-btn").addEventListener("click", () => pollBridge(true));
+  document.getElementById("bridge-disable-btn").addEventListener("click", disableBridge);
+  refreshBridgeUI();
+}
+
+async function refreshBridgeUI() {
+  try {
+    const cfg = await fetch("/api/bridge/config").then(r => r.json());
+    state.bridgeEnabled = cfg.enabled;
+    const configuredView = document.getElementById("bridge-configured-view");
+    const setupView = document.getElementById("bridge-setup-view");
+
+    if (cfg.configured && cfg.enabled) {
+      configuredView.classList.remove("hidden");
+      setupView.classList.add("hidden");
+      document.getElementById("bridge-repo-display").textContent =
+        `${cfg.github_owner}/${cfg.github_repo}`;
+    } else {
+      configuredView.classList.add("hidden");
+      setupView.classList.remove("hidden");
+    }
+  } catch (err) {
+    // Bridge status is a progressive enhancement — leave the setup form visible
+  }
+}
+
+async function saveBridgeConfig() {
+  const statusEl = document.getElementById("bridge-status-line");
+  statusEl.className = "status-line";
+  statusEl.textContent = "Vérification du dépôt...";
+
+  const payload = {
+    github_owner: document.getElementById("bridge-owner").value.trim(),
+    github_repo: document.getElementById("bridge-repo").value.trim(),
+    github_token: document.getElementById("bridge-token").value.trim(),
+  };
+
+  try {
+    const res = await fetch("/api/bridge/config", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.error || "Échec de la configuration.");
+
+    statusEl.textContent = "✅ Dépôt privé vérifié — Cloud Bridge activé.";
+    statusEl.classList.add("ok");
+    document.getElementById("bridge-token").value = "";
+    showToast("🌉 Cloud Bridge activé", "success");
+    await refreshBridgeUI();
+  } catch (err) {
+    statusEl.textContent = `⛔ ${err.message}`;
+    statusEl.classList.add("err");
+  }
+}
+
+async function disableBridge() {
+  if (!confirm("Désactiver le Cloud Bridge ? Les messages en attente distants ne seront plus relevés.")) {
+    return;
+  }
+  await fetch("/api/bridge/disable", { method: "POST" });
+  state.bridgeEnabled = false;
+  showToast("🚫 Cloud Bridge désactivé", "info");
+  await refreshBridgeUI();
+}
+
+async function pollBridge(manual) {
+  if (!state.bridgeEnabled) return;
+  try {
+    const res = await fetch("/api/bridge/poll", { method: "POST" });
+    const data = await res.json();
+    if (!res.ok) {
+      if (manual) showToast(`⛔ ${data.error || "Échec de la vérification distante."}`, "error");
+      return;
+    }
+    if (data.new_messages > 0) {
+      showToast(`📥 ${data.new_messages} message(s) reçu(s) via le Cloud Bridge`, "success");
+      showSystemNotification("TASHIL DOCUMENT HUB",
+        `${data.new_messages} nouveau(x) message(s) distant(s) reçu(s)`);
+      if (state.currentView === "dashboard") loadDashboard();
+      if (state.currentView === "messagerie") loadInbox();
+    } else if (manual) {
+      showToast("✅ Aucun nouveau message distant.", "info");
+    }
+  } catch (err) {
+    if (manual) showToast("⛔ Impossible de contacter le Cloud Bridge.", "error");
   }
 }
 
