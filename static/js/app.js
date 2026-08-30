@@ -313,6 +313,7 @@ function showApp() {
     setupMessaging();
     setupUpdateChecker();
     setupLogout();
+    setupDeleteProfile();
     setupLockButton();
     setupCopyLanUrl();
     setupCloudBridge();
@@ -933,6 +934,74 @@ function setupLogout() {
     }
     lockSession();
   };
+}
+
+// ------------------------------------------------------------------ //
+// Delete profile (irreversible — requires PIN re-entry, not just a
+// dismissible dialog, since this permanently destroys archived documents)
+// ------------------------------------------------------------------ //
+function setupDeleteProfile() {
+  document.getElementById("delete-profile-btn").onclick = openDeleteProfileModal;
+  document.getElementById("delete-profile-cancel-btn").onclick = closeDeleteProfileModal;
+  document.getElementById("delete-profile-confirm-btn").onclick = confirmDeleteProfile;
+}
+
+function openDeleteProfileModal() {
+  document.getElementById("delete-profile-institution-name").textContent =
+    state.profile ? state.profile.institution_name : "";
+  document.getElementById("delete-profile-pin").value = "";
+  document.getElementById("delete-profile-error").classList.add("hidden");
+  document.getElementById("delete-profile-overlay").classList.remove("hidden");
+}
+
+function closeDeleteProfileModal() {
+  document.getElementById("delete-profile-overlay").classList.add("hidden");
+}
+
+async function confirmDeleteProfile() {
+  const errorEl = document.getElementById("delete-profile-error");
+  errorEl.classList.add("hidden");
+
+  const pin = document.getElementById("delete-profile-pin").value.trim();
+  if (!/^\d{4,6}$/.test(pin)) {
+    errorEl.textContent = "Le code PIN doit contenir 4 à 6 chiffres.";
+    errorEl.classList.remove("hidden");
+    return;
+  }
+
+  try {
+    const res = await fetch("/api/profile/delete", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ pin }),
+    });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.error || "Échec de la suppression.");
+
+    closeDeleteProfileModal();
+    if (data.warning) {
+      showToast(`⚠️ ${data.warning}`, "error");
+    } else {
+      showToast("🗑️ Profil supprimé définitivement", "success");
+    }
+
+    // The profile is gone and the session is already locked server-side —
+    // send the user back to the profile picker (or onboarding if that was
+    // the last profile on this device).
+    state.profile = null;
+    document.getElementById("app").classList.add("hidden");
+
+    const session = await fetch("/api/session").then(r => r.json());
+    state.session = session;
+    if (session.first_launch) {
+      showOnboarding({ allowCancel: false });
+    } else {
+      showLockScreen();
+    }
+  } catch (err) {
+    errorEl.textContent = err.message;
+    errorEl.classList.remove("hidden");
+  }
 }
 
 // ------------------------------------------------------------------ //

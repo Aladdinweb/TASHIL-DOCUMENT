@@ -72,7 +72,7 @@ _LEGACY_ARCHIVE_ENTRANT = os.path.join(BASE_DIR, "archives", "Courrier_Entrant")
 os.makedirs(PROFILES_DIR, exist_ok=True)
 
 APP_ROOT = os.path.dirname(os.path.abspath(__file__))
-APP_VERSION = "2.5.0"
+APP_VERSION = "2.6.0"
 GITHUB_REPO = "Aladdinweb/TASHIL-ES"  # used by the in-app OTA update checker
 
 app = Flask(__name__,
@@ -673,6 +673,60 @@ def api_session_lock():
     archives, but it also must never destroy them."""
     global _active_key
     _active_key = None
+    return jsonify({"ok": True})
+
+
+@app.route("/api/profile/delete", methods=["POST"])
+def api_delete_profile():
+    """
+    Permanently deletes the CURRENTLY ACTIVE profile: its isolated database,
+    its entire archive folder (Courrier_Sortant + Courrier_Entrant), and its
+    entry in the device's registry. Irreversible — requires the profile's
+    own PIN to be re-entered as the actual authorization (a dismissible
+    confirm() dialog alone is not enough protection for a destructive
+    action against real archived documents).
+    """
+    global _active_key
+    if _active_key is None:
+        return locked_response()
+
+    data = request.get_json(force=True)
+    pin = data.get("pin", "")
+
+    profile = get_profile_row(_active_key)
+    if profile is None:
+        _active_key = None
+        return jsonify({"error": "Profil introuvable."}), 404
+    if profile["pin_hash"] is None or not check_password_hash(profile["pin_hash"], pin):
+        return jsonify({"error": "Code PIN incorrect."}), 401
+
+    key_to_delete = _active_key
+    paths = profile_paths(key_to_delete)
+
+    # Lock immediately — no further access to this profile from this point
+    # on, regardless of whether file cleanup below fully succeeds.
+    _active_key = None
+
+    conn = get_registry_db()
+    conn.execute("DELETE FROM profiles WHERE institution_key = ?", (key_to_delete,))
+    conn.commit()
+    conn.close()
+
+    try:
+        if os.path.isdir(paths["folder"]):
+            shutil.rmtree(paths["folder"])
+    except OSError as exc:
+        # The profile is already gone from the picker either way (registry
+        # entry removed above) — but tell the user plainly if some files
+        # couldn't be removed (e.g. one was open in another program),
+        # rather than silently leaving orphaned data on disk unmentioned.
+        return jsonify({
+            "ok": True,
+            "warning": f"Le profil a été retiré, mais certains fichiers n'ont pas pu être "
+                       f"supprimés automatiquement ({exc}). Vous pouvez les supprimer "
+                       f"manuellement dans le dossier de l'application si besoin."
+        })
+
     return jsonify({"ok": True})
 
 

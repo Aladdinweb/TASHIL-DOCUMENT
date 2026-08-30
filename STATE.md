@@ -1,5 +1,5 @@
 # TASHIL DOCUMENT HUB — WEB EDITION
-## Documentation de traçabilité — v2.5.0
+## Documentation de traçabilité — v2.6.0
 
 **Copyright :** ILINE TECH 2026 BY FERAK ALADDIN
 **Date :** 2026-08-30
@@ -697,3 +697,80 @@ en fonction partagée, nouvelles routes de provisioning, correction du bug
 de sondage à adresse unique, renommage de la fonction de correspondance
 locale), `templates/index.html`, `static/css/style.css`,
 `static/js/app.js`. Aucune fonctionnalité antérieure retirée.
+
+---
+
+## 14. v2.6.0 — Suppression définitive de profil (2026-08-30)
+
+**Validation utilisateur préalable** : le Cloud Bridge en production
+(`Aladdinweb/TASHIL-PRODUCTION-BRIDGE`) a été confirmé connecté et
+fonctionnel par capture d'écran — badge "🟢 Réseau TASHIL Connecté", dépôt
+actif affiché, QR de provisioning généré avec succès.
+
+### 14.1 Problème signalé
+
+Les profils créés (ex. EPSP ES SENIA, POLYCLINIQUE AADL) restaient
+définitivement enregistrés sur l'appareil, sans possibilité de
+suppression — seul le verrouillage ("Déconnexion") existait, qui préserve
+délibérément les données (comportement voulu depuis v2.3.0, mais aucun
+moyen de vraiment nettoyer un profil de test ou obsolète).
+
+### 14.2 Fonctionnalité ajoutée
+
+Nouvelle route `POST /api/profile/delete`, appelée uniquement sur le
+profil **actuellement déverrouillé** (pas de suppression à distance d'un
+profil qu'on n'a pas soi-même authentifié) :
+
+1. **Confirmation de sécurité** : ré-saisie obligatoire du code PIN du
+   profil (pas seulement une boîte de dialogue `confirm()` navigateur,
+   trop facile à valider par clic accidentel pour une action qui détruit
+   des documents archivés réels et irréversiblement). Testé : mauvais PIN
+   → `HTTP 401`, rien n'est touché sur le disque (vérifié explicitement
+   avant de tester la suppression réelle).
+2. **À la suppression confirmée** :
+   - Verrouillage immédiat de la session (`_active_key = None`) avant
+     toute opération destructive, pour qu'aucun accès ultérieur à ce
+     profil ne soit possible même en cas d'échec partiel du nettoyage.
+   - Suppression de l'entrée dans `registry.db` (le profil disparaît
+     immédiatement de la liste de sélection).
+   - Suppression physique de tout le dossier isolé
+     `~/TASHIL_DATA/profiles/<clé>/` — base SQLite ET archives
+     (Courrier_Sortant + Courrier_Entrant) en un seul `shutil.rmtree()`.
+   - Si la suppression des fichiers échoue partiellement (ex. fichier
+     verrouillé par un antivirus ou un autre programme sous Windows), le
+     profil est quand même retiré de la liste, mais un avertissement
+     explicite est renvoyé au lieu d'échouer silencieusement en laissant
+     des données orphelines sans le dire à l'utilisateur.
+3. **Redirection après suppression** : retour à l'écran de sélection de
+   profil s'il en reste d'autres sur l'appareil ; retour à l'assistant de
+   configuration initiale si c'était le dernier profil (testé : `
+   first_launch` repasse à `true` après suppression du seul profil
+   existant).
+
+**Isolation vérifiée à la suppression** : un second profil créé en
+parallèle, non touché par la suppression du premier — dossier intact,
+déverrouillage toujours fonctionnel, aucune donnée perdue ni mélangée.
+
+### 14.3 Interface
+
+Nouvelle carte "⚠️ Zone dangereuse" dans Paramètres, visuellement séparée
+(bordure rouge) de la carte "🚪 Session" pour ne jamais confondre
+verrouillage (réversible) et suppression (définitive). Modale de
+confirmation dédiée avec rappel explicite de l'irréversibilité + champ PIN
+(classe `.pin-input`, cohérent avec le reste de l'application).
+
+### 14.4 Tests effectués
+
+- ✅ Mauvais PIN → `401`, aucun fichier touché (vérifié par inspection du
+  disque avant/après)
+- ✅ Bon PIN → suppression réelle confirmée : dossier disparu du disque,
+  entrée disparue du registre, session verrouillée automatiquement
+- ✅ Second profil non affecté (isolation préservée)
+- ✅ Suppression du dernier profil restant → `first_launch: true`,
+  redirection vers l'onboarding plutôt qu'un écran de sélection vide
+- ✅ Vérification croisée de tous les `getElementById(...)` de `app.js`
+  contre `index.html` — 0 référence orpheline
+
+**Fichiers modifiés :** `app.py` (nouvelle route `/api/profile/delete`),
+`templates/index.html`, `static/css/style.css`, `static/js/app.js`.
+Aucune fonctionnalité antérieure retirée.

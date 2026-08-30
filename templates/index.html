@@ -301,6 +301,17 @@
         </p>
         <button class="btn btn-danger" id="logout-btn">🔒 Verrouiller / Changer d'établissement</button>
       </div>
+
+      <div class="card danger-zone">
+        <h3>⚠️ Zone dangereuse</h3>
+        <p class="muted">
+          Supprime <strong>définitivement</strong> ce profil : sa base de
+          données isolée et tous ses documents archivés (Courrier Sortant
+          et Entrant). Les autres profils sur cet appareil ne sont pas
+          affectés. <strong>Cette action est irréversible.</strong>
+        </p>
+        <button class="btn btn-danger" id="delete-profile-btn">🗑️ Supprimer définitivement ce profil</button>
+      </div>
     </section>
 
     <footer class="app-footer">
@@ -308,6 +319,25 @@
     </footer>
 
   </main>
+</div>
+
+<!-- Delete-profile confirmation (PIN re-entry required) -->
+<div id="delete-profile-overlay" class="overlay hidden">
+  <div class="onboarding-card">
+    <h1>⚠️ Suppression définitive</h1>
+    <p class="muted" id="delete-profile-institution-name">—</p>
+    <p>
+      Cette action supprimera définitivement ce profil, sa base de données
+      et TOUS ses documents archivés sur cet appareil.
+      <strong>Cette action est irréversible.</strong>
+    </p>
+    <label>Entrez le code PIN de ce profil pour confirmer</label>
+    <input id="delete-profile-pin" type="password" inputmode="numeric" pattern="\d*" maxlength="6"
+           placeholder="····" autocomplete="off" class="pin-input">
+    <button class="btn btn-danger" id="delete-profile-confirm-btn">🗑️ Confirmer la suppression définitive</button>
+    <button class="btn btn-secondary" id="delete-profile-cancel-btn">← Annuler</button>
+    <p id="delete-profile-error" class="error hidden"></p>
+  </div>
 </div>
 
 <script src="/static/js/app.js"></script>
