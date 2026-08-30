@@ -207,6 +207,8 @@
         <p id="pf-name">Nom : —</p>
         <label>Clé de licence</label>
         <div class="key-box" id="pf-serial">—</div>
+        <label>ID de routage TASHIL (à communiquer aux autres établissements)</label>
+        <div class="key-box" id="pf-routing-id">—</div>
       </div>
 
       <div class="card">
@@ -223,36 +225,70 @@
       </div>
 
       <div class="card">
-        <h3>🌉 Cloud Bridge (transmission distante via GitHub)</h3>
-        <p class="muted">
-          Permet de transmettre des documents à un établissement situé sur un
-          autre ordinateur / réseau (au-delà du Wi-Fi local). Nécessite un
-          dépôt GitHub <strong>privé</strong> dédié — TASHIL vérifie
-          automatiquement que le dépôt est bien privé avant d'activer quoi
-          que ce soit.
-        </p>
-        <p class="muted small-note">
-          ⚠️ Les documents transmis via ce dépôt ne sont pas chiffrés — la
-          confidentialité du dépôt et les personnes qui y ont accès sont la
-          seule protection. N'utilisez jamais un dépôt public.
-        </p>
+        <h3>🌉 Réseau TASHIL (transmission distante)</h3>
 
-        <div id="bridge-status-line" class="status-line"></div>
+        <div id="bridge-connected-badge" class="bridge-badge hidden">
+          <span class="bridge-dot bridge-dot-on"></span> Réseau TASHIL Connecté
+        </div>
+        <div id="bridge-disconnected-badge" class="bridge-badge hidden">
+          <span class="bridge-dot bridge-dot-off"></span> Non configuré
+        </div>
 
+        <p id="bridge-status-line" class="status-line"></p>
+
+        <!-- Configured: show ID card + provisioning + disable -->
         <div id="bridge-configured-view" class="hidden">
           <p>Dépôt actif : <span class="key-box" id="bridge-repo-display">—</span></p>
           <button class="btn btn-secondary" id="bridge-poll-btn">🔄 Vérifier les messages distants</button>
-          <button class="btn btn-danger" id="bridge-disable-btn">🚫 Désactiver le Cloud Bridge</button>
+          <button class="btn btn-secondary" id="bridge-show-qr-btn">📱 Provisionner un autre appareil</button>
+          <button class="btn btn-danger" id="bridge-disable-btn">🚫 Désactiver</button>
+
+          <div id="bridge-qr-reveal" class="hidden qr-card">
+            <p class="muted small-note">
+              ⚠️ Ce QR contient une clé d'accès réelle. Ne le montrez qu'à
+              l'appareil que vous provisionnez vous-même, en personne.
+            </p>
+            <img id="bridge-qr-img" class="qr-image" alt="QR de provisioning Cloud Bridge">
+            <p class="muted">
+              Scannez avec l'appareil photo du nouvel appareil (comme pour
+              un QR Wi-Fi), copiez le texte détecté, puis collez-le dans
+              "Importer un code" sur cet appareil.
+            </p>
+          </div>
         </div>
 
+        <!-- Not configured: import-by-paste is the primary path -->
         <div id="bridge-setup-view">
-          <label>Propriétaire GitHub (utilisateur ou organisation)</label>
-          <input id="bridge-owner" type="text" placeholder="ex: Aladdinweb">
-          <label>Nom du dépôt privé dédié</label>
-          <input id="bridge-repo" type="text" placeholder="ex: TASHIL-Bridge">
-          <label>Jeton d'accès personnel GitHub (scope "repo")</label>
-          <input id="bridge-token" type="password" placeholder="ghp_..." autocomplete="off">
-          <button class="btn btn-primary" id="bridge-save-btn">💾 Activer le Cloud Bridge</button>
+          <p class="muted">
+            Aucune saisie de nom d'utilisateur, dépôt ou jeton n'est
+            nécessaire ici — collez simplement le code fourni par
+            l'appareil déjà connecté au Réseau TASHIL.
+          </p>
+          <label>Coller le code de provisioning</label>
+          <textarea id="bridge-import-input" rows="3" placeholder="Collez ici le code obtenu par scan QR..."></textarea>
+          <button class="btn btn-primary" id="bridge-import-btn">📥 Importer</button>
+
+          <details class="advanced-details">
+            <summary>⚙️ Configuration manuelle (avancé — premier appareil uniquement)</summary>
+            <p class="muted small-note">
+              À utiliser une seule fois, sur le tout premier appareil, pour
+              créer la connexion initiale. Les appareils suivants utilisent
+              "Importer un code" ci-dessus.
+            </p>
+            <label>Propriétaire GitHub (utilisateur ou organisation)</label>
+            <input id="bridge-owner" type="text" placeholder="ex: Aladdinweb">
+            <label>Nom du dépôt privé dédié</label>
+            <input id="bridge-repo" type="text" placeholder="ex: TASHIL-Bridge">
+            <label>Jeton d'accès personnel GitHub (scope "repo")</label>
+            <input id="bridge-token" type="password" placeholder="ghp_..." autocomplete="off">
+            <p class="muted small-note">
+              ⚠️ Le dépôt DOIT être privé — TASHIL vérifie automatiquement
+              et refuse tout dépôt public. Les documents transmis ne sont
+              pas chiffrés : la confidentialité du dépôt et le contrôle de
+              qui y a accès sont la seule protection.
+            </p>
+            <button class="btn btn-primary" id="bridge-save-btn">💾 Créer la connexion initiale</button>
+          </details>
         </div>
       </div>
 

@@ -72,7 +72,7 @@ _LEGACY_ARCHIVE_ENTRANT = os.path.join(BASE_DIR, "archives", "Courrier_Entrant")
 os.makedirs(PROFILES_DIR, exist_ok=True)
 
 APP_ROOT = os.path.dirname(os.path.abspath(__file__))
-APP_VERSION = "2.4.0"
+APP_VERSION = "2.5.0"
 GITHUB_REPO = "Aladdinweb/TASHIL-ES"  # used by the in-app OTA update checker
 
 app = Flask(__name__,
@@ -303,23 +303,28 @@ def next_tracking_number(conn, direction: str, institution_key: str) -> str:
     return f"TASHIL-{short}-{prefix}-{year}-{count + 1:06d}"
 
 
-def find_local_profile_by_name(institution_name: str, exclude_key: str = None):
+def find_local_profile_by_recipient(recipient_text: str, exclude_key: str = None):
     """
-    Looks for another profile registered on THIS device whose institution
-    name matches the given recipient string (case/whitespace-insensitive).
-    Used to deliver a message locally when both sender and recipient are
-    profiles on the same machine. Returns None if no match — this does
-    NOT reach across a network to a different computer; see the honesty
-    note in api_send_message().
+    Looks for another profile registered on THIS device matching the given
+    recipient string — either an exact institution ID/key (e.g.
+    '31_EP_EPSP_ES_SENIA', shown to each institution as its "ID de routage"
+    in Paramètres) or a plain institution name (case/whitespace-insensitive).
+    Matching by ID first lets two institutions communicate unambiguously
+    even if names collide; name matching remains the friendly default.
+    Returns None if no match — this does NOT reach across a network to a
+    different computer; see the honesty note in api_send_message().
     """
     conn = get_registry_db()
     rows = conn.execute("SELECT * FROM profiles").fetchall()
     conn.close()
-    target = institution_name.strip().casefold()
+    target_key = recipient_text.strip()
+    target_name = recipient_text.strip().casefold()
     for row in rows:
         if row["institution_key"] == exclude_key:
             continue
-        if row["institution_name"].strip().casefold() == target:
+        if row["institution_key"] == target_key:
+            return dict(row)
+        if row["institution_name"].strip().casefold() == target_name:
             return dict(row)
     return None
 
@@ -812,7 +817,7 @@ def api_send_message():
     # (LAN push / Cloud Bridge) not yet built. See STATE.md.
     # --------------------------------------------------------------- #
     delivered_locally = False
-    recipient_profile = find_local_profile_by_name(recipient, exclude_key=_active_key)
+    recipient_profile = find_local_profile_by_recipient(recipient, exclude_key=_active_key)
     if recipient_profile is not None:
         try:
             recipient_key = recipient_profile["institution_key"]
@@ -975,31 +980,30 @@ def api_bridge_get_config():
     })
 
 
-@app.route("/api/bridge/config", methods=["POST"])
-def api_bridge_save_config():
-    data = request.get_json(force=True)
-    owner = data.get("github_owner", "").strip()
-    repo = data.get("github_repo", "").strip()
-    token = data.get("github_token", "").strip()
-
+def _validate_and_save_bridge_config(owner: str, repo: str, token: str):
+    """
+    Shared by both the manual entry form AND the QR/pasted-code import path
+    — guarantees the private-repo safety check applies identically no
+    matter how the credentials arrived. Returns (status_code, body_dict).
+    """
     if not owner or not repo or not token:
-        return jsonify({"error": "Propriétaire, dépôt et jeton GitHub sont tous requis."}), 400
+        return 400, {"error": "Propriétaire, dépôt et jeton GitHub sont tous requis."}
 
     status, repo_info = _github_request("GET", f"/repos/{owner}/{repo}", token)
     if status == 0:
-        return jsonify({"error": f"Impossible de contacter GitHub : {repo_info.get('message', 'réseau indisponible')}"}), 502
+        return 502, {"error": f"Impossible de contacter GitHub : {repo_info.get('message', 'réseau indisponible')}"}
     if status == 401:
-        return jsonify({"error": "Jeton GitHub invalide ou expiré."}), 401
+        return 401, {"error": "Jeton GitHub invalide ou expiré."}
     if status == 404:
-        return jsonify({"error": "Dépôt introuvable (ou le jeton n'y a pas accès)."}), 404
+        return 404, {"error": "Dépôt introuvable (ou le jeton n'y a pas accès)."}
     if status != 200:
-        return jsonify({"error": f"Erreur GitHub inattendue ({status})."}), 502
+        return 502, {"error": f"Erreur GitHub inattendue ({status})."}
 
     if repo_info.get("private") is not True:
-        return jsonify({
+        return 400, {
             "error": "Ce dépôt est PUBLIC. TASHIL refuse d'y transmettre des documents. "
                      "Utilisez un dépôt privé dédié."
-        }), 400
+        }
 
     conn = get_registry_db()
     conn.execute("""
@@ -1012,7 +1016,88 @@ def api_bridge_save_config():
     conn.commit()
     conn.close()
 
-    return jsonify({"ok": True, "private_verified": True})
+    return 200, {"ok": True, "private_verified": True}
+
+
+@app.route("/api/bridge/config", methods=["POST"])
+def api_bridge_save_config():
+    data = request.get_json(force=True)
+    owner = data.get("github_owner", "").strip()
+    repo = data.get("github_repo", "").strip()
+    token = data.get("github_token", "").strip()
+    status, body = _validate_and_save_bridge_config(owner, repo, token)
+    return jsonify(body), status
+
+
+# --------------------------------------------------------------------------- #
+# Provisioning code / QR — lets a SECOND device pick up an ALREADY-VERIFIED
+# bridge configuration without anyone retyping owner/repo/token by hand.
+#
+# ⚠️ This is convenience for TRANSFERRING a real credential between two
+# devices you control in person — it does not change the underlying
+# security model. The code/QR contains the actual token in the clear
+# (base64 is encoding, not encryption); treat a screenshot or photo of it
+# exactly like you'd treat the token itself. It is generated only for an
+# already-unlocked session that already configured the bridge, and is
+# never cached or logged server-side beyond the single response.
+# --------------------------------------------------------------------------- #
+def build_provisioning_code(cfg: dict) -> str:
+    payload = {
+        "github_owner": cfg["github_owner"],
+        "github_repo": cfg["github_repo"],
+        "github_token": cfg["github_token"],
+    }
+    return base64.b64encode(json.dumps(payload).encode("utf-8")).decode("ascii")
+
+
+def parse_provisioning_code(code: str) -> dict:
+    payload = json.loads(base64.b64decode(code.strip().encode("ascii")).decode("utf-8"))
+    if not isinstance(payload, dict) or "github_token" not in payload:
+        raise ValueError("malformed provisioning payload")
+    return payload
+
+
+@app.route("/api/bridge/provisioning-code", methods=["GET"])
+def api_bridge_provisioning_code():
+    if _active_key is None:
+        return locked_response()
+    cfg = get_bridge_config()
+    if not cfg or not cfg["enabled"]:
+        return jsonify({"error": "Le Cloud Bridge n'est pas encore configuré sur cet appareil."}), 400
+    return jsonify({"code": build_provisioning_code(cfg)})
+
+
+@app.route("/api/bridge/provisioning-qr.png", methods=["GET"])
+def api_bridge_provisioning_qr():
+    if _active_key is None:
+        return locked_response()
+    if not _QRCODE_AVAILABLE:
+        abort(501)
+    cfg = get_bridge_config()
+    if not cfg or not cfg["enabled"]:
+        abort(404)
+    img = qrcode.make(build_provisioning_code(cfg))
+    buf = BytesIO()
+    img.save(buf, format="PNG")
+    buf.seek(0)
+    return send_file(buf, mimetype="image/png")
+
+
+@app.route("/api/bridge/import-code", methods=["POST"])
+def api_bridge_import_code():
+    data = request.get_json(force=True)
+    code = data.get("code", "").strip()
+    if not code:
+        return jsonify({"error": "Code de provisioning vide."}), 400
+    try:
+        payload = parse_provisioning_code(code)
+    except Exception:
+        return jsonify({"error": "Code de provisioning invalide ou corrompu."}), 400
+
+    status, body = _validate_and_save_bridge_config(
+        payload.get("github_owner", ""), payload.get("github_repo", ""), payload.get("github_token", "")
+    )
+    return jsonify(body), status
 
 
 @app.route("/api/bridge/disable", methods=["POST"])
@@ -1042,15 +1127,21 @@ def api_bridge_poll():
 
     profile = get_profile_row(_active_key)
     owner, repo, token = cfg["github_owner"], cfg["github_repo"], cfg["github_token"]
-    key = bridge_slug(profile["institution_name"])
 
-    status, listing = _github_request("GET", f"/repos/{owner}/{repo}/contents/bridge/{key}", token)
-    if status == 404:
-        return jsonify({"ok": True, "bridge_enabled": True, "new_messages": 0})
-    if status != 200:
-        return jsonify({"error": f"Erreur GitHub ({status})."}), 502
+    # A sender may have addressed this institution either by its plain name
+    # or by its exact routing ID (institution_key) — check both folders so
+    # neither addressing style silently gets lost. Deduplicated by set()
+    # since the two can occasionally normalize to the same slug.
+    keys_to_check = {bridge_slug(profile["institution_name"]), bridge_slug(profile["institution_key"])}
 
-    json_entries = [f for f in listing if f["name"].endswith(".json")]
+    json_entries = []
+    for key in keys_to_check:
+        status, listing = _github_request("GET", f"/repos/{owner}/{repo}/contents/bridge/{key}", token)
+        if status == 200:
+            json_entries.extend(f for f in listing if f["name"].endswith(".json"))
+        elif status != 404:
+            return jsonify({"error": f"Erreur GitHub ({status})."}), 502
+
     conn = get_profile_db(_active_key)
     paths = profile_paths(_active_key)
     new_count = 0

@@ -1,8 +1,8 @@
 # TASHIL DOCUMENT HUB — WEB EDITION
-## Documentation de traçabilité — v2.4.0
+## Documentation de traçabilité — v2.5.0
 
 **Copyright :** ILINE TECH 2026 BY FERAK ALADDIN
-**Date :** 2026-08-29
+**Date :** 2026-08-30
 
 ---
 
@@ -580,3 +580,120 @@ pas d'accès réseau réel à api.github.com) :**
 client GitHub minimal, configuration et sondage du Cloud Bridge),
 `templates/index.html`, `static/js/app.js`. Aucune fonctionnalité
 antérieure retirée.
+
+---
+
+## 13. v2.5.0 — Provisioning QR (refus explicite du hardcoding) + routage par ID (2026-08-30)
+
+### 13.1 ⚠️ Demande refusée, avec justification concrète
+
+L'utilisateur a demandé d'intégrer directement dans `app.py` / les
+fichiers de configuration un jeton GitHub et des identifiants
+d'authentification **partagés et codés en dur**, pour que le Cloud Bridge
+soit actif "out-of-the-box" sans configuration utilisateur.
+
+**Cette demande a été refusée telle quelle**, et une alternative sûre a
+été proposée puis construite à la place. Raisonnement, explicité
+directement à l'utilisateur :
+- L'application est distribuée sous forme d'exécutable Windows (`.exe`)
+  installé sur les postes de plusieurs établissements de santé distincts.
+  Un jeton codé en dur dans `app.py` se retrouve identique dans **chaque**
+  copie distribuée.
+- Extraction triviale : `strings TASHIL_DOCUMENT.exe | grep ghp_`, ou
+  simple désassemblage du bundle PyInstaller, révèle la chaîne en quelques
+  secondes. PyInstaller n'est pas un coffre-fort de secrets.
+- Rayon d'impact total : un seul exécutable copié, volé, ou partagé lors
+  d'un dépannage à distance suffit à compromettre l'accès en
+  lecture/écriture à **tous** les documents de **tous** les établissements
+  du réseau — l'exact opposé du modèle d'isolation stricte construit en
+  v2.3.0.
+- Un token compromis nécessiterait de le régénérer ET de redistribuer une
+  nouvelle version à chaque poste pour le corriger — aucune révocation
+  ciblée possible avec un secret partagé unique.
+
+Deux alternatives ont été présentées : (A) provisioning par QR/code —
+retenue et construite ci-dessous ; (B) un serveur relais dédié détenant
+le vrai jeton côté serveur uniquement, avec une clé légère par
+installation révocable individuellement — architecture correcte à long
+terme mais projet d'infrastructure plus large (hébergement à choisir),
+non construit cette fois-ci, à reconsidérer si le réseau grandit
+significativement.
+
+### 13.2 Provisioning par code / QR (ce qui a été construit)
+
+Objectif atteint : **aucune saisie manuelle de propriétaire/dépôt/jeton
+GitHub sur les appareils suivants**, sans jamais distribuer le vrai
+secret dans le binaire de l'application.
+
+- Un seul appareil ("premier appareil") effectue la configuration
+  initiale une fois (formulaire manuel, maintenant replié sous
+  "⚙️ Configuration manuelle (avancé)" dans Paramètres).
+- Cet appareil peut ensuite générer un **code de provisioning** (chaîne
+  encodée en base64 contenant owner/repo/token) et son équivalent en
+  **QR code** (`GET /api/bridge/provisioning-qr.png`, réutilise le pipeline
+  qrcode+Pillow déjà éprouvé pour l'accès réseau).
+- Le nouvel appareil scanne ce QR avec **n'importe quel lecteur QR natif**
+  (appareil photo du téléphone, Google Lens, etc. — pas de bibliothèque de
+  décodage JS embarquée dans TASHIL, choix délibéré : évite les problèmes
+  de permissions caméra/HTTPS dans une fenêtre pywebview embarquée, et
+  évite de devoir reproduire à la main un algorithme de décodage QR non
+  testable dans cet environnement de développement), copie le texte
+  révélé, puis le colle dans le champ "Importer un code" — un seul
+  copier-coller, zéro frappe de propriétaire/dépôt/jeton.
+- `POST /api/bridge/import-code` réutilise **exactement** la même
+  fonction de validation (`_validate_and_save_bridge_config`) que la
+  saisie manuelle — la vérification "dépôt privé obligatoire" s'applique
+  donc identiquement, peu importe le chemin d'entrée.
+- Interface simplifiée comme demandé : badge "🟢 Réseau TASHIL Connecté"
+  / "⚪ Non configuré" en premier plan ; le jeton n'est plus jamais
+  affiché après sa saisie initiale (déjà le cas depuis v2.4.0, confirmé
+  inchangé).
+
+**⚠️ Rappel de sécurité affiché directement dans l'interface** : le QR/
+code de provisioning contient le vrai jeton en clair (le base64 encode,
+il ne chiffre pas) — à traiter comme le jeton lui-même. Ne le montrer
+qu'en personne, à l'appareil qu'on provisionne soi-même.
+
+### 13.3 Routage par ID d'établissement
+
+- Chaque profil affiche maintenant son **"ID de routage TASHIL"** dans
+  Paramètres (c'est en fait l'`institution_key` déjà généré en interne
+  depuis v2.3.0 — juste rendu visible pour que les établissements puissent
+  se le communiquer et lever toute ambiguïté de nom).
+- `find_local_profile_by_name` renommé `find_local_profile_by_recipient`
+  et étendu : reconnaît maintenant soit un ID exact, soit un nom
+  d'établissement en texte libre, dans le champ destinataire — la
+  livraison locale (section 12.1) fonctionne donc avec les deux.
+- **Bug réel trouvé et corrigé pendant cette implémentation** : le sondage
+  Cloud Bridge (`api_bridge_poll`) ne vérifiait qu'un seul dossier distant,
+  adressé par le NOM de l'institution. Si un expéditeur adressait son
+  envoi par ID plutôt que par nom, le message aurait été poussé vers un
+  dossier différent que le destinataire n'aurait jamais consulté — perte
+  silencieuse. Corrigé : le sondage vérifie maintenant les deux adresses
+  possibles (nom ET ID) et fusionne les résultats.
+
+### 13.4 Tests effectués
+
+Toujours avec le serveur GitHub Contents API factice (voir section 12.2 —
+pas d'accès réseau réel à `api.github.com` depuis ce bac à sable) :
+- ✅ Génération du code de provisioning + décodage local confirmé
+  (round-trip base64/JSON vérifié octet pour octet)
+- ✅ Génération du QR de provisioning : PNG valide, HTTP 200
+- ✅ **Flux complet réaliste** : Appareil A configure manuellement →
+  génère un code → Appareil B (profil différent, simulant un second
+  poste) importe ce code via `/api/bridge/import-code` **sans jamais
+  fournir owner/repo/token lui-même** → statut confirmé connecté, jeton
+  absent de la réponse
+- ✅ Code de provisioning invalide/corrompu → rejeté proprement (`HTTP
+  400`), pas de crash
+- ✅ Vérification croisée de tous les `getElementById(...)` de `app.js`
+  contre `index.html` — 0 référence orpheline
+- ✅ Non-régression : livraison locale (section 12.1) et vérification
+  anti-dépôt-public (section 12.2) toujours fonctionnelles après ces
+  changements
+
+**Fichiers modifiés :** `app.py` (refactorisation de la validation bridge
+en fonction partagée, nouvelles routes de provisioning, correction du bug
+de sondage à adresse unique, renommage de la fonction de correspondance
+locale), `templates/index.html`, `static/css/style.css`,
+`static/js/app.js`. Aucune fonctionnalité antérieure retirée.

@@ -719,6 +719,7 @@ function renderParametres() {
   document.getElementById("pf-type").textContent = `Type : ${state.profile.institution_type}`;
   document.getElementById("pf-name").textContent = `Nom : ${state.profile.institution_name}`;
   document.getElementById("pf-serial").textContent = state.profile.serial_key;
+  document.getElementById("pf-routing-id").textContent = state.profile.institution_key;
 }
 
 // ------------------------------------------------------------------ //
@@ -783,8 +784,10 @@ async function checkForUpdate() {
 // ------------------------------------------------------------------ //
 function setupCloudBridge() {
   document.getElementById("bridge-save-btn").addEventListener("click", saveBridgeConfig);
+  document.getElementById("bridge-import-btn").addEventListener("click", importBridgeCode);
   document.getElementById("bridge-poll-btn").addEventListener("click", () => pollBridge(true));
   document.getElementById("bridge-disable-btn").addEventListener("click", disableBridge);
+  document.getElementById("bridge-show-qr-btn").addEventListener("click", toggleProvisioningQr);
   refreshBridgeUI();
 }
 
@@ -794,18 +797,33 @@ async function refreshBridgeUI() {
     state.bridgeEnabled = cfg.enabled;
     const configuredView = document.getElementById("bridge-configured-view");
     const setupView = document.getElementById("bridge-setup-view");
+    const connectedBadge = document.getElementById("bridge-connected-badge");
+    const disconnectedBadge = document.getElementById("bridge-disconnected-badge");
 
     if (cfg.configured && cfg.enabled) {
+      connectedBadge.classList.remove("hidden");
+      disconnectedBadge.classList.add("hidden");
       configuredView.classList.remove("hidden");
       setupView.classList.add("hidden");
       document.getElementById("bridge-repo-display").textContent =
         `${cfg.github_owner}/${cfg.github_repo}`;
     } else {
+      connectedBadge.classList.add("hidden");
+      disconnectedBadge.classList.remove("hidden");
       configuredView.classList.add("hidden");
       setupView.classList.remove("hidden");
+      document.getElementById("bridge-qr-reveal").classList.add("hidden");
     }
   } catch (err) {
     // Bridge status is a progressive enhancement — leave the setup form visible
+  }
+}
+
+function toggleProvisioningQr() {
+  const reveal = document.getElementById("bridge-qr-reveal");
+  const nowHidden = reveal.classList.toggle("hidden");
+  if (!nowHidden) {
+    document.getElementById("bridge-qr-img").src = `/api/bridge/provisioning-qr.png?t=${Date.now()}`;
   }
 }
 
@@ -829,10 +847,42 @@ async function saveBridgeConfig() {
     const data = await res.json();
     if (!res.ok) throw new Error(data.error || "Échec de la configuration.");
 
-    statusEl.textContent = "✅ Dépôt privé vérifié — Cloud Bridge activé.";
+    statusEl.textContent = "✅ Dépôt privé vérifié — Réseau TASHIL connecté.";
     statusEl.classList.add("ok");
     document.getElementById("bridge-token").value = "";
-    showToast("🌉 Cloud Bridge activé", "success");
+    showToast("🌉 Réseau TASHIL connecté", "success");
+    await refreshBridgeUI();
+  } catch (err) {
+    statusEl.textContent = `⛔ ${err.message}`;
+    statusEl.classList.add("err");
+  }
+}
+
+async function importBridgeCode() {
+  const statusEl = document.getElementById("bridge-status-line");
+  statusEl.className = "status-line";
+  statusEl.textContent = "Vérification du code...";
+
+  const code = document.getElementById("bridge-import-input").value.trim();
+  if (!code) {
+    statusEl.textContent = "Veuillez coller un code de provisioning.";
+    statusEl.classList.add("err");
+    return;
+  }
+
+  try {
+    const res = await fetch("/api/bridge/import-code", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ code }),
+    });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.error || "Échec de l'import.");
+
+    statusEl.textContent = "✅ Réseau TASHIL connecté.";
+    statusEl.classList.add("ok");
+    document.getElementById("bridge-import-input").value = "";
+    showToast("🌉 Réseau TASHIL connecté", "success");
     await refreshBridgeUI();
   } catch (err) {
     statusEl.textContent = `⛔ ${err.message}`;
@@ -841,12 +891,12 @@ async function saveBridgeConfig() {
 }
 
 async function disableBridge() {
-  if (!confirm("Désactiver le Cloud Bridge ? Les messages en attente distants ne seront plus relevés.")) {
+  if (!confirm("Désactiver le Réseau TASHIL ? Les messages en attente distants ne seront plus relevés.")) {
     return;
   }
   await fetch("/api/bridge/disable", { method: "POST" });
   state.bridgeEnabled = false;
-  showToast("🚫 Cloud Bridge désactivé", "info");
+  showToast("🚫 Réseau TASHIL désactivé", "info");
   await refreshBridgeUI();
 }
 

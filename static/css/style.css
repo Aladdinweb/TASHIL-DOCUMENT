@@ -214,6 +214,20 @@ textarea { resize: vertical; }
 .qr-card .lan-url { display: inline-block; margin: 4px auto 12px; }
 .qr-card .btn { width: auto; display: inline-block; padding: 10px 20px; margin-top: 0; }
 
+.bridge-badge {
+  display: inline-flex; align-items: center; gap: 8px; font-weight: 600;
+  font-size: 14px; margin-bottom: 12px;
+}
+.bridge-dot { width: 10px; height: 10px; border-radius: 50%; display: inline-block; }
+.bridge-dot-on { background: var(--success); box-shadow: 0 0 8px var(--success); }
+.bridge-dot-off { background: var(--text-muted); }
+
+.advanced-details { margin-top: 16px; }
+.advanced-details summary {
+  cursor: pointer; color: var(--text-muted); font-size: 13px; padding: 8px 0;
+}
+.advanced-details summary:hover { color: var(--primary); }
+
 .key-box {
   font-family: monospace; font-weight: 700; color: var(--primary);
   background: var(--input-bg); padding: 10px 14px; border-radius: 8px;
