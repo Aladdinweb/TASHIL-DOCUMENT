@@ -5,5 +5,5 @@ qrcode==7.4.2
 Pillow==10.4.0
 cryptography==43.0.1
 certifi==2024.8.30
-opencv-python-headless==4.10.0.84
+pyzbar==0.1.9
 pyinstaller==6.10.0

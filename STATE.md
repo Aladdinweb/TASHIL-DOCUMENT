@@ -1,8 +1,8 @@
 # TASHIL DOCUMENT HUB — WEB EDITION
-## Documentation de traçabilité — v2.7.0
+## Documentation de traçabilité — v2.7.1
 
 **Copyright :** ILINE TECH 2026 BY FERAK ALADDIN
-**Date :** 2026-08-31
+**Date :** 2026-09-02
 
 ---
 
@@ -977,3 +977,71 @@ ci-dessus), `templates/index.html`, `static/css/style.css`,
 `static/js/app.js`, `requirements.txt` (+ `cryptography`, `certifi`,
 `opencv-python-headless`), `tashil_web.spec` (+ `collect_all` pour ces
 trois nouvelles dépendances). Aucune fonctionnalité antérieure retirée.
+
+---
+
+## 16. v2.7.1 — Correctifs suite à validation réelle sur build Windows (2026-09-02)
+
+Retour utilisateur avec captures d'écran du build v2.7.0 réellement
+installé et testé.
+
+### 16.1 ✅ Correctif SSL confirmé fonctionnel en conditions réelles
+
+Le correctif certifi de la section 15.5 est **confirmé résolu** :
+"Connexion à api.github.com réussie. (7264 ms)" — capture d'écran réelle
+sur le poste de l'utilisateur, chose que cet environnement de
+développement ne pouvait pas prouver lui-même (son propre proxy réseau
+sortant intercepte le TLS). C'est la validation finale qui manquait.
+
+### 16.2 🐛 Décodage d'image QR : échec confirmé en production, remplacé
+
+**Signalé avec capture d'écran** : "⛔ Le décodage d'image QR n'est pas
+disponible sur ce build" — `opencv-python-headless` (section 15.6) a
+échoué à l'import dans l'exécutable réellement construit, malgré des
+tests locaux réussis dans cet environnement de développement à chaque
+étape. Ceci confirme précisément le risque documenté au moment de son
+introduction ("dépendance native la plus volumineuse du projet à ce
+jour... premier suspect en cas de problème").
+
+**Décision : abandon d'OpenCV, remplacé par `pyzbar`.** Plutôt que de
+continuer à deviner quel réglage PyInstaller pourrait réparer
+l'empaquetage d'OpenCV (cycle de test coûteux : chaque tentative exige une
+reconstruction Windows complète par l'utilisateur), remplacement par une
+dépendance native fondamentalement plus simple et plus légère :
+- `pyzbar` encapsule uniquement la bibliothèque C `zbar` — beaucoup moins
+  de surface que le volumineux OpenCV, et son paquet Windows sur PyPI
+  embarque directement la DLL nécessaire (`libzbar-64.dll`), sans
+  installation système séparée requise.
+- Réutilise **Pillow**, déjà confirmé fonctionnel dans ce build exact (la
+  génération du QR de provisioning en dépend déjà avec succès en
+  production) — préférable à l'introduction d'une nouvelle bibliothèque
+  d'image.
+
+**Amélioration de diagnostic ajoutée en parallèle** : l'échec silencieux
+précédent ("non disponible sur ce build", sans aucune indication de la
+cause réelle) est corrigé. Le message d'erreur `ImportError` réel est
+maintenant capturé (`_QR_DECODE_IMPORT_ERROR`) et inclus dans la réponse
+si le décodage échoue à nouveau — testé explicitement : le message
+devient par exemple *"...(détail technique : No module named 'pyzbar')"*
+au lieu d'un message générique. Si `pyzbar` rencontre lui aussi un
+problème d'empaquetage, la cause sera visible immédiatement plutôt que de
+nécessiter un nouveau cycle de capture d'écran et de diagnostic à
+distance.
+
+**⚠️ Limite de test honnête, à nouveau** : `pyzbar` n'a pas pu être
+installé dans cet environnement de développement (pas d'accès PyPI en
+direct) — impossible de garantir à 100% qu'il s'empaquette correctement
+avant un vrai test sur le build Windows réel. La mécanique de la route
+Flask (upload multipart, ouverture d'image PIL, gestion des erreurs) a
+été testée avec un module de substitution local reproduisant l'interface
+de `pyzbar.decode()`, mais pas la bibliothèque réelle elle-même — même
+limite méthodologique que pour OpenCV précédemment, qui s'est avérée
+insuffisante à elle seule pour garantir un empaquetage réussi. **Le test
+le plus important restant : glisser une vraie image QR sur le prochain
+build reconstruit.**
+
+**Fichiers modifiés :** `app.py` (remplacement OpenCV → pyzbar + capture
+du message d'erreur d'import réel), `requirements.txt`
+(`opencv-python-headless` → `pyzbar`), `tashil_web.spec` (collection
+PyInstaller mise à jour en conséquence). Aucune fonctionnalité antérieure
+retirée.

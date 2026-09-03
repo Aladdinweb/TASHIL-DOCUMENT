@@ -32,27 +32,34 @@ crypto_datas, crypto_binaries, crypto_hiddenimports = collect_all('cryptography'
 # PyInstaller can miss the packaged file.
 certifi_datas, certifi_binaries, certifi_hiddenimports = collect_all('certifi')
 
-# opencv-python-headless (QR image decode, v2.7.0) — used only for the
-# "load/drop a QR image" provisioning fallback. ⚠️ This is a genuinely
-# heavy, complex native dependency (much larger and more failure-prone to
-# package than anything else in this project so far) — collect_all() is
-# essential here, not optional, but if the built exe ever fails specifically
-# around QR image decoding, this is the first dependency to suspect.
-cv2_datas, cv2_binaries, cv2_hiddenimports = collect_all('cv2')
+# pyzbar (QR image decode, v2.7.0) — used only for the "load/drop a QR
+# image" provisioning fallback. Replaces an earlier attempt using
+# opencv-python-headless, which imported cleanly in every local test here
+# but FAILED to import in the actual built exe with no visible reason —
+# confirmed by the user in production. pyzbar is a much smaller, simpler
+# native dependency (wraps the zbar C library, ships its DLLs directly in
+# the Windows wheel) — lower packaging risk, and reuses Pillow, which is
+# already proven working in this exact build (provisioning QR generation
+# already depends on it successfully). collect_all() still applies since
+# it wraps a compiled shared library, same reasoning as pywebview above.
+# ⚠️ If QR image decoding fails again after this change, the in-app error
+# message now surfaces the real import failure reason (see
+# _QR_DECODE_IMPORT_ERROR in app.py) instead of a dead-end "not available".
+pyzbar_datas, pyzbar_binaries, pyzbar_hiddenimports = collect_all('pyzbar')
 
 a = Analysis(
     ['desktop_launcher.py'],
     pathex=[],
     binaries=webview_binaries + qrcode_binaries + pil_binaries + crypto_binaries
-             + certifi_binaries + cv2_binaries,
+             + certifi_binaries + pyzbar_binaries,
     datas=[
         ('templates', 'templates'),
         ('static', 'static'),
         ('app.py', '.'),
-    ] + webview_datas + qrcode_datas + pil_datas + crypto_datas + certifi_datas + cv2_datas,
+    ] + webview_datas + qrcode_datas + pil_datas + crypto_datas + certifi_datas + pyzbar_datas,
     hiddenimports=['flask', 'werkzeug', 'jinja2'] + webview_hiddenimports
                   + qrcode_hiddenimports + pil_hiddenimports + crypto_hiddenimports
-                  + certifi_hiddenimports + cv2_hiddenimports,
+                  + certifi_hiddenimports + pyzbar_hiddenimports,
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],

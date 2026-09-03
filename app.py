@@ -70,11 +70,17 @@ except ImportError:
     _CERTIFI_AVAILABLE = False
 
 try:
-    import cv2
-    import numpy as np
-    _CV2_AVAILABLE = True
-except ImportError:
-    _CV2_AVAILABLE = False
+    from pyzbar.pyzbar import decode as _zbar_decode
+    _QR_DECODE_AVAILABLE = True
+    _QR_DECODE_IMPORT_ERROR = None
+except ImportError as _qr_import_exc:
+    _QR_DECODE_AVAILABLE = False
+    # Captured deliberately (unlike a bare False flag) — a previous choice
+    # here (opencv-python-headless) failed to import in a real built exe
+    # with no visible reason beyond "not available on this build". This
+    # ensures that if the replacement ever fails too, the actual cause is
+    # visible instead of another silent dead end.
+    _QR_DECODE_IMPORT_ERROR = str(_qr_import_exc)
 
 # --------------------------------------------------------------------------- #
 # Paths — cross-platform, no admin rights required (works on Windows AND
@@ -93,7 +99,7 @@ _LEGACY_ARCHIVE_ENTRANT = os.path.join(BASE_DIR, "archives", "Courrier_Entrant")
 os.makedirs(PROFILES_DIR, exist_ok=True)
 
 APP_ROOT = os.path.dirname(os.path.abspath(__file__))
-APP_VERSION = "2.7.0"
+APP_VERSION = "2.7.1"
 GITHUB_REPO = "Aladdinweb/TASHIL-ES"  # used by the in-app OTA update checker
 
 app = Flask(__name__,
@@ -1443,36 +1449,45 @@ def api_bridge_decode_qr_image():
     image file itself. Returns just the decoded text; the frontend feeds
     it into the same /api/bridge/import-code flow as a manually pasted
     code, so the exact same private-repo verification applies either way.
+
+    Uses pyzbar + Pillow rather than OpenCV: an earlier version of this
+    endpoint used opencv-python-headless, which imported successfully in
+    every local test but failed to import at all in a real built exe
+    (confirmed by the user — "Le décodage d'image QR n'est pas disponible
+    sur ce build"), with no way to tell why from the generic message
+    alone. Pillow is already a proven-working dependency in this exact
+    build (the provisioning QR generation feature already uses it
+    successfully), and pyzbar is a much smaller, simpler native
+    dependency than OpenCV — lower packaging risk. If this import STILL
+    fails, _QR_DECODE_IMPORT_ERROR captures the real reason instead of
+    another dead-end "not available" message.
     """
-    if not _CV2_AVAILABLE:
-        return jsonify({"error": "Le décodage d'image QR n'est pas disponible sur ce build."}), 501
+    if not _QR_DECODE_AVAILABLE:
+        detail = f" (détail technique : {_QR_DECODE_IMPORT_ERROR})" if _QR_DECODE_IMPORT_ERROR else ""
+        return jsonify({"error": f"Le décodage d'image QR n'est pas disponible sur ce build.{detail}"}), 501
 
     file = request.files.get("image")
     if not file or file.filename == "":
         return jsonify({"error": "Aucune image fournie."}), 400
 
     try:
-        img_bytes = file.read()
-        img_array = np.frombuffer(img_bytes, dtype=np.uint8)
-        cv_img = cv2.imdecode(img_array, cv2.IMREAD_COLOR)
-        if cv_img is None:
-            return jsonify({"error": "Fichier image invalide ou illisible."}), 400
+        from PIL import Image
+        img = Image.open(BytesIO(file.read()))
+        img = img.convert("RGB")
 
-        detector = cv2.QRCodeDetector()
-        decoded_text, points, _ = detector.detectAndDecode(cv_img)
-
-        if not decoded_text:
+        results = _zbar_decode(img)
+        if not results:
             # Real-world images (screenshots, angled phone photos) can be
-            # too small or low-contrast for the detector on the first
-            # pass — a simple upscale often resolves it, confirmed in
-            # testing against a genuinely small source QR image.
-            upscaled = cv2.resize(cv_img, None, fx=2.5, fy=2.5, interpolation=cv2.INTER_CUBIC)
-            decoded_text, points, _ = detector.detectAndDecode(upscaled)
+            # too small or low-contrast for zbar's finder-pattern detection
+            # on the first pass — a simple upscale often resolves it.
+            upscaled = img.resize((img.width * 2, img.height * 2), Image.LANCZOS)
+            results = _zbar_decode(upscaled)
 
-        if not decoded_text:
+        if not results:
             return jsonify({"error": "Aucun QR code détecté dans cette image. "
                                       "Essayez une image plus nette ou de meilleure résolution."}), 400
 
+        decoded_text = results[0].data.decode("utf-8")
         return jsonify({"code": decoded_text})
     except Exception as exc:
         return jsonify({"error": f"Échec du décodage : {exc}"}), 500
