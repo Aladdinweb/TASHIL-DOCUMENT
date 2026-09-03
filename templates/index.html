@@ -262,8 +262,16 @@
           <p class="muted">
             Aucune saisie de nom d'utilisateur, dépôt ou jeton n'est
             nécessaire ici — collez simplement le code fourni par
-            l'appareil déjà connecté au Réseau TASHIL.
+            l'appareil déjà connecté au Réseau TASHIL, ou déposez/chargez
+            directement l'image du QR ci-dessous.
           </p>
+
+          <div class="drop-zone" id="qr-drop-zone">
+            <span id="qr-drop-zone-text">🖼️ Glissez l'image du QR ici, ou cliquez pour choisir un fichier</span>
+            <input type="file" id="qr-file-input" accept="image/*" hidden>
+          </div>
+          <p id="qr-decode-status" class="status-line"></p>
+
           <label>Coller le code de provisioning</label>
           <textarea id="bridge-import-input" rows="3" placeholder="Collez ici le code obtenu par scan QR..."></textarea>
           <button class="btn btn-primary" id="bridge-import-btn">📥 Importer</button>
@@ -275,6 +283,8 @@
               créer la connexion initiale. Les appareils suivants utilisent
               "Importer un code" ci-dessus.
             </p>
+            <button class="btn btn-secondary" id="network-test-btn">🔌 Tester la connexion à GitHub</button>
+            <p id="network-test-status" class="status-line"></p>
             <label>Propriétaire GitHub (utilisateur ou organisation)</label>
             <input id="bridge-owner" type="text" placeholder="ex: Aladdinweb">
             <label>Nom du dépôt privé dédié</label>

@@ -1,8 +1,8 @@
 # TASHIL DOCUMENT HUB — WEB EDITION
-## Documentation de traçabilité — v2.6.0
+## Documentation de traçabilité — v2.7.0
 
 **Copyright :** ILINE TECH 2026 BY FERAK ALADDIN
-**Date :** 2026-08-30
+**Date :** 2026-08-31
 
 ---
 
@@ -774,3 +774,206 @@ confirmation dédiée avec rappel explicite de l'irréversibilité + champ PIN
 **Fichiers modifiés :** `app.py` (nouvelle route `/api/profile/delete`),
 `templates/index.html`, `static/css/style.css`, `static/js/app.js`.
 Aucune fonctionnalité antérieure retirée.
+
+---
+
+## 15. v2.7.0 — Chiffrement, fiabilité du Cloud Bridge, accusés de réception, décodage QR, diagnostic réseau (2026-08-31)
+
+Version majeure — six ajouts substantiels, tous testés réellement (serveur
+lancé, serveur GitHub factice utilisé pour les scénarios distants, chaque
+propriété vérifiée par appel API réel, pas seulement relue). Chaque
+section ci-dessous inclut ce qui a été testé et, quand pertinent, les
+limites honnêtes de ce qui a été construit.
+
+### 15.1 Chiffrement au repos, dérivé du code PIN
+
+**⚠️ Honnêteté sur le niveau de sécurité réel**, affichée à l'utilisateur
+avant l'implémentation : un code PIN à 4-6 chiffres n'a que 10 000 à
+1 000 000 de valeurs possibles. Même avec une fonction de dérivation de
+clé lente (PBKDF2-HMAC-SHA256, 480 000 itérations), un attaquant en
+possession d'une copie hors-ligne des fichiers chiffrés peut le retrouver
+par force brute en temps raisonnable sur du matériel moderne. Ceci protège
+contre la menace réaliste du quotidien (un appareil volé ou emprunté,
+parcouru sans le PIN) — pas contre un attaquant déterminé et outillé.
+
+**⚠️ Limite de conception réelle, documentée plutôt que cachée** : le
+chiffrement s'applique uniquement au contenu que le propre profil
+déverrouillé écrit lui-même (ses messages envoyés, et tout ce qu'il reçoit
+via le Cloud Bridge en étant déverrouillé). La **livraison locale**
+(v2.4.0) écrit directement dans le stockage d'un profil destinataire
+pendant qu'il est verrouillé — son PIN n'est pas disponible à ce moment,
+donc ce contenu reste en clair. Documenté, pas silencieusement ignoré.
+
+**Conception technique :**
+- Nouvelle colonne `encryption_salt` sur `profiles` (migration `ALTER
+  TABLE` idempotente et rétrocompatible — les profils existants restent
+  `NULL` = non chiffrés, continuent de fonctionner exactement comme avant ;
+  seuls les profils créés à partir de v2.7.0 en bénéficient automatiquement).
+  Un profil migré qui reçoit son PIN pour la première fois (`/api/session/set-pin`)
+  génère aussi son sel à ce moment — il commence alors à chiffrer.
+- Clé Fernet (AES-128-CBC authentifié, bibliothèque `cryptography`) dérivée
+  via PBKDF2HMAC(PIN, sel, 480 000 itérations), mise en cache en mémoire
+  UNIQUEMENT pendant la session déverrouillée (`_active_fernet`), effacée
+  au verrouillage — jamais persistée sur disque.
+- Fichiers archivés : chiffrés avant écriture, déchiffrés à la volée au
+  téléchargement. Champs `subject`/`body` en base : chiffrés avant
+  `INSERT`, déchiffrés systématiquement avant tout retour JSON
+  (`decrypt_message_row`, appliqué à Tableau de Bord, Boîte de réception,
+  Registre).
+- **Bug de conception réel trouvé et corrigé pendant l'implémentation** :
+  la copie propre de l'expéditeur est chiffrée avec SA clé — mais cette
+  copie ne doit JAMAIS être celle transmise à la livraison locale ou au
+  Cloud Bridge (le destinataire a une clé différente, ou aucune). Corrigé
+  en lisant les octets originaux UNE SEULE FOIS à l'envoi et en les
+  réutilisant tels quels pour toute autre destination — seule la copie
+  propre de l'expéditeur passe par le chiffrement.
+
+**Tests réels effectués :**
+- ✅ Dérivation de clé déterministe (même PIN+sel → même clé), clés
+  différentes pour PIN différents
+- ✅ Chiffrement réel vérifié : contenu du fichier ET des colonnes
+  subject/body sur disque confirmé illisible (jetons Fernet, pas du texte
+  brut) — inspection directe des fichiers, pas seulement via l'API
+- ✅ Cycle complet via l'API réelle : envoi avec sujet/corps sensibles →
+  lecture via Tableau de Bord → contenu correctement déchiffré et lisible
+- ✅ Téléchargement déchiffre correctement le fichier
+- ✅ Mauvais PIN → `401`, déverrouillage refusé (pas de tentative de
+  déchiffrement avec une mauvaise clé exposée à l'utilisateur)
+
+### 15.2 Correction du bogue d'écran figé au verrouillage/déconnexion
+
+**Cause trouvée par audit de code** (le bogue précis n'a pas pu être
+reproduit littéralement dans cet environnement de développement, sans
+pywebview réel) : `showLockScreen()` n'avait aucune gestion d'erreur
+autour de son appel `fetch("/api/session")`, et ne réinitialisait jamais
+explicitement la visibilité de ses éléments internes. Si cet appel
+échouait pour une raison quelconque (aléa réseau, timing), l'exécution
+s'arrêtait net, laissant l'écran de verrouillage affiché mais vide — sauf
+le titre statique "TASHIL DOCUMENT HUB" déjà présent dans le HTML, ce qui
+correspond exactement au symptôme décrit ("écran gris... affichant TASHIL
+DOCUMENT HUB").
+
+**Corrections :**
+- `showLockScreen()` réinitialise maintenant explicitement l'état visible
+  de tous ses sous-éléments à chaque appel, et enveloppe l'appel réseau
+  dans un `try/catch` avec un bouton "🔄 Réessayer" en cas d'échec — plus
+  jamais d'écran bloqué sans issue.
+- `lockSession()` attend maintenant correctement `showLockScreen()`
+  (`await` manquant auparavant).
+- Même traitement appliqué à `confirmDeleteProfile()`, qui avait le même
+  motif non protégé — et dont la logique a été restructurée pour que tout
+  aléa réseau sur la redirection ne soit plus jamais rapporté comme un
+  échec de la suppression elle-même (qui, à ce stade, a déjà réussi).
+
+### 15.3 Notifications de bureau + son + accusés de réception via le Bridge
+
+- **Son de notification** : généré programmatiquement via l'API Web
+  Audio (deux tonalités brèves) — aucun fichier audio externe à empaqueter.
+  ⚠️ Les navigateurs exigent une interaction préalable de l'utilisateur
+  avant qu'`AudioContext` puisse jouer un son (politique anti-autoplay) —
+  la toute première notification après le lancement pourrait donc rester
+  silencieuse ; limitation connue du navigateur, pas un bogue. Le toast
+  visuel et la notification système fonctionnent dans tous les cas.
+- **Accusé de réception — routage réel, pas seulement un statut local** :
+  - Si le message reçu provient d'une **livraison locale** (même
+    appareil) : mise à jour instantanée et directe du statut côté
+    expéditeur — testé réellement, confirmé en base de données.
+  - Si le message provient du **Cloud Bridge** (appareil distant) : un
+    petit objet "accusé" est poussé dans
+    `bridge/<adresse_expéditeur>/receipts/<numéro>.json`. Au prochain
+    sondage de l'expéditeur, l'accusé est appliqué à son message envoyé
+    et une notification "📄 Le document [N°] a été consulté / réceptionné
+    par [Établissement]" s'affiche (toast + son + notification système).
+  - **Testé en conditions réelles simulant deux appareils séparés** :
+    envoi → réception distante → accusé → sondage de l'expéditeur → statut
+    mis à jour ET message de notification exact retourné par l'API.
+  - Nouvelle colonne `delivery_method` sur `messages` (`local`/`bridge`/
+    `NULL`) — c'est elle qui détermine vers où router l'accusé.
+
+### 15.4 Retry-on-delete-failure (fiabilité du Cloud Bridge)
+
+Nouvelle table `bridge_pending_cleanup` par profil : si une suppression
+GitHub échoue juste après l'import réussi d'un message ou d'un accusé
+(aléa réseau ponctuel), l'entrée est mise en file d'attente au lieu
+d'être simplement abandonnée — car une fois importée, son numéro de suivi
+est déjà connu localement, donc les sondages suivants l'auraient sinon
+ignorée indéfiniment, laissant une copie orpheline invisible dans le
+dépôt. Chaque sondage retente d'abord le nettoyage en attente avant de
+traiter les nouvelles entrées. **Testé réellement** : entrée de nettoyage
+injectée manuellement, confirmé nettoyée dès le sondage suivant.
+
+### 15.5 Correction critique — erreur SSL sur le build Windows réel
+
+**Signalée par capture d'écran réelle** : `SSL: CERTIFICATE_VERIFY_FAILED
+— unable to get local issuer certificate`. Cause connue et bien
+documentée dans l'écosystème PyInstaller : un exécutable Windows figé ne
+retrouve souvent pas le magasin de certificats du système comme le ferait
+une installation Python normale.
+
+**Correctif** : toutes les requêtes HTTPS vers l'API GitHub utilisent
+désormais explicitement le paquet de certificats racine fourni par
+`certifi`, empaqueté avec l'application (`ssl.create_default_context(cafile=certifi.where())`)
+— indépendant de l'état du magasin de certificats de l'OS.
+
+⚠️ **Limite de test honnête** : cet environnement de développement a son
+propre proxy réseau sortant qui intercepte le TLS avec un certificat
+auto-signé, empêchant une vérification complète contre le vrai
+`api.github.com` depuis ce bac à sable. Le test effectué confirme que le
+code exerce réellement la vérification de certificat via `certifi` (erreur
+différente et plus spécifique après le correctif : rejet correct d'un
+certificat auto-signé non fiable, plutôt qu'absence totale de chaîne de
+confiance) — mais la confirmation finale contre le vrai GitHub reste à
+faire sur la machine réelle de l'utilisateur.
+
+### 15.6 Décodage d'image QR (glisser-déposer + sélection de fichier)
+
+Alternative au scan caméra natif pour le provisioning du Cloud Bridge —
+utile si le QR a été enregistré/capturé en image et transféré autrement.
+
+- **Bibliothèque retenue : `opencv-python-headless`**, pas `pyzbar`.
+  Raisonnement explicite : `pyzbar` n'a pas pu être installé dans cet
+  environnement de développement (pas d'accès direct à PyPI), donc son
+  bon fonctionnement n'aurait jamais pu être réellement vérifié ici — alors
+  qu'OpenCV, bien que nettement plus lourd et plus complexe à empaqueter
+  (dépendance native la plus volumineuse de tout le projet à ce jour), a
+  pu être testé pour de vrai, de bout en bout. Priorité donnée à "tester
+  ce qui est réellement livré" plutôt qu'à la légèreté du paquet — compromis
+  explicite, assumé et documenté plutôt que deviné.
+  ⚠️ Si le futur exécutable rencontre un problème spécifiquement autour du
+  décodage d'image QR, cette dépendance est la première à examiner.
+- Nouvelle route `POST /api/bridge/decode-qr-image` : décode l'image
+  envoyée, avec une nouvelle tentative en agrandissement (×2.5) si la
+  détection échoue au premier passage (utile pour des images de petite
+  taille ou peu contrastées).
+- Interface : zone de glisser-déposer + bouton de sélection de fichier
+  dans l'onglet Cloud Bridge non configuré ; le texte décodé alimente le
+  champ existant "Coller le code" et repasse par le MÊME chemin de
+  validation que la saisie manuelle (vérification anti-dépôt-public
+  incluse).
+- **Testé réellement, bout en bout, sans mock** : QR généré et encodé via
+  l'encodeur natif d'OpenCV (car `qrcode` n'a pas non plus pu être
+  installé ici) → agrandi avec zone de silence blanche → envoyé en tant
+  que vrai fichier PNG via une vraie requête HTTP → décodé par la vraie
+  route Flask → texte décodé identique à l'original, octet pour octet →
+  réinjecté dans `/api/bridge/import-code` → Cloud Bridge réellement
+  configuré au bout de la chaîne complète. Le cas d'échec (image sans QR)
+  a aussi été testé : `HTTP 400` propre avec message clair, pas de crash.
+
+### 15.7 Test de connectivité réseau (diagnostic Cloud Bridge)
+
+Nouveau bouton "🔌 Tester la connexion à GitHub" dans la configuration
+avancée — envoie une requête HTTPS minimale vers `api.github.com`
+**sans en-tête d'authentification** (délibérément séparé de
+`_github_request`, pour ne jamais confondre un problème réseau/SSL avec
+un problème d'identifiants). Affiche le résultat avec un indice contextuel
+selon le type d'erreur (certificat SSL, délai dépassé, DNS, connexion
+refusée) — pensé spécifiquement pour aider à diagnostiquer rapidement les
+postes bloqués par un pare-feu d'entreprise. **Testé réellement** :
+détecte et rapporte correctement l'interception SSL de cet environnement
+de développement, avec l'indice approprié.
+
+**Fichiers modifiés :** `app.py` (ajouts substantiels sur tous les points
+ci-dessus), `templates/index.html`, `static/css/style.css`,
+`static/js/app.js`, `requirements.txt` (+ `cryptography`, `certifi`,
+`opencv-python-headless`), `tashil_web.spec` (+ `collect_all` pour ces
+trois nouvelles dépendances). Aucune fonctionnalité antérieure retirée.

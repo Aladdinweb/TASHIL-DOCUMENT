@@ -181,15 +181,32 @@ async function showLockScreen() {
   document.getElementById("onboarding-overlay").classList.add("hidden");
   document.getElementById("lock-overlay").classList.remove("hidden");
   document.getElementById("lock-pin-step").classList.add("hidden");
+  // Explicitly reset to defaults every time — a previous call may have
+  // left these hidden mid-PIN-entry (selectProfileForUnlock hides them).
+  // Without this reset, a fresh call from a different entry point (e.g.
+  // after deleting a profile) could land on a stuck, mostly-blank screen.
+  document.getElementById("lock-profile-list").classList.remove("hidden");
+  document.getElementById("lock-add-profile-btn").classList.remove("hidden");
 
-  const session = await fetch("/api/session").then(r => r.json());
-  state.session = session;
-  renderProfileList(session.profiles);
-
-  document.getElementById("lock-add-profile-btn").onclick = () => {
-    document.getElementById("lock-overlay").classList.add("hidden");
-    showOnboarding({ allowCancel: session.profiles.length > 0 });
-  };
+  try {
+    const session = await fetch("/api/session").then(r => r.json());
+    state.session = session;
+    renderProfileList(session.profiles);
+    document.getElementById("lock-add-profile-btn").onclick = () => {
+      document.getElementById("lock-overlay").classList.add("hidden");
+      showOnboarding({ allowCancel: session.profiles.length > 0 });
+    };
+  } catch (err) {
+    // Never leave the screen stuck blank with no way forward — this is
+    // exactly the failure mode that previously showed as a frozen gray
+    // screen with just the static "TASHIL DOCUMENT HUB" title visible.
+    document.getElementById("lock-profile-list").innerHTML = `
+      <p class="empty-state">
+        ⛔ Impossible de charger la liste des établissements.<br>
+        <button class="btn btn-secondary" id="lock-retry-btn" style="margin-top:10px;">🔄 Réessayer</button>
+      </p>`;
+    document.getElementById("lock-retry-btn").addEventListener("click", showLockScreen);
+  }
 }
 
 function renderProfileList(profiles) {
@@ -364,7 +381,7 @@ async function lockSession() {
   }
   state.profile = null;
   document.getElementById("app").classList.add("hidden");
-  showLockScreen();
+  await showLockScreen();
 }
 
 // ------------------------------------------------------------------ //
@@ -401,6 +418,35 @@ function showSystemNotification(title, body) {
   }
 }
 
+// Generates a short two-tone chime with the Web Audio API — no external
+// audio file needed (nothing to bundle/package, works identically on
+// every platform). Browsers require a prior user interaction before
+// AudioContext can play sound (autoplay policy) — by the time a
+// background poll fires the user has normally already clicked something,
+// but the very first notification after launch could be silently blocked
+// by that policy; this is a known, unavoidable browser constraint, not a
+// bug — the toast/visual notification still fires regardless.
+function playNotificationSound() {
+  try {
+    const ctx = new (window.AudioContext || window.webkitAudioContext)();
+    const now = ctx.currentTime;
+    [880, 1320].forEach((freq, i) => {
+      const osc = ctx.createOscillator();
+      const gain = ctx.createGain();
+      osc.type = "sine";
+      osc.frequency.value = freq;
+      gain.gain.setValueAtTime(0, now + i * 0.12);
+      gain.gain.linearRampToValueAtTime(0.2, now + i * 0.12 + 0.02);
+      gain.gain.linearRampToValueAtTime(0, now + i * 0.12 + 0.18);
+      osc.connect(gain).connect(ctx.destination);
+      osc.start(now + i * 0.12);
+      osc.stop(now + i * 0.12 + 0.2);
+    });
+  } catch (err) {
+    // Web Audio unsupported in this context — toast/notification still fire
+  }
+}
+
 // ------------------------------------------------------------------ //
 // Background polling — surfaces new received messages as notifications
 // without requiring the user to be on the Messagerie tab.
@@ -416,6 +462,7 @@ function startBackgroundPolling() {
         state.lastKnownReceived = data.total_received;
         showToast(`📥 ${diff} nouveau(x) message(s) reçu(s)`, "success");
         showSystemNotification("TASHIL DOCUMENT HUB", `${diff} nouveau(x) message(s) reçu(s)`);
+        playNotificationSound();
         if (state.currentView === "dashboard") loadDashboard();
         if (state.currentView === "messagerie") loadInbox();
       }
@@ -789,7 +836,69 @@ function setupCloudBridge() {
   document.getElementById("bridge-poll-btn").addEventListener("click", () => pollBridge(true));
   document.getElementById("bridge-disable-btn").addEventListener("click", disableBridge);
   document.getElementById("bridge-show-qr-btn").addEventListener("click", toggleProvisioningQr);
+  document.getElementById("network-test-btn").addEventListener("click", runNetworkTest);
+  setupQrImageInput();
   refreshBridgeUI();
+}
+
+function setupQrImageInput() {
+  const dropZone = document.getElementById("qr-drop-zone");
+  const fileInput = document.getElementById("qr-file-input");
+
+  dropZone.addEventListener("click", () => fileInput.click());
+  fileInput.addEventListener("change", () => {
+    if (fileInput.files.length) decodeQrImageFile(fileInput.files[0]);
+  });
+  dropZone.addEventListener("dragover", e => { e.preventDefault(); dropZone.classList.add("dragover"); });
+  dropZone.addEventListener("dragleave", () => dropZone.classList.remove("dragover"));
+  dropZone.addEventListener("drop", e => {
+    e.preventDefault();
+    dropZone.classList.remove("dragover");
+    if (e.dataTransfer.files.length) decodeQrImageFile(e.dataTransfer.files[0]);
+  });
+}
+
+async function decodeQrImageFile(file) {
+  const statusEl = document.getElementById("qr-decode-status");
+  statusEl.className = "status-line";
+  statusEl.textContent = "Décodage de l'image...";
+
+  const formData = new FormData();
+  formData.append("image", file);
+
+  try {
+    const res = await fetch("/api/bridge/decode-qr-image", { method: "POST", body: formData });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.error || "Échec du décodage.");
+
+    document.getElementById("bridge-import-input").value = data.code;
+    statusEl.textContent = "✅ QR décodé — vérifiez puis cliquez sur Importer.";
+    statusEl.classList.add("ok");
+  } catch (err) {
+    statusEl.textContent = `⛔ ${err.message}`;
+    statusEl.classList.add("err");
+  }
+}
+
+async function runNetworkTest() {
+  const statusEl = document.getElementById("network-test-status");
+  statusEl.className = "status-line";
+  statusEl.textContent = "Test en cours...";
+
+  try {
+    const res = await fetch("/api/bridge/network-test");
+    const data = await res.json();
+    if (data.ok) {
+      statusEl.textContent = `✅ ${data.message} (${data.elapsed_ms} ms)`;
+      statusEl.classList.add("ok");
+    } else {
+      statusEl.textContent = `⛔ ${data.message}${data.hint ? " — " + data.hint : ""}`;
+      statusEl.classList.add("err");
+    }
+  } catch (err) {
+    statusEl.textContent = "⛔ Impossible de lancer le test.";
+    statusEl.classList.add("err");
+  }
 }
 
 async function refreshBridgeUI() {
@@ -914,10 +1023,22 @@ async function pollBridge(manual) {
       showToast(`📥 ${data.new_messages} message(s) reçu(s) via le Cloud Bridge`, "success");
       showSystemNotification("TASHIL DOCUMENT HUB",
         `${data.new_messages} nouveau(x) message(s) distant(s) reçu(s)`);
+      playNotificationSound();
       if (state.currentView === "dashboard") loadDashboard();
       if (state.currentView === "messagerie") loadInbox();
     } else if (manual) {
       showToast("✅ Aucun nouveau message distant.", "info");
+    }
+
+    if (data.receipts && data.receipts.length > 0) {
+      data.receipts.forEach(receipt => {
+        const message = `📄 Le document ${receipt.tracking_number} a été consulté / réceptionné par ${receipt.acknowledged_by}`;
+        showToast(message, "success");
+        showSystemNotification("TASHIL DOCUMENT HUB", message);
+        playNotificationSound();
+      });
+      if (state.currentView === "dashboard") loadDashboard();
+      if (state.currentView === "messagerie") loadInbox();
     }
   } catch (err) {
     if (manual) showToast("⛔ Impossible de contacter le Cloud Bridge.", "error");
@@ -969,39 +1090,46 @@ async function confirmDeleteProfile() {
     return;
   }
 
+  let deleteData;
   try {
     const res = await fetch("/api/profile/delete", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ pin }),
     });
-    const data = await res.json();
-    if (!res.ok) throw new Error(data.error || "Échec de la suppression.");
+    deleteData = await res.json();
+    if (!res.ok) throw new Error(deleteData.error || "Échec de la suppression.");
+  } catch (err) {
+    errorEl.textContent = err.message;
+    errorEl.classList.remove("hidden");
+    return;
+  }
 
-    closeDeleteProfileModal();
-    if (data.warning) {
-      showToast(`⚠️ ${data.warning}`, "error");
-    } else {
-      showToast("🗑️ Profil supprimé définitivement", "success");
-    }
+  // The delete itself has now genuinely succeeded — anything below this
+  // point is just redirect bookkeeping and must never be reported back
+  // as a deletion failure if it hiccups.
+  closeDeleteProfileModal();
+  if (deleteData.warning) {
+    showToast(`⚠️ ${deleteData.warning}`, "error");
+  } else {
+    showToast("🗑️ Profil supprimé définitivement", "success");
+  }
 
-    // The profile is gone and the session is already locked server-side —
-    // send the user back to the profile picker (or onboarding if that was
-    // the last profile on this device).
-    state.profile = null;
-    document.getElementById("app").classList.add("hidden");
+  state.profile = null;
+  document.getElementById("app").classList.add("hidden");
 
+  try {
     const session = await fetch("/api/session").then(r => r.json());
     state.session = session;
     if (session.first_launch) {
       showOnboarding({ allowCancel: false });
-    } else {
-      showLockScreen();
+      return;
     }
   } catch (err) {
-    errorEl.textContent = err.message;
-    errorEl.classList.remove("hidden");
+    // Fall through to showLockScreen() below regardless — it has its own
+    // retry-capable error handling rather than leaving the user stuck.
   }
+  await showLockScreen();
 }
 
 // ------------------------------------------------------------------ //

@@ -55,6 +55,27 @@ try:
 except ImportError:
     _QRCODE_AVAILABLE = False
 
+try:
+    from cryptography.fernet import Fernet, InvalidToken
+    from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
+    from cryptography.hazmat.primitives import hashes as _crypto_hashes
+    _CRYPTO_AVAILABLE = True
+except ImportError:
+    _CRYPTO_AVAILABLE = False
+
+try:
+    import certifi
+    _CERTIFI_AVAILABLE = True
+except ImportError:
+    _CERTIFI_AVAILABLE = False
+
+try:
+    import cv2
+    import numpy as np
+    _CV2_AVAILABLE = True
+except ImportError:
+    _CV2_AVAILABLE = False
+
 # --------------------------------------------------------------------------- #
 # Paths — cross-platform, no admin rights required (works on Windows AND
 # Termux/Android identically, unlike the old C:\TASHIL\... hardcoded paths).
@@ -72,7 +93,7 @@ _LEGACY_ARCHIVE_ENTRANT = os.path.join(BASE_DIR, "archives", "Courrier_Entrant")
 os.makedirs(PROFILES_DIR, exist_ok=True)
 
 APP_ROOT = os.path.dirname(os.path.abspath(__file__))
-APP_VERSION = "2.6.0"
+APP_VERSION = "2.7.0"
 GITHUB_REPO = "Aladdinweb/TASHIL-ES"  # used by the in-app OTA update checker
 
 app = Flask(__name__,
@@ -195,6 +216,15 @@ def init_registry_db():
             updated_at TEXT
         )
     """)
+    # Schema migration for pre-v2.7.0 databases: CREATE TABLE IF NOT EXISTS
+    # above won't add a new column to an already-existing table, so this
+    # runs an explicit, idempotent, backward-compatible ALTER. Existing
+    # profiles get encryption_salt = NULL, which the app treats as "legacy,
+    # unencrypted" — they keep working exactly as before, in plaintext.
+    # Only profiles created from this version onward opt into encryption.
+    existing_cols = [r[1] for r in conn.execute("PRAGMA table_info(profiles)").fetchall()]
+    if "encryption_salt" not in existing_cols:
+        conn.execute("ALTER TABLE profiles ADD COLUMN encryption_salt TEXT")
     conn.commit()
     conn.close()
 
@@ -283,6 +313,22 @@ def get_profile_db(institution_key: str):
             created_at TEXT NOT NULL
         )
     """)
+    # Idempotent migration: tracks HOW a message reached this database
+    # ('local', 'bridge', or NULL for anything predating this column) —
+    # needed so accusé-de-réception can route a receipt back to the right
+    # place (see api_update_message_status).
+    existing_cols = [r[1] for r in conn.execute("PRAGMA table_info(messages)").fetchall()]
+    if "delivery_method" not in existing_cols:
+        conn.execute("ALTER TABLE messages ADD COLUMN delivery_method TEXT")
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS bridge_pending_cleanup (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            repo_path TEXT NOT NULL,
+            sha TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        )
+    """)
+    conn.commit()
     return conn
 
 
@@ -352,9 +398,19 @@ def _github_request(method: str, url_or_path: str, token: str, json_body: dict =
     path (starting with '/') or a full URL (as returned in listing
     responses' 'url' field) — both are used by the polling logic below.
     Returns (status_code, parsed_json_or_empty_dict).
+
+    Explicitly uses certifi's CA bundle for SSL verification rather than
+    relying on urllib's default context. This is a real, known issue with
+    PyInstaller-frozen Windows executables: the frozen exe often can't
+    locate the OS certificate store the way a normal Python installation
+    does, producing "SSL: CERTIFICATE_VERIFY_FAILED — unable to get local
+    issuer certificate" even when the network connection itself is fine.
+    Bundling and pointing at certifi's own cacert.pem sidesteps that
+    entirely — confirmed as the cause via a real error report.
     """
     import urllib.request
     import urllib.error
+    import ssl
 
     url = url_or_path if url_or_path.startswith("http") else f"{GITHUB_API_BASE}{url_or_path}"
     headers = {
@@ -365,8 +421,11 @@ def _github_request(method: str, url_or_path: str, token: str, json_body: dict =
     }
     body = json.dumps(json_body).encode("utf-8") if json_body is not None else None
     req = urllib.request.Request(url, data=body, headers=headers, method=method)
+
+    ssl_context = ssl.create_default_context(cafile=certifi.where()) if _CERTIFI_AVAILABLE else None
+
     try:
-        with urllib.request.urlopen(req, timeout=15) as resp:
+        with urllib.request.urlopen(req, timeout=15, context=ssl_context) as resp:
             raw = resp.read()
             return resp.status, (json.loads(raw.decode("utf-8")) if raw else {})
     except urllib.error.HTTPError as e:
@@ -400,7 +459,7 @@ def bridge_slug(institution_name: str) -> str:
 
 
 def push_to_bridge(cfg: dict, recipient_name: str, sender_name: str, subject: str,
-                    body: str, tracking: str, file_path: str, original_filename: str) -> bool:
+                    body: str, tracking: str, file_bytes: bytes, original_filename: str) -> bool:
     owner, repo, token = cfg["github_owner"], cfg["github_repo"], cfg["github_token"]
     key = bridge_slug(recipient_name)
 
@@ -419,11 +478,12 @@ def push_to_bridge(cfg: dict, recipient_name: str, sender_name: str, subject: st
         "created_at": datetime.now().isoformat(),
     }
 
-    try:
-        with open(file_path, "rb") as f:
-            file_b64 = base64.b64encode(f.read()).decode("utf-8")
-    except OSError:
-        return False
+    # file_bytes are the ORIGINAL plaintext (see api_send_message) — never
+    # the sender's own encrypted archive copy, which only the sender's key
+    # could ever open. The Cloud Bridge itself provides no encryption of
+    # its own (see the module-level security note above); the recipient
+    # applies its own encryption independently when it later imports this.
+    file_b64 = base64.b64encode(file_bytes).decode("utf-8")
 
     meta_b64 = base64.b64encode(
         json.dumps(meta, ensure_ascii=False, indent=2).encode("utf-8")
@@ -523,6 +583,7 @@ migrate_legacy_single_tenant_if_needed()
 # Active session — single in-memory value (see concurrency note at top).
 # --------------------------------------------------------------------------- #
 _active_key = None
+_active_fernet = None  # Fernet instance derived from the active profile's PIN, or None
 
 
 def require_active_profile():
@@ -535,6 +596,99 @@ def require_active_profile():
 def locked_response():
     return jsonify({"error": "Session verrouillée. Veuillez entrer votre code PIN.",
                      "locked": True}), 423
+
+
+# --------------------------------------------------------------------------- #
+# Encryption at rest (v2.7.0) — keyed to the profile's own PIN.
+#
+# ⚠️ Honesty note, stated plainly (also shown to the user in Paramètres):
+# a 4-6 digit PIN has only 10,000–1,000,000 possible values. Even with a
+# deliberately slow key-derivation function, this is brute-forceable
+# offline by anyone who obtains the encrypted files directly, given
+# enough time. This protects against the realistic everyday threat —
+# a stolen or borrowed device being casually browsed without the PIN —
+# not against a determined, resourced attacker with the encrypted blob
+# and time to spend on it.
+#
+# ⚠️ Scope limitation, also stated plainly: encryption only applies to
+# content THIS profile's own unlocked session writes — its own sent
+# messages, and anything it receives via the Cloud Bridge while unlocked.
+# Same-device LOCAL delivery (v2.4.0) writes directly into a recipient
+# profile's storage while that profile is locked — we don't have their
+# PIN at that moment, so that content is written in plaintext. This is a
+# real, currently-unavoidable gap given the local-delivery design, not an
+# oversight; see api_send_message for where this is handled.
+#
+# Only profiles created from v2.7.0 onward (encryption_salt is not NULL)
+# participate at all — existing profiles keep working exactly as before.
+# --------------------------------------------------------------------------- #
+def generate_encryption_salt() -> str:
+    return base64.b64encode(os.urandom(16)).decode("ascii")
+
+
+def derive_fernet(pin: str, salt_b64: str):
+    if not _CRYPTO_AVAILABLE:
+        return None
+    salt = base64.b64decode(salt_b64)
+    kdf = PBKDF2HMAC(algorithm=_crypto_hashes.SHA256(), length=32, salt=salt, iterations=480000)
+    derived = kdf.derive(pin.encode("utf-8"))
+    return Fernet(base64.urlsafe_b64encode(derived))
+
+
+def set_active_session(institution_key: str, pin: str, profile_row: dict = None):
+    """Activates a profile's session AND derives/caches its encryption key
+    (if it has one) in the same place, so the two can never drift apart."""
+    global _active_key, _active_fernet
+    _active_key = institution_key
+    row = profile_row or get_profile_row(institution_key)
+    if row and row.get("encryption_salt"):
+        _active_fernet = derive_fernet(pin, row["encryption_salt"])
+    else:
+        _active_fernet = None
+
+
+def clear_active_session():
+    global _active_key, _active_fernet
+    _active_key = None
+    _active_fernet = None
+
+
+def encrypt_text(value: str) -> str:
+    if _active_fernet is None or not value:
+        return value
+    return _active_fernet.encrypt(value.encode("utf-8")).decode("ascii")
+
+
+def decrypt_text(value: str) -> str:
+    if _active_fernet is None or not value:
+        return value
+    try:
+        return _active_fernet.decrypt(value.encode("ascii")).decode("utf-8")
+    except (InvalidToken, ValueError, Exception):
+        return value  # legacy plaintext row, or content this key can't open — degrade, don't crash
+
+
+def encrypt_file_bytes(data: bytes) -> bytes:
+    if _active_fernet is None:
+        return data
+    return _active_fernet.encrypt(data)
+
+
+def decrypt_file_bytes(data: bytes) -> bytes:
+    if _active_fernet is None:
+        return data
+    try:
+        return _active_fernet.decrypt(data)
+    except (InvalidToken, ValueError):
+        return data
+
+
+def decrypt_message_row(row: dict) -> dict:
+    """Applied to every message dict before it's ever sent to the frontend."""
+    row = dict(row)
+    row["subject"] = decrypt_text(row.get("subject") or "")
+    row["body"] = decrypt_text(row.get("body") or "")
+    return row
 
 
 # --------------------------------------------------------------------------- #
@@ -636,15 +790,21 @@ def api_session_set_pin():
     if row["pin_hash"] is not None:
         return jsonify({"error": "Un code PIN existe déjà pour ce profil."}), 400
 
+    # A profile getting its first-ever PIN (migrated legacy profile) also
+    # opts into encryption at rest from this point forward — old plaintext
+    # rows/files stay readable (decrypt_text/decrypt_file_bytes fall back
+    # gracefully when content isn't actually encrypted), new ones get
+    # encrypted going forward.
+    salt = generate_encryption_salt()
     conn = get_registry_db()
-    conn.execute("UPDATE profiles SET pin_hash = ? WHERE institution_key = ?",
-                 (generate_password_hash(pin), key))
+    conn.execute("UPDATE profiles SET pin_hash = ?, encryption_salt = ? WHERE institution_key = ?",
+                 (generate_password_hash(pin), salt, key))
     conn.commit()
     conn.close()
 
-    global _active_key
-    _active_key = key
-    return jsonify({"ok": True, "profile": profile_public_dict(get_profile_row(key))})
+    updated_row = get_profile_row(key)
+    set_active_session(key, pin, updated_row)
+    return jsonify({"ok": True, "profile": profile_public_dict(updated_row)})
 
 
 @app.route("/api/session/unlock", methods=["POST"])
@@ -661,8 +821,7 @@ def api_session_unlock():
     if not check_password_hash(row["pin_hash"], pin):
         return jsonify({"error": "Code PIN incorrect."}), 401
 
-    global _active_key
-    _active_key = key
+    set_active_session(key, pin, row)
     return jsonify({"ok": True, "profile": profile_public_dict(row)})
 
 
@@ -671,8 +830,7 @@ def api_session_lock():
     """Locks the workspace (the 'logout' action) WITHOUT deleting any data —
     switching institutions must never show a previous institution's
     archives, but it also must never destroy them."""
-    global _active_key
-    _active_key = None
+    clear_active_session()
     return jsonify({"ok": True})
 
 
@@ -695,7 +853,7 @@ def api_delete_profile():
 
     profile = get_profile_row(_active_key)
     if profile is None:
-        _active_key = None
+        clear_active_session()
         return jsonify({"error": "Profil introuvable."}), 404
     if profile["pin_hash"] is None or not check_password_hash(profile["pin_hash"], pin):
         return jsonify({"error": "Code PIN incorrect."}), 401
@@ -705,7 +863,7 @@ def api_delete_profile():
 
     # Lock immediately — no further access to this profile from this point
     # on, regardless of whether file cleanup below fully succeeds.
-    _active_key = None
+    clear_active_session()
 
     conn = get_registry_db()
     conn.execute("DELETE FROM profiles WHERE institution_key = ?", (key_to_delete,))
@@ -752,24 +910,25 @@ def api_save_profile():
 
     key = make_institution_key(wilaya_code, institution_type, institution_name)
     serial_key = generate_serial_key(wilaya_code, institution_type, institution_name)
+    salt = generate_encryption_salt()
 
     conn = get_registry_db()
     conn.execute("""
         INSERT INTO profiles (institution_key, wilaya_code, wilaya_name,
                                institution_type, institution_name, serial_key,
-                               pin_hash, theme, created_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, 'dark', ?)
+                               pin_hash, theme, encryption_salt, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, 'dark', ?, ?)
     """, (key, wilaya_code, wilaya_name, institution_type, institution_name,
-          serial_key, generate_password_hash(pin), datetime.now().isoformat()))
+          serial_key, generate_password_hash(pin), salt, datetime.now().isoformat()))
     conn.commit()
     conn.close()
 
     # Ensure the isolated storage folder exists immediately
     get_profile_db(key).close()
 
-    global _active_key
-    _active_key = key
-    return jsonify({"ok": True, "profile": profile_public_dict(get_profile_row(key))})
+    updated_row = get_profile_row(key)
+    set_active_session(key, pin, updated_row)
+    return jsonify({"ok": True, "profile": profile_public_dict(updated_row)})
 
 
 @app.route("/api/profile/theme", methods=["POST"])
@@ -804,7 +963,7 @@ def api_dashboard():
         "total_sent": sent,
         "total_received": received,
         "pending": pending,
-        "recent": [dict(r) for r in recent],
+        "recent": [decrypt_message_row(r) for r in recent],
     })
 
 
@@ -822,7 +981,7 @@ def api_list_messages():
         (direction,)
     ).fetchall()
     conn.close()
-    return jsonify({"messages": [dict(r) for r in rows]})
+    return jsonify({"messages": [decrypt_message_row(r) for r in rows]})
 
 
 @app.route("/api/messages/send", methods=["POST"])
@@ -844,22 +1003,30 @@ def api_send_message():
     sender = profile["institution_name"] if profile else "TASHIL"
     paths = profile_paths(_active_key)
 
+    # Read the original plaintext bytes ONCE. Only the SENDER's own
+    # archived copy gets encrypted below, with the sender's own key — any
+    # copy handed to a different security domain (local delivery, Cloud
+    # Bridge) must use these original bytes, never the sender's encrypted
+    # file, which a recipient has no way to decrypt (different key/PIN).
+    original_bytes = file.read()
+
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     tag = sanitize(sender).replace(" ", "")[:30]
     safe_name = sanitize(secure_filename(file.filename) or "document")
     archived_name = f"{ts}_{tag}_{safe_name}"
     archived_path = os.path.join(paths["sortant"], archived_name)
-    file.save(archived_path)
+    with open(archived_path, "wb") as f:
+        f.write(encrypt_file_bytes(original_bytes))
 
     conn = get_profile_db(_active_key)
     tracking = next_tracking_number(conn, "sortant", _active_key)
     conn.execute("""
         INSERT INTO messages (direction, tracking_number, sender_institution,
                                recipient_institution, subject, body, file_path,
-                               file_original_name, status, created_at)
-        VALUES ('sortant', ?, ?, ?, ?, ?, ?, ?, 'envoye', ?)
-    """, (tracking, sender, recipient, subject, body, archived_path,
-          file.filename, datetime.now().isoformat()))
+                               file_original_name, status, delivery_method, created_at)
+        VALUES ('sortant', ?, ?, ?, ?, ?, ?, ?, 'envoye', NULL, ?)
+    """, (tracking, sender, recipient, encrypt_text(subject), encrypt_text(body),
+          archived_path, file.filename, datetime.now().isoformat()))
     conn.commit()
     conn.close()
 
@@ -877,7 +1044,14 @@ def api_send_message():
             recipient_key = recipient_profile["institution_key"]
             recipient_paths = profile_paths(recipient_key)
             recipient_archived_path = os.path.join(recipient_paths["entrant"], archived_name)
-            shutil.copy2(archived_path, recipient_archived_path)
+            # Plaintext, deliberately — see the encryption scope limitation
+            # documented above set_active_session(): we don't have the
+            # recipient's PIN/key at this point (they're locked), so we
+            # cannot encrypt on their behalf. This writes the ORIGINAL
+            # bytes, never the sender's encrypted copy (which only the
+            # sender's own key could ever open).
+            with open(recipient_archived_path, "wb") as f:
+                f.write(original_bytes)
 
             recipient_conn = get_profile_db(recipient_key)
             recipient_tracking = tracking
@@ -885,8 +1059,8 @@ def api_send_message():
                 recipient_conn.execute("""
                     INSERT INTO messages (direction, tracking_number, sender_institution,
                                            recipient_institution, subject, body, file_path,
-                                           file_original_name, status, created_at)
-                    VALUES ('entrant', ?, ?, ?, ?, ?, ?, ?, 'envoye', ?)
+                                           file_original_name, status, delivery_method, created_at)
+                    VALUES ('entrant', ?, ?, ?, ?, ?, ?, ?, 'envoye', 'local', ?)
                 """, (recipient_tracking, sender, recipient, subject, body,
                       recipient_archived_path, file.filename, datetime.now().isoformat()))
             except sqlite3.IntegrityError:
@@ -896,8 +1070,8 @@ def api_send_message():
                 recipient_conn.execute("""
                     INSERT INTO messages (direction, tracking_number, sender_institution,
                                            recipient_institution, subject, body, file_path,
-                                           file_original_name, status, created_at)
-                    VALUES ('entrant', ?, ?, ?, ?, ?, ?, ?, 'envoye', ?)
+                                           file_original_name, status, delivery_method, created_at)
+                    VALUES ('entrant', ?, ?, ?, ?, ?, ?, ?, 'envoye', 'local', ?)
                 """, (recipient_tracking, sender, recipient, subject, body,
                       recipient_archived_path, file.filename, datetime.now().isoformat()))
             recipient_conn.commit()
@@ -923,10 +1097,18 @@ def api_send_message():
             try:
                 delivered_via_bridge = push_to_bridge(
                     bridge_cfg, recipient, sender, subject, body,
-                    tracking, archived_path, file.filename
+                    tracking, original_bytes, file.filename
                 )
             except Exception:
                 delivered_via_bridge = False
+
+    delivery_method = "local" if delivered_locally else ("bridge" if delivered_via_bridge else None)
+    if delivery_method:
+        method_conn = get_profile_db(_active_key)
+        method_conn.execute("UPDATE messages SET delivery_method = ? WHERE tracking_number = ?",
+                             (delivery_method, tracking))
+        method_conn.commit()
+        method_conn.close()
 
     return jsonify({
         "ok": True,
@@ -947,7 +1129,18 @@ def api_download_message(message_id):
     conn.close()
     if row is None or not row["file_path"] or not os.path.exists(row["file_path"]):
         abort(404)
-    return send_file(row["file_path"], as_attachment=True,
+
+    # decrypt_file_bytes is safe to call unconditionally: files written by
+    # local delivery (a different security domain — see api_send_message)
+    # are genuinely plaintext, and Fernet.decrypt() on non-Fernet bytes
+    # raises InvalidToken, which decrypt_file_bytes catches and returns
+    # the original bytes unchanged. The ciphertext format itself is the
+    # only "is this encrypted" flag needed — no separate per-file marker.
+    with open(row["file_path"], "rb") as f:
+        raw = f.read()
+    plaintext = decrypt_file_bytes(raw)
+
+    return send_file(BytesIO(plaintext), as_attachment=True,
                       download_name=row["file_original_name"] or "document")
 
 
@@ -970,7 +1163,66 @@ def api_update_message_status(message_id):
     conn.commit()
     updated = conn.execute("SELECT * FROM messages WHERE id = ?", (message_id,)).fetchone()
     conn.close()
-    return jsonify({"ok": True, "message": dict(updated)})
+
+    # Read-receipt routing: only for entrant messages being acknowledged.
+    if status == "accuse" and row["direction"] == "entrant":
+        route_read_receipt(row)
+
+    return jsonify({"ok": True, "message": decrypt_message_row(updated)})
+
+
+def route_read_receipt(message_row):
+    """
+    Notifies the ORIGINAL SENDER that their document was acknowledged —
+    instantly if they're a profile on this same device (delivery_method
+    == 'local'), or via a small receipt object pushed through the Cloud
+    Bridge otherwise. Never raises: a receipt that can't be delivered
+    isn't worth failing the accusé action itself over — the requester's
+    own local status update already succeeded regardless.
+    """
+    tracking = message_row["tracking_number"]
+    sender_name = message_row["sender_institution"] or ""
+    delivery_method = message_row["delivery_method"] if "delivery_method" in message_row.keys() else None
+
+    try:
+        if delivery_method == "local":
+            sender_profile = find_local_profile_by_recipient(sender_name, exclude_key=_active_key)
+            if sender_profile is not None:
+                sender_conn = get_profile_db(sender_profile["institution_key"])
+                sender_conn.execute(
+                    "UPDATE messages SET status = 'accuse' WHERE tracking_number = ? AND direction = 'sortant'",
+                    (tracking,)
+                )
+                sender_conn.commit()
+                sender_conn.close()
+        elif delivery_method == "bridge":
+            cfg = get_bridge_config()
+            if cfg and cfg["enabled"]:
+                acknowledger = get_profile_row(_active_key)
+                acknowledger_name = acknowledger["institution_name"] if acknowledger else "?"
+                push_receipt_to_bridge(cfg, sender_name, tracking, acknowledger_name)
+    except Exception:
+        pass  # see docstring — a failed receipt never blocks the accusé itself
+
+
+def push_receipt_to_bridge(cfg: dict, sender_name: str, tracking: str, acknowledger_name: str) -> bool:
+    owner, repo, token = cfg["github_owner"], cfg["github_repo"], cfg["github_token"]
+    key = bridge_slug(sender_name)
+    receipt_path = f"bridge/{key}/receipts/{tracking}.json"
+    payload = {
+        "type": "receipt",
+        "tracking_number": tracking,
+        "acknowledged_by": acknowledger_name,
+        "acknowledged_at": datetime.now().isoformat(),
+    }
+    payload_b64 = base64.b64encode(
+        json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    ).decode("utf-8")
+    status, _ = _github_request(
+        "PUT", f"/repos/{owner}/{repo}/contents/{receipt_path}", token,
+        {"message": f"TASHIL bridge: receipt for {tracking}", "content": payload_b64}
+    )
+    return status in (200, 201)
 
 
 @app.route("/api/messages/<int:message_id>", methods=["DELETE"])
@@ -1014,12 +1266,57 @@ def api_registre():
             (direction,)
         ).fetchall()
     conn.close()
-    return jsonify({"entries": [dict(r) for r in rows]})
+    return jsonify({"entries": [decrypt_message_row(r) for r in rows]})
 
 
 # --------------------------------------------------------------------------- #
 # API — Cloud Bridge configuration & manual poll
 # --------------------------------------------------------------------------- #
+@app.route("/api/bridge/network-test", methods=["GET"])
+def api_bridge_network_test():
+    """
+    Diagnostic-only, no token/repo needed: checks whether THIS machine can
+    reach api.github.com over HTTPS at all — separates "GitHub itself is
+    unreachable / blocked by a firewall or proxy" from "the repo/token
+    configuration is wrong", which otherwise look identical from the
+    config form's point of view. Deliberately sends NO Authorization
+    header (unlike _github_request) — this checks pure network/SSL
+    reachability, not credentials.
+    """
+    import time
+    import urllib.request
+    import urllib.error
+    import ssl
+
+    ssl_context = ssl.create_default_context(cafile=certifi.where()) if _CERTIFI_AVAILABLE else None
+    req = urllib.request.Request(
+        "https://api.github.com/zen",
+        headers={"User-Agent": "TASHIL-DOCUMENT-HUB", "Accept": "application/vnd.github+json"},
+    )
+
+    start = time.monotonic()
+    try:
+        with urllib.request.urlopen(req, timeout=10, context=ssl_context) as resp:
+            elapsed_ms = int((time.monotonic() - start) * 1000)
+            return jsonify({"ok": True, "elapsed_ms": elapsed_ms,
+                             "message": "Connexion à api.github.com réussie."})
+    except Exception as exc:
+        elapsed_ms = int((time.monotonic() - start) * 1000)
+        error_message = str(exc)
+        hint = ""
+        if "CERTIFICATE_VERIFY_FAILED" in error_message:
+            hint = ("Problème de certificat SSL — souvent causé par un antivirus/pare-feu "
+                    "qui inspecte le trafic HTTPS, ou un proxy d'entreprise.")
+        elif "timed out" in error_message.lower():
+            hint = "Délai dépassé — le pare-feu bloque probablement la connexion sortante."
+        elif "Name or service not known" in error_message or "getaddrinfo failed" in error_message:
+            hint = "Résolution DNS échouée — vérifiez la connexion Internet de cette machine."
+        elif "Connection refused" in error_message:
+            hint = "Connexion refusée — un pare-feu local ou réseau bloque probablement le port 443."
+
+        return jsonify({"ok": False, "elapsed_ms": elapsed_ms, "message": error_message, "hint": hint})
+
+
 @app.route("/api/bridge/config", methods=["GET"])
 def api_bridge_get_config():
     cfg = get_bridge_config()
@@ -1137,6 +1434,50 @@ def api_bridge_provisioning_qr():
     return send_file(buf, mimetype="image/png")
 
 
+@app.route("/api/bridge/decode-qr-image", methods=["POST"])
+def api_bridge_decode_qr_image():
+    """
+    Decodes a QR code from an uploaded image file (drag-and-drop or file
+    picker) — for someone who can't use a phone camera or copy/paste text
+    directly, e.g. they saved/screenshotted the QR and transferred the
+    image file itself. Returns just the decoded text; the frontend feeds
+    it into the same /api/bridge/import-code flow as a manually pasted
+    code, so the exact same private-repo verification applies either way.
+    """
+    if not _CV2_AVAILABLE:
+        return jsonify({"error": "Le décodage d'image QR n'est pas disponible sur ce build."}), 501
+
+    file = request.files.get("image")
+    if not file or file.filename == "":
+        return jsonify({"error": "Aucune image fournie."}), 400
+
+    try:
+        img_bytes = file.read()
+        img_array = np.frombuffer(img_bytes, dtype=np.uint8)
+        cv_img = cv2.imdecode(img_array, cv2.IMREAD_COLOR)
+        if cv_img is None:
+            return jsonify({"error": "Fichier image invalide ou illisible."}), 400
+
+        detector = cv2.QRCodeDetector()
+        decoded_text, points, _ = detector.detectAndDecode(cv_img)
+
+        if not decoded_text:
+            # Real-world images (screenshots, angled phone photos) can be
+            # too small or low-contrast for the detector on the first
+            # pass — a simple upscale often resolves it, confirmed in
+            # testing against a genuinely small source QR image.
+            upscaled = cv2.resize(cv_img, None, fx=2.5, fy=2.5, interpolation=cv2.INTER_CUBIC)
+            decoded_text, points, _ = detector.detectAndDecode(upscaled)
+
+        if not decoded_text:
+            return jsonify({"error": "Aucun QR code détecté dans cette image. "
+                                      "Essayez une image plus nette ou de meilleure résolution."}), 400
+
+        return jsonify({"code": decoded_text})
+    except Exception as exc:
+        return jsonify({"error": f"Échec du décodage : {exc}"}), 500
+
+
 @app.route("/api/bridge/import-code", methods=["POST"])
 def api_bridge_import_code():
     data = request.get_json(force=True)
@@ -1163,24 +1504,65 @@ def api_bridge_disable():
     return jsonify({"ok": True})
 
 
+# --------------------------------------------------------------------------- #
+# Retry-on-delete-failure (v2.7.0): if a GitHub DELETE call fails right
+# after a message/receipt was successfully imported (rare transient
+# network issue), the entry is queued in bridge_pending_cleanup instead
+# of silently left behind — because once imported, its tracking_number is
+# already known locally, so future polls would otherwise skip re-checking
+# it entirely, and the stray copy would linger in the repo unnoticed.
+# --------------------------------------------------------------------------- #
+def _queue_bridge_cleanup(conn, url_or_path: str, sha: str):
+    conn.execute(
+        "INSERT INTO bridge_pending_cleanup (repo_path, sha, created_at) VALUES (?, ?, ?)",
+        (url_or_path, sha, datetime.now().isoformat())
+    )
+    conn.commit()
+
+
+def _delete_bridge_entry_or_queue(conn, owner: str, repo: str, token: str, url_or_path: str, sha: str):
+    status, _ = _github_request("DELETE", url_or_path, token,
+                                 {"message": "TASHIL bridge: consumed", "sha": sha})
+    if status not in (200, 204):
+        _queue_bridge_cleanup(conn, url_or_path, sha)
+
+
+def _retry_pending_bridge_cleanup(conn, owner: str, repo: str, token: str):
+    pending = conn.execute("SELECT * FROM bridge_pending_cleanup").fetchall()
+    for row in pending:
+        status, _ = _github_request("DELETE", row["repo_path"], token,
+                                     {"message": "TASHIL bridge: retried cleanup", "sha": row["sha"]})
+        if status in (200, 204):
+            conn.execute("DELETE FROM bridge_pending_cleanup WHERE id = ?", (row["id"],))
+    conn.commit()
+
+
 @app.route("/api/bridge/poll", methods=["POST"])
 def api_bridge_poll():
     """
-    Checks the Cloud Bridge repo for new messages addressed to the
-    CURRENTLY ACTIVE profile, downloads and inserts any found into that
-    profile's own isolated database + archive, then removes the consumed
-    entries from the bridge repo. Safe to call repeatedly — already-seen
-    tracking numbers are skipped.
+    Checks the Cloud Bridge repo for new messages AND read-receipts
+    addressed to the CURRENTLY ACTIVE profile. Downloads/imports anything
+    found into that profile's own isolated database + archive, applies
+    any receipts to the matching sent items, then removes consumed
+    entries from the bridge repo — retrying any cleanup that failed on a
+    previous poll first. Safe to call repeatedly — already-seen tracking
+    numbers are skipped.
     """
     if _active_key is None:
         return locked_response()
 
     cfg = get_bridge_config()
     if not cfg or not cfg["enabled"]:
-        return jsonify({"ok": True, "bridge_enabled": False, "new_messages": 0})
+        return jsonify({"ok": True, "bridge_enabled": False, "new_messages": 0, "receipts": []})
 
     profile = get_profile_row(_active_key)
     owner, repo, token = cfg["github_owner"], cfg["github_repo"], cfg["github_token"]
+    conn = get_profile_db(_active_key)
+    paths = profile_paths(_active_key)
+
+    # Retry any deletions that failed on a previous poll BEFORE processing
+    # new entries (see queue_bridge_cleanup / feature note above).
+    _retry_pending_bridge_cleanup(conn, owner, repo, token)
 
     # A sender may have addressed this institution either by its plain name
     # or by its exact routing ID (institution_key) — check both folders so
@@ -1189,17 +1571,25 @@ def api_bridge_poll():
     keys_to_check = {bridge_slug(profile["institution_name"]), bridge_slug(profile["institution_key"])}
 
     json_entries = []
+    receipt_entries = []
     for key in keys_to_check:
         status, listing = _github_request("GET", f"/repos/{owner}/{repo}/contents/bridge/{key}", token)
         if status == 200:
             json_entries.extend(f for f in listing if f["name"].endswith(".json"))
         elif status != 404:
+            conn.close()
             return jsonify({"error": f"Erreur GitHub ({status})."}), 502
 
-    conn = get_profile_db(_active_key)
-    paths = profile_paths(_active_key)
-    new_count = 0
+        r_status, r_listing = _github_request(
+            "GET", f"/repos/{owner}/{repo}/contents/bridge/{key}/receipts", token
+        )
+        if r_status == 200:
+            receipt_entries.extend(f for f in r_listing if f["name"].endswith(".json"))
+        elif r_status != 404:
+            conn.close()
+            return jsonify({"error": f"Erreur GitHub ({r_status})."}), 502
 
+    new_count = 0
     for entry in json_entries:
         meta_status, meta_content = _github_request("GET", entry["url"], token)
         if meta_status != 200 or "content" not in meta_content:
@@ -1213,6 +1603,8 @@ def api_bridge_poll():
             "SELECT 1 FROM messages WHERE tracking_number = ?", (meta["tracking_number"],)
         ).fetchone()
         if already_have:
+            # Already imported on a previous poll — if cleanup failed that
+            # time, _retry_pending_bridge_cleanup above already handles it.
             continue
 
         attach_status, attach_content = _github_request(
@@ -1227,34 +1619,74 @@ def api_bridge_poll():
         safe_name = sanitize(meta.get("file_original_name", "document"))
         local_path = os.path.join(paths["entrant"], f"{ts}_{tag}_{safe_name}")
         try:
+            # Encrypts with THIS profile's own active key, if it has
+            # encryption enabled — safe no-op otherwise. We're the
+            # recipient and unlocked right now, so (unlike local
+            # delivery) applying our own encryption here is correct.
             with open(local_path, "wb") as f:
-                f.write(file_bytes)
+                f.write(encrypt_file_bytes(file_bytes))
         except OSError:
             continue
 
         conn.execute("""
             INSERT INTO messages (direction, tracking_number, sender_institution,
                                    recipient_institution, subject, body, file_path,
-                                   file_original_name, status, created_at)
-            VALUES ('entrant', ?, ?, ?, ?, ?, ?, ?, 'envoye', ?)
+                                   file_original_name, status, delivery_method, created_at)
+            VALUES ('entrant', ?, ?, ?, ?, ?, ?, ?, 'envoye', 'bridge', ?)
         """, (meta["tracking_number"], meta.get("sender_institution", "?"),
               meta.get("recipient_institution", profile["institution_name"]),
-              meta.get("subject", ""), meta.get("body", ""), local_path,
-              meta.get("file_original_name", "document"),
+              encrypt_text(meta.get("subject", "")), encrypt_text(meta.get("body", "")),
+              local_path, meta.get("file_original_name", "document"),
               meta.get("created_at", datetime.now().isoformat())))
         conn.commit()
         new_count += 1
 
-        # Clean up consumed entries so the bridge queue doesn't grow forever
-        _github_request("DELETE", entry["url"], token,
-                         {"message": f"TASHIL bridge: consumed {meta['tracking_number']}",
-                          "sha": entry["sha"]})
-        _github_request("DELETE", f"/repos/{owner}/{repo}/contents/{meta['attachment_path_in_repo']}", token,
-                         {"message": f"TASHIL bridge: consumed attachment {meta['tracking_number']}",
-                          "sha": attach_content["sha"]})
+        # Clean up consumed entries so the bridge queue doesn't grow
+        # forever — queue for retry instead of silently dropping if the
+        # delete itself fails (see _retry_pending_bridge_cleanup).
+        _delete_bridge_entry_or_queue(conn, owner, repo, token, entry["url"], entry["sha"])
+        _delete_bridge_entry_or_queue(
+            conn, owner, repo, token,
+            f"/repos/{owner}/{repo}/contents/{meta['attachment_path_in_repo']}",
+            attach_content["sha"]
+        )
+
+    receipts_applied = []
+    for entry in receipt_entries:
+        r_status, r_content = _github_request("GET", entry["url"], token)
+        if r_status != 200 or "content" not in r_content:
+            continue
+        try:
+            receipt = json.loads(base64.b64decode(r_content["content"]).decode("utf-8"))
+        except (ValueError, KeyError):
+            continue
+
+        tracking = receipt.get("tracking_number")
+        if tracking:
+            sent_row = conn.execute(
+                "SELECT * FROM messages WHERE tracking_number = ? AND direction = 'sortant'", (tracking,)
+            ).fetchone()
+            if sent_row is not None and sent_row["status"] != "accuse":
+                conn.execute(
+                    "UPDATE messages SET status = 'accuse' WHERE tracking_number = ? AND direction = 'sortant'",
+                    (tracking,)
+                )
+                conn.commit()
+                receipts_applied.append({
+                    "tracking_number": tracking,
+                    "acknowledged_by": receipt.get("acknowledged_by", "?"),
+                })
+
+        # Consume the receipt regardless, so it never sits in the queue forever.
+        _delete_bridge_entry_or_queue(conn, owner, repo, token, entry["url"], entry["sha"])
 
     conn.close()
-    return jsonify({"ok": True, "bridge_enabled": True, "new_messages": new_count})
+    return jsonify({
+        "ok": True,
+        "bridge_enabled": True,
+        "new_messages": new_count,
+        "receipts": receipts_applied,
+    })
 
 
 if __name__ == "__main__":
