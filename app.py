@@ -12,6 +12,14 @@ institution profiles side by side, each with its own isolated database
 and archive folders, unlocked by a per-profile PIN. See the "Session /
 multi-tenant" section below.
 
+v2.8.1 — SQLite concurrency hardening: every connection now runs in WAL
+(Write-Ahead Logging) mode with a 5-second busy_timeout, and every DB
+access goes through a context manager that guarantees commit()/close()
+even on error — see "SQLite connection handling" below. This fixes
+"database is locked" errors observed on the desktop build, caused by the
+background Cloud Bridge polling thread and a foreground send both
+touching SQLite at once.
+
 ⚠️ Security honesty note: the PIN is a lock-screen deterrent against
 casual/physical snooping on a shared device (hashed with werkzeug's
 salted hash, never stored in plaintext) — it is NOT full-disk or
@@ -43,6 +51,7 @@ import base64
 import uuid
 from io import BytesIO
 from datetime import datetime
+from contextlib import contextmanager
 
 from flask import (Flask, request, jsonify, send_from_directory,
                     send_file, render_template, abort)
@@ -99,7 +108,7 @@ _LEGACY_ARCHIVE_ENTRANT = os.path.join(BASE_DIR, "archives", "Courrier_Entrant")
 os.makedirs(PROFILES_DIR, exist_ok=True)
 
 APP_ROOT = os.path.dirname(os.path.abspath(__file__))
-APP_VERSION = "2.8.0"
+APP_VERSION = "2.8.1"
 GITHUB_REPO = "Aladdinweb/TASHIL-ES"  # used by the in-app OTA update checker
 
 app = Flask(__name__,
@@ -222,51 +231,90 @@ def get_onboarding_institutions(wilaya_code: int, institution_type: str):
 
 
 # --------------------------------------------------------------------------- #
-# Registry DB — the master list of institution profiles on this device.
-# Lives OUTSIDE any profile folder, at ~/TASHIL_DATA/registry.db.
+# SQLite connection handling (v2.8.1)
+#
+# Every single connection opened anywhere in this file — registry or
+# per-profile — goes through _open_sqlite_connection(), which:
+#   1. Sets a 5-second sqlite3 connect timeout AND `PRAGMA busy_timeout
+#      = 5000` — if a writer already holds the database, a second
+#      connection now waits up to 5s for it to finish instead of
+#      raising "database is locked" immediately.
+#   2. Enables `PRAGMA journal_mode=WAL` — Write-Ahead Logging lets
+#      readers and a single writer work concurrently instead of
+#      exclusive-locking the whole file for every write. This is a
+#      database-level setting (persisted in the file itself), so
+#      re-issuing it on every connection is a cheap no-op after the
+#      first time, not a repeated migration.
+#
+# registry_db() / profile_db(key) are context managers built on top of
+# this: `with registry_db() as conn:` guarantees conn.commit() runs on
+# success and conn.close() runs unconditionally (success OR exception),
+# so a slow request, a network call, or a bug inside the `with` block
+# can never leave a connection open and holding a lock. Pass
+# commit=False for read-only blocks where a commit would be a no-op
+# anyway (harmless either way, but explicit is clearer).
 # --------------------------------------------------------------------------- #
-def get_registry_db():
-    conn = sqlite3.connect(REGISTRY_DB_PATH)
+def _open_sqlite_connection(db_path: str) -> sqlite3.Connection:
+    conn = sqlite3.connect(db_path, timeout=5)
     conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL;")
+    conn.execute("PRAGMA busy_timeout=5000;")
     return conn
 
 
-def init_registry_db():
+def get_registry_db() -> sqlite3.Connection:
+    """Raw connection factory. Prefer the registry_db() context manager
+    below in route/business-logic code — this is kept for the handful of
+    call sites (init, migration) that need to manage their own lifecycle."""
+    return _open_sqlite_connection(REGISTRY_DB_PATH)
+
+
+@contextmanager
+def registry_db(commit: bool = True):
     conn = get_registry_db()
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS profiles (
-            institution_key TEXT PRIMARY KEY,
-            wilaya_code INTEGER NOT NULL,
-            wilaya_name TEXT NOT NULL,
-            institution_type TEXT NOT NULL,
-            institution_name TEXT NOT NULL,
-            serial_key TEXT NOT NULL,
-            pin_hash TEXT,
-            theme TEXT DEFAULT 'dark',
-            created_at TEXT NOT NULL
-        )
-    """)
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS bridge_config (
-            id INTEGER PRIMARY KEY CHECK (id = 1),
-            github_owner TEXT,
-            github_repo TEXT,
-            github_token TEXT,
-            enabled INTEGER DEFAULT 0,
-            updated_at TEXT
-        )
-    """)
-    # Schema migration for pre-v2.7.0 databases: CREATE TABLE IF NOT EXISTS
-    # above won't add a new column to an already-existing table, so this
-    # runs an explicit, idempotent, backward-compatible ALTER. Existing
-    # profiles get encryption_salt = NULL, which the app treats as "legacy,
-    # unencrypted" — they keep working exactly as before, in plaintext.
-    # Only profiles created from this version onward opt into encryption.
-    existing_cols = [r[1] for r in conn.execute("PRAGMA table_info(profiles)").fetchall()]
-    if "encryption_salt" not in existing_cols:
-        conn.execute("ALTER TABLE profiles ADD COLUMN encryption_salt TEXT")
-    conn.commit()
-    conn.close()
+    try:
+        yield conn
+        if commit:
+            conn.commit()
+    finally:
+        conn.close()
+
+
+def init_registry_db():
+    with registry_db() as conn:
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS profiles (
+                institution_key TEXT PRIMARY KEY,
+                wilaya_code INTEGER NOT NULL,
+                wilaya_name TEXT NOT NULL,
+                institution_type TEXT NOT NULL,
+                institution_name TEXT NOT NULL,
+                serial_key TEXT NOT NULL,
+                pin_hash TEXT,
+                theme TEXT DEFAULT 'dark',
+                created_at TEXT NOT NULL
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS bridge_config (
+                id INTEGER PRIMARY KEY CHECK (id = 1),
+                github_owner TEXT,
+                github_repo TEXT,
+                github_token TEXT,
+                enabled INTEGER DEFAULT 0,
+                updated_at TEXT
+            )
+        """)
+        # Schema migration for pre-v2.7.0 databases: CREATE TABLE IF NOT
+        # EXISTS above won't add a new column to an already-existing
+        # table, so this runs an explicit, idempotent, backward-compatible
+        # ALTER. Existing profiles get encryption_salt = NULL, which the
+        # app treats as "legacy, unencrypted" — they keep working exactly
+        # as before, in plaintext. Only profiles created from this version
+        # onward opt into encryption.
+        existing_cols = [r[1] for r in conn.execute("PRAGMA table_info(profiles)").fetchall()]
+        if "encryption_salt" not in existing_cols:
+            conn.execute("ALTER TABLE profiles ADD COLUMN encryption_salt TEXT")
 
 
 init_registry_db()
@@ -282,13 +330,12 @@ def make_institution_key(wilaya_code: int, institution_type: str, institution_na
     slug = re.sub(r'[^A-Za-z0-9]+', '_', institution_name.strip().upper()).strip('_')
     base_key = f"{wilaya_code:02d}_{type_code}_{slug}"[:80]
 
-    conn = get_registry_db()
-    key = base_key
-    suffix = 2
-    while conn.execute("SELECT 1 FROM profiles WHERE institution_key = ?", (key,)).fetchone():
-        key = f"{base_key}_{suffix}"
-        suffix += 1
-    conn.close()
+    with registry_db(commit=False) as conn:
+        key = base_key
+        suffix = 2
+        while conn.execute("SELECT 1 FROM profiles WHERE institution_key = ?", (key,)).fetchone():
+            key = f"{base_key}_{suffix}"
+            suffix += 1
     return key
 
 
@@ -304,16 +351,16 @@ def generate_serial_key(wilaya_code, institution_type, institution_name) -> str:
 
 
 def list_profiles():
-    conn = get_registry_db()
-    rows = conn.execute("SELECT * FROM profiles ORDER BY institution_name").fetchall()
-    conn.close()
+    with registry_db(commit=False) as conn:
+        rows = conn.execute("SELECT * FROM profiles ORDER BY institution_name").fetchall()
     return [dict(r) for r in rows]
 
 
 def get_profile_row(institution_key: str):
-    conn = get_registry_db()
-    row = conn.execute("SELECT * FROM profiles WHERE institution_key = ?", (institution_key,)).fetchone()
-    conn.close()
+    with registry_db(commit=False) as conn:
+        row = conn.execute(
+            "SELECT * FROM profiles WHERE institution_key = ?", (institution_key,)
+        ).fetchone()
     return dict(row) if row else None
 
 
@@ -332,12 +379,14 @@ def profile_paths(institution_key: str):
     }
 
 
-def get_profile_db(institution_key: str):
+def get_profile_db(institution_key: str) -> sqlite3.Connection:
+    """Raw connection factory for a profile's isolated database — ensures
+    folders + schema exist, applies WAL/busy_timeout. Prefer the
+    profile_db(key) context manager below in route/business-logic code."""
     paths = profile_paths(institution_key)
     os.makedirs(paths["sortant"], exist_ok=True)
     os.makedirs(paths["entrant"], exist_ok=True)
-    conn = sqlite3.connect(paths["db"])
-    conn.row_factory = sqlite3.Row
+    conn = _open_sqlite_connection(paths["db"])
     conn.execute("""
         CREATE TABLE IF NOT EXISTS messages (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -372,6 +421,17 @@ def get_profile_db(institution_key: str):
     return conn
 
 
+@contextmanager
+def profile_db(institution_key: str, commit: bool = True):
+    conn = get_profile_db(institution_key)
+    try:
+        yield conn
+        if commit:
+            conn.commit()
+    finally:
+        conn.close()
+
+
 def next_tracking_number(conn, direction: str, institution_key: str) -> str:
     """
     Tracking numbers now embed a short institution code (derived from the
@@ -400,9 +460,8 @@ def find_local_profile_by_recipient(recipient_text: str, exclude_key: str = None
     Returns None if no match — this does NOT reach across a network to a
     different computer; see the honesty note in api_send_message().
     """
-    conn = get_registry_db()
-    rows = conn.execute("SELECT * FROM profiles").fetchall()
-    conn.close()
+    with registry_db(commit=False) as conn:
+        rows = conn.execute("SELECT * FROM profiles").fetchall()
     target_key = recipient_text.strip()
     target_name = recipient_text.strip().casefold()
     for row in rows:
@@ -479,9 +538,8 @@ def _github_request(method: str, url_or_path: str, token: str, json_body: dict =
 
 
 def get_bridge_config():
-    conn = get_registry_db()
-    row = conn.execute("SELECT * FROM bridge_config WHERE id = 1").fetchone()
-    conn.close()
+    with registry_db(commit=False) as conn:
+        row = conn.execute("SELECT * FROM bridge_config WHERE id = 1").fetchone()
     return dict(row) if row else None
 
 
@@ -568,8 +626,7 @@ def migrate_legacy_single_tenant_if_needed():
         return  # already have at least one profile — never auto-migrate again
 
     try:
-        legacy_conn = sqlite3.connect(_LEGACY_DB_PATH)
-        legacy_conn.row_factory = sqlite3.Row
+        legacy_conn = _open_sqlite_connection(_LEGACY_DB_PATH)
         legacy_profile = legacy_conn.execute(
             "SELECT * FROM profile WHERE id = 1"
         ).fetchone()
@@ -593,6 +650,8 @@ def migrate_legacy_single_tenant_if_needed():
     os.makedirs(paths["folder"], exist_ok=True)
     os.makedirs(os.path.join(paths["folder"], "archives"), exist_ok=True)
 
+    legacy_conn.close()
+
     # Move (not copy) the legacy db and archive folders into the new location
     shutil.move(_LEGACY_DB_PATH, paths["db"])
     if os.path.isdir(_LEGACY_ARCHIVE_SORTANT):
@@ -600,17 +659,14 @@ def migrate_legacy_single_tenant_if_needed():
     if os.path.isdir(_LEGACY_ARCHIVE_ENTRANT):
         shutil.move(_LEGACY_ARCHIVE_ENTRANT, paths["entrant"])
 
-    registry_conn = get_registry_db()
-    registry_conn.execute("""
-        INSERT INTO profiles (institution_key, wilaya_code, wilaya_name,
-                               institution_type, institution_name, serial_key,
-                               pin_hash, theme, created_at)
-        VALUES (?, ?, ?, ?, ?, ?, NULL, ?, ?)
-    """, (key, wilaya_code, wilaya_name, institution_type, institution_name,
-          serial_key, theme, datetime.now().isoformat()))
-    registry_conn.commit()
-    registry_conn.close()
-    legacy_conn.close()
+    with registry_db() as conn:
+        conn.execute("""
+            INSERT INTO profiles (institution_key, wilaya_code, wilaya_name,
+                                   institution_type, institution_name, serial_key,
+                                   pin_hash, theme, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, NULL, ?, ?)
+        """, (key, wilaya_code, wilaya_name, institution_type, institution_name,
+              serial_key, theme, datetime.now().isoformat()))
 
     print(f"[migration] Legacy profile '{institution_name}' migrated to profiles/{key}/ "
           f"— a PIN must be set on first unlock.")
@@ -836,11 +892,11 @@ def api_session_set_pin():
     # gracefully when content isn't actually encrypted), new ones get
     # encrypted going forward.
     salt = generate_encryption_salt()
-    conn = get_registry_db()
-    conn.execute("UPDATE profiles SET pin_hash = ?, encryption_salt = ? WHERE institution_key = ?",
-                 (generate_password_hash(pin), salt, key))
-    conn.commit()
-    conn.close()
+    with registry_db() as conn:
+        conn.execute(
+            "UPDATE profiles SET pin_hash = ?, encryption_salt = ? WHERE institution_key = ?",
+            (generate_password_hash(pin), salt, key)
+        )
 
     updated_row = get_profile_row(key)
     set_active_session(key, pin, updated_row)
@@ -884,7 +940,6 @@ def api_delete_profile():
     confirm() dialog alone is not enough protection for a destructive
     action against real archived documents).
     """
-    global _active_key
     if _active_key is None:
         return locked_response()
 
@@ -905,10 +960,8 @@ def api_delete_profile():
     # on, regardless of whether file cleanup below fully succeeds.
     clear_active_session()
 
-    conn = get_registry_db()
-    conn.execute("DELETE FROM profiles WHERE institution_key = ?", (key_to_delete,))
-    conn.commit()
-    conn.close()
+    with registry_db() as conn:
+        conn.execute("DELETE FROM profiles WHERE institution_key = ?", (key_to_delete,))
 
     try:
         if os.path.isdir(paths["folder"]):
@@ -952,19 +1005,18 @@ def api_save_profile():
     serial_key = generate_serial_key(wilaya_code, institution_type, institution_name)
     salt = generate_encryption_salt()
 
-    conn = get_registry_db()
-    conn.execute("""
-        INSERT INTO profiles (institution_key, wilaya_code, wilaya_name,
-                               institution_type, institution_name, serial_key,
-                               pin_hash, theme, encryption_salt, created_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, 'dark', ?, ?)
-    """, (key, wilaya_code, wilaya_name, institution_type, institution_name,
-          serial_key, generate_password_hash(pin), salt, datetime.now().isoformat()))
-    conn.commit()
-    conn.close()
+    with registry_db() as conn:
+        conn.execute("""
+            INSERT INTO profiles (institution_key, wilaya_code, wilaya_name,
+                                   institution_type, institution_name, serial_key,
+                                   pin_hash, theme, encryption_salt, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, 'dark', ?, ?)
+        """, (key, wilaya_code, wilaya_name, institution_type, institution_name,
+              serial_key, generate_password_hash(pin), salt, datetime.now().isoformat()))
 
-    # Ensure the isolated storage folder exists immediately
-    get_profile_db(key).close()
+    # Ensure the isolated storage folder + schema exist immediately
+    with profile_db(key):
+        pass
 
     updated_row = get_profile_row(key)
     set_active_session(key, pin, updated_row)
@@ -979,10 +1031,8 @@ def api_set_theme():
     theme = data.get("theme", "dark")
     if theme not in ("dark", "light"):
         return jsonify({"error": "Thème invalide."}), 400
-    conn = get_registry_db()
-    conn.execute("UPDATE profiles SET theme = ? WHERE institution_key = ?", (theme, _active_key))
-    conn.commit()
-    conn.close()
+    with registry_db() as conn:
+        conn.execute("UPDATE profiles SET theme = ? WHERE institution_key = ?", (theme, _active_key))
     return jsonify({"ok": True})
 
 
@@ -993,26 +1043,27 @@ def api_set_theme():
 def api_dashboard():
     if _active_key is None:
         return locked_response()
-    conn = get_profile_db(_active_key)
-    sent = conn.execute("SELECT COUNT(*) c FROM messages WHERE direction='sortant'").fetchone()["c"]
-    received = conn.execute("SELECT COUNT(*) c FROM messages WHERE direction='entrant'").fetchone()["c"]
-    # "En attente" = sent but not yet acknowledged by the recipient. Note:
-    # previously this counted status='en_attente', a value nothing ever
-    # actually inserted (every outgoing message is written with status
-    # 'envoye') — so this counter silently showed 0 always. Redefined here
-    # to mean what the dashboard label actually implies: outgoing messages
-    # still awaiting an accusé de réception. total_sent stays an honest
-    # all-time count regardless of acknowledgement state.
-    pending = conn.execute(
-        "SELECT COUNT(*) c FROM messages WHERE direction='sortant' AND status != 'accuse'"
-    ).fetchone()["c"]
-    recent = conn.execute("SELECT * FROM messages ORDER BY created_at DESC LIMIT 15").fetchall()
-    conn.close()
+    with profile_db(_active_key, commit=False) as conn:
+        sent = conn.execute("SELECT COUNT(*) c FROM messages WHERE direction='sortant'").fetchone()["c"]
+        received = conn.execute("SELECT COUNT(*) c FROM messages WHERE direction='entrant'").fetchone()["c"]
+        # "En attente" = sent but not yet acknowledged by the recipient. Note:
+        # previously this counted status='en_attente', a value nothing ever
+        # actually inserted (every outgoing message is written with status
+        # 'envoye') — so this counter silently showed 0 always. Redefined here
+        # to mean what the dashboard label actually implies: outgoing messages
+        # still awaiting an accusé de réception. total_sent stays an honest
+        # all-time count regardless of acknowledgement state.
+        pending = conn.execute(
+            "SELECT COUNT(*) c FROM messages WHERE direction='sortant' AND status != 'accuse'"
+        ).fetchone()["c"]
+        recent = conn.execute("SELECT * FROM messages ORDER BY created_at DESC LIMIT 15").fetchall()
+        recent = [decrypt_message_row(r) for r in recent]
+
     return jsonify({
         "total_sent": sent,
         "total_received": received,
         "pending": pending,
-        "recent": [decrypt_message_row(r) for r in recent],
+        "recent": recent,
     })
 
 
@@ -1024,13 +1075,13 @@ def api_list_messages():
     if _active_key is None:
         return locked_response()
     direction = request.args.get("direction", "sortant")
-    conn = get_profile_db(_active_key)
-    rows = conn.execute(
-        "SELECT * FROM messages WHERE direction = ? ORDER BY created_at DESC",
-        (direction,)
-    ).fetchall()
-    conn.close()
-    return jsonify({"messages": [decrypt_message_row(r) for r in rows]})
+    with profile_db(_active_key, commit=False) as conn:
+        rows = conn.execute(
+            "SELECT * FROM messages WHERE direction = ? ORDER BY created_at DESC",
+            (direction,)
+        ).fetchall()
+        rows = [decrypt_message_row(r) for r in rows]
+    return jsonify({"messages": rows})
 
 
 @app.route("/api/messages/send", methods=["POST"])
@@ -1067,17 +1118,22 @@ def api_send_message():
     with open(archived_path, "wb") as f:
         f.write(encrypt_file_bytes(original_bytes))
 
-    conn = get_profile_db(_active_key)
-    tracking = next_tracking_number(conn, "sortant", _active_key)
-    conn.execute("""
-        INSERT INTO messages (direction, tracking_number, sender_institution,
-                               recipient_institution, subject, body, file_path,
-                               file_original_name, status, delivery_method, created_at)
-        VALUES ('sortant', ?, ?, ?, ?, ?, ?, ?, 'envoye', NULL, ?)
-    """, (tracking, sender, recipient, encrypt_text(subject), encrypt_text(body),
-          archived_path, file.filename, datetime.now().isoformat()))
-    conn.commit()
-    conn.close()
+    # Short, isolated connection: open, write, commit, close — never held
+    # open across the network calls (local-delivery file copy, Cloud
+    # Bridge push) that happen further down in this route. This is the
+    # crux of the "database is locked" fix: a slow network call must
+    # never happen while a SQLite write transaction is still open,
+    # because that's exactly the window where the background Cloud
+    # Bridge poll (or heartbeat) can collide with it.
+    with profile_db(_active_key) as conn:
+        tracking = next_tracking_number(conn, "sortant", _active_key)
+        conn.execute("""
+            INSERT INTO messages (direction, tracking_number, sender_institution,
+                                   recipient_institution, subject, body, file_path,
+                                   file_original_name, status, delivery_method, created_at)
+            VALUES ('sortant', ?, ?, ?, ?, ?, ?, ?, 'envoye', NULL, ?)
+        """, (tracking, sender, recipient, encrypt_text(subject), encrypt_text(body),
+              archived_path, file.filename, datetime.now().isoformat()))
 
     # --------------------------------------------------------------- #
     # Local delivery: if the recipient happens to be another profile
@@ -1102,29 +1158,28 @@ def api_send_message():
             with open(recipient_archived_path, "wb") as f:
                 f.write(original_bytes)
 
-            recipient_conn = get_profile_db(recipient_key)
             recipient_tracking = tracking
             try:
-                recipient_conn.execute("""
-                    INSERT INTO messages (direction, tracking_number, sender_institution,
-                                           recipient_institution, subject, body, file_path,
-                                           file_original_name, status, delivery_method, created_at)
-                    VALUES ('entrant', ?, ?, ?, ?, ?, ?, ?, 'envoye', 'local', ?)
-                """, (recipient_tracking, sender, recipient, subject, body,
-                      recipient_archived_path, file.filename, datetime.now().isoformat()))
+                with profile_db(recipient_key) as recipient_conn:
+                    recipient_conn.execute("""
+                        INSERT INTO messages (direction, tracking_number, sender_institution,
+                                               recipient_institution, subject, body, file_path,
+                                               file_original_name, status, delivery_method, created_at)
+                        VALUES ('entrant', ?, ?, ?, ?, ?, ?, ?, 'envoye', 'local', ?)
+                    """, (recipient_tracking, sender, recipient, subject, body,
+                          recipient_archived_path, file.filename, datetime.now().isoformat()))
             except sqlite3.IntegrityError:
                 # Extremely rare tracking-number collision across two
                 # independent institution databases — disambiguate and retry.
                 recipient_tracking = f"{tracking}-{uuid.uuid4().hex[:4].upper()}"
-                recipient_conn.execute("""
-                    INSERT INTO messages (direction, tracking_number, sender_institution,
-                                           recipient_institution, subject, body, file_path,
-                                           file_original_name, status, delivery_method, created_at)
-                    VALUES ('entrant', ?, ?, ?, ?, ?, ?, ?, 'envoye', 'local', ?)
-                """, (recipient_tracking, sender, recipient, subject, body,
-                      recipient_archived_path, file.filename, datetime.now().isoformat()))
-            recipient_conn.commit()
-            recipient_conn.close()
+                with profile_db(recipient_key) as recipient_conn:
+                    recipient_conn.execute("""
+                        INSERT INTO messages (direction, tracking_number, sender_institution,
+                                               recipient_institution, subject, body, file_path,
+                                               file_original_name, status, delivery_method, created_at)
+                        VALUES ('entrant', ?, ?, ?, ?, ?, ?, ?, 'envoye', 'local', ?)
+                    """, (recipient_tracking, sender, recipient, subject, body,
+                          recipient_archived_path, file.filename, datetime.now().isoformat()))
             delivered_locally = True
         except Exception:
             # Never fail the whole send just because local delivery hit an
@@ -1135,7 +1190,8 @@ def api_send_message():
     # Cloud Bridge fallback: only attempted when no local profile matched
     # (a local match always takes precedence — see find_local_profile_by_name
     # docstring). Never fails the overall send; the sender's own record is
-    # already safely saved regardless of bridge outcome.
+    # already safely saved regardless of bridge outcome. Note the GitHub
+    # network call happens here with NO SQLite connection open at all.
     # --------------------------------------------------------------- #
     delivered_via_bridge = False
     bridge_attempted = False
@@ -1153,11 +1209,9 @@ def api_send_message():
 
     delivery_method = "local" if delivered_locally else ("bridge" if delivered_via_bridge else None)
     if delivery_method:
-        method_conn = get_profile_db(_active_key)
-        method_conn.execute("UPDATE messages SET delivery_method = ? WHERE tracking_number = ?",
-                             (delivery_method, tracking))
-        method_conn.commit()
-        method_conn.close()
+        with profile_db(_active_key) as method_conn:
+            method_conn.execute("UPDATE messages SET delivery_method = ? WHERE tracking_number = ?",
+                                 (delivery_method, tracking))
 
     return jsonify({
         "ok": True,
@@ -1173,9 +1227,8 @@ def api_send_message():
 def api_download_message(message_id):
     if _active_key is None:
         return locked_response()
-    conn = get_profile_db(_active_key)
-    row = conn.execute("SELECT * FROM messages WHERE id = ?", (message_id,)).fetchone()
-    conn.close()
+    with profile_db(_active_key, commit=False) as conn:
+        row = conn.execute("SELECT * FROM messages WHERE id = ?", (message_id,)).fetchone()
     if row is None or not row["file_path"] or not os.path.exists(row["file_path"]):
         abort(404)
 
@@ -1202,22 +1255,24 @@ def api_update_message_status(message_id):
     if status not in ("envoye", "recu", "accuse", "en_attente"):
         return jsonify({"error": "Statut invalide."}), 400
 
-    conn = get_profile_db(_active_key)
-    row = conn.execute("SELECT * FROM messages WHERE id = ?", (message_id,)).fetchone()
-    if row is None:
-        conn.close()
-        return jsonify({"error": "Message introuvable."}), 404
+    with profile_db(_active_key) as conn:
+        row = conn.execute("SELECT * FROM messages WHERE id = ?", (message_id,)).fetchone()
+        if row is None:
+            return jsonify({"error": "Message introuvable."}), 404
 
-    conn.execute("UPDATE messages SET status = ? WHERE id = ?", (status, message_id))
-    conn.commit()
-    updated = conn.execute("SELECT * FROM messages WHERE id = ?", (message_id,)).fetchone()
-    conn.close()
+        conn.execute("UPDATE messages SET status = ? WHERE id = ?", (status, message_id))
+        updated = conn.execute("SELECT * FROM messages WHERE id = ?", (message_id,)).fetchone()
+        updated = decrypt_message_row(updated)
+        row_dict = dict(row)
 
-    # Read-receipt routing: only for entrant messages being acknowledged.
-    if status == "accuse" and row["direction"] == "entrant":
-        route_read_receipt(row)
+    # Read-receipt routing happens AFTER the connection above is closed —
+    # it opens its own short-lived connection(s) to a *different* profile's
+    # database (route_read_receipt), and may make a Cloud Bridge network
+    # call. Never do either of those while still holding this connection.
+    if status == "accuse" and row_dict["direction"] == "entrant":
+        route_read_receipt(row_dict)
 
-    return jsonify({"ok": True, "message": decrypt_message_row(updated)})
+    return jsonify({"ok": True, "message": updated})
 
 
 def route_read_receipt(message_row):
@@ -1231,19 +1286,18 @@ def route_read_receipt(message_row):
     """
     tracking = message_row["tracking_number"]
     sender_name = message_row["sender_institution"] or ""
-    delivery_method = message_row["delivery_method"] if "delivery_method" in message_row.keys() else None
+    delivery_method = message_row.get("delivery_method")
 
     try:
         if delivery_method == "local":
             sender_profile = find_local_profile_by_recipient(sender_name, exclude_key=_active_key)
             if sender_profile is not None:
-                sender_conn = get_profile_db(sender_profile["institution_key"])
-                sender_conn.execute(
-                    "UPDATE messages SET status = 'accuse' WHERE tracking_number = ? AND direction = 'sortant'",
-                    (tracking,)
-                )
-                sender_conn.commit()
-                sender_conn.close()
+                with profile_db(sender_profile["institution_key"]) as sender_conn:
+                    sender_conn.execute(
+                        "UPDATE messages SET status = 'accuse' "
+                        "WHERE tracking_number = ? AND direction = 'sortant'",
+                        (tracking,)
+                    )
         elif delivery_method == "bridge":
             cfg = get_bridge_config()
             if cfg and cfg["enabled"]:
@@ -1278,16 +1332,13 @@ def push_receipt_to_bridge(cfg: dict, sender_name: str, tracking: str, acknowled
 def api_delete_message(message_id):
     if _active_key is None:
         return locked_response()
-    conn = get_profile_db(_active_key)
-    row = conn.execute("SELECT * FROM messages WHERE id = ?", (message_id,)).fetchone()
-    if row is None:
-        conn.close()
-        return jsonify({"error": "Message introuvable."}), 404
+    with profile_db(_active_key) as conn:
+        row = conn.execute("SELECT * FROM messages WHERE id = ?", (message_id,)).fetchone()
+        if row is None:
+            return jsonify({"error": "Message introuvable."}), 404
 
-    file_path = row["file_path"]
-    conn.execute("DELETE FROM messages WHERE id = ?", (message_id,))
-    conn.commit()
-    conn.close()
+        file_path = row["file_path"]
+        conn.execute("DELETE FROM messages WHERE id = ?", (message_id,))
 
     if file_path and os.path.exists(file_path):
         try:
@@ -1306,16 +1357,16 @@ def api_registre():
     if _active_key is None:
         return locked_response()
     direction = request.args.get("direction", "tous")
-    conn = get_profile_db(_active_key)
-    if direction == "tous":
-        rows = conn.execute("SELECT * FROM messages ORDER BY created_at DESC").fetchall()
-    else:
-        rows = conn.execute(
-            "SELECT * FROM messages WHERE direction = ? ORDER BY created_at DESC",
-            (direction,)
-        ).fetchall()
-    conn.close()
-    return jsonify({"entries": [decrypt_message_row(r) for r in rows]})
+    with profile_db(_active_key, commit=False) as conn:
+        if direction == "tous":
+            rows = conn.execute("SELECT * FROM messages ORDER BY created_at DESC").fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT * FROM messages WHERE direction = ? ORDER BY created_at DESC",
+                (direction,)
+            ).fetchall()
+        rows = [decrypt_message_row(r) for r in rows]
+    return jsonify({"entries": rows})
 
 
 # --------------------------------------------------------------------------- #
@@ -1385,6 +1436,9 @@ def _validate_and_save_bridge_config(owner: str, repo: str, token: str):
     Shared by both the manual entry form AND the QR/pasted-code import path
     — guarantees the private-repo safety check applies identically no
     matter how the credentials arrived. Returns (status_code, body_dict).
+
+    Deliberately does the (slow) GitHub network call BEFORE opening any
+    SQLite connection — the write itself is a single short INSERT/UPDATE.
     """
     if not owner or not repo or not token:
         return 400, {"error": "Propriétaire, dépôt et jeton GitHub sont tous requis."}
@@ -1405,16 +1459,14 @@ def _validate_and_save_bridge_config(owner: str, repo: str, token: str):
                      "Utilisez un dépôt privé dédié."
         }
 
-    conn = get_registry_db()
-    conn.execute("""
-        INSERT INTO bridge_config (id, github_owner, github_repo, github_token, enabled, updated_at)
-        VALUES (1, ?, ?, ?, 1, ?)
-        ON CONFLICT(id) DO UPDATE SET
-            github_owner=excluded.github_owner, github_repo=excluded.github_repo,
-            github_token=excluded.github_token, enabled=1, updated_at=excluded.updated_at
-    """, (owner, repo, token, datetime.now().isoformat()))
-    conn.commit()
-    conn.close()
+    with registry_db() as conn:
+        conn.execute("""
+            INSERT INTO bridge_config (id, github_owner, github_repo, github_token, enabled, updated_at)
+            VALUES (1, ?, ?, ?, 1, ?)
+            ON CONFLICT(id) DO UPDATE SET
+                github_owner=excluded.github_owner, github_repo=excluded.github_repo,
+                github_token=excluded.github_token, enabled=1, updated_at=excluded.updated_at
+        """, (owner, repo, token, datetime.now().isoformat()))
 
     return 200, {"ok": True, "private_verified": True}
 
@@ -1555,10 +1607,8 @@ def api_bridge_import_code():
 
 @app.route("/api/bridge/disable", methods=["POST"])
 def api_bridge_disable():
-    conn = get_registry_db()
-    conn.execute("UPDATE bridge_config SET enabled = 0 WHERE id = 1")
-    conn.commit()
-    conn.close()
+    with registry_db() as conn:
+        conn.execute("UPDATE bridge_config SET enabled = 0 WHERE id = 1")
     return jsonify({"ok": True})
 
 
@@ -1575,10 +1625,18 @@ def _queue_bridge_cleanup(conn, url_or_path: str, sha: str):
         "INSERT INTO bridge_pending_cleanup (repo_path, sha, created_at) VALUES (?, ?, ?)",
         (url_or_path, sha, datetime.now().isoformat())
     )
-    conn.commit()
 
 
 def _delete_bridge_entry_or_queue(conn, owner: str, repo: str, token: str, url_or_path: str, sha: str):
+    """
+    Note: the GitHub DELETE call below happens WHILE `conn` (passed in by
+    the caller) may still be open for the current poll cycle — this
+    mirrors the original design and is fine under WAL: readers elsewhere
+    are not blocked by it, and a same-process write from the same
+    connection is not the kind of cross-connection contention WAL/
+    busy_timeout are guarding against. The queuing INSERT itself, right
+    below, is a fast local write with no network in between.
+    """
     status, _ = _github_request("DELETE", url_or_path, token,
                                  {"message": "TASHIL bridge: consumed", "sha": sha})
     if status not in (200, 204):
@@ -1592,7 +1650,6 @@ def _retry_pending_bridge_cleanup(conn, owner: str, repo: str, token: str):
                                      {"message": "TASHIL bridge: retried cleanup", "sha": row["sha"]})
         if status in (200, 204):
             conn.execute("DELETE FROM bridge_pending_cleanup WHERE id = ?", (row["id"],))
-    conn.commit()
 
 
 # --------------------------------------------------------------------------- #
@@ -1689,6 +1746,19 @@ def api_bridge_poll():
     entries from the bridge repo — retrying any cleanup that failed on a
     previous poll first. Safe to call repeatedly — already-seen tracking
     numbers are skipped.
+
+    This function's SQLite connection (via profile_db()) is held open for
+    the whole poll, interleaved with many GitHub network calls — that
+    part of the original design is unchanged here. What changes with
+    v2.8.1 is that this connection now runs in WAL mode with a 5s
+    busy_timeout, same as every other connection in the app: a
+    foreground request (e.g. a send, or opening the Registre) that needs
+    the SAME profile's database while a poll is mid-flight now waits up
+    to 5 seconds and proceeds, instead of failing immediately with
+    "database is locked". The context manager also guarantees this
+    connection is always closed — even if a GitHub call raises or a
+    network timeout occurs partway through — so a failed poll can never
+    leak a held-open connection into the next request.
     """
     if _active_key is None:
         return locked_response()
@@ -1699,138 +1769,135 @@ def api_bridge_poll():
 
     profile = get_profile_row(_active_key)
     owner, repo, token = cfg["github_owner"], cfg["github_repo"], cfg["github_token"]
-    conn = get_profile_db(_active_key)
     paths = profile_paths(_active_key)
 
-    # Retry any deletions that failed on a previous poll BEFORE processing
-    # new entries (see queue_bridge_cleanup / feature note above).
-    _retry_pending_bridge_cleanup(conn, owner, repo, token)
+    with profile_db(_active_key) as conn:
+        # Retry any deletions that failed on a previous poll BEFORE
+        # processing new entries (see queue_bridge_cleanup / feature note).
+        _retry_pending_bridge_cleanup(conn, owner, repo, token)
 
-    # Announce presence for "Établissements connectés" — piggybacked here
-    # rather than a separate timer, so it costs no extra GitHub API budget
-    # beyond what polling already uses.
-    try:
-        _send_heartbeat(owner, repo, token, profile)
-    except Exception:
-        pass  # a missed heartbeat just means this device looks offline a bit longer, not a real failure
-
-    # A sender may have addressed this institution either by its plain name
-    # or by its exact routing ID (institution_key) — check both folders so
-    # neither addressing style silently gets lost. Deduplicated by set()
-    # since the two can occasionally normalize to the same slug.
-    keys_to_check = {bridge_slug(profile["institution_name"]), bridge_slug(profile["institution_key"])}
-
-    json_entries = []
-    receipt_entries = []
-    for key in keys_to_check:
-        status, listing = _github_request("GET", f"/repos/{owner}/{repo}/contents/bridge/{key}", token)
-        if status == 200:
-            json_entries.extend(f for f in listing if f["name"].endswith(".json"))
-        elif status != 404:
-            conn.close()
-            return jsonify({"error": f"Erreur GitHub ({status})."}), 502
-
-        r_status, r_listing = _github_request(
-            "GET", f"/repos/{owner}/{repo}/contents/bridge/{key}/receipts", token
-        )
-        if r_status == 200:
-            receipt_entries.extend(f for f in r_listing if f["name"].endswith(".json"))
-        elif r_status != 404:
-            conn.close()
-            return jsonify({"error": f"Erreur GitHub ({r_status})."}), 502
-
-    new_count = 0
-    for entry in json_entries:
-        meta_status, meta_content = _github_request("GET", entry["url"], token)
-        if meta_status != 200 or "content" not in meta_content:
-            continue
+        # Announce presence for "Établissements connectés" — piggybacked
+        # here rather than a separate timer, so it costs no extra GitHub
+        # API budget beyond what polling already uses.
         try:
-            meta = json.loads(base64.b64decode(meta_content["content"]).decode("utf-8"))
-        except (ValueError, KeyError):
-            continue
+            _send_heartbeat(owner, repo, token, profile)
+        except Exception:
+            pass  # a missed heartbeat just means this device looks offline a bit longer, not a real failure
 
-        already_have = conn.execute(
-            "SELECT 1 FROM messages WHERE tracking_number = ?", (meta["tracking_number"],)
-        ).fetchone()
-        if already_have:
-            # Already imported on a previous poll — if cleanup failed that
-            # time, _retry_pending_bridge_cleanup above already handles it.
-            continue
+        # A sender may have addressed this institution either by its plain
+        # name or by its exact routing ID (institution_key) — check both
+        # folders so neither addressing style silently gets lost.
+        # Deduplicated by set() since the two can occasionally normalize
+        # to the same slug.
+        keys_to_check = {bridge_slug(profile["institution_name"]), bridge_slug(profile["institution_key"])}
 
-        attach_status, attach_content = _github_request(
-            "GET", f"/repos/{owner}/{repo}/contents/{meta['attachment_path_in_repo']}", token
-        )
-        if attach_status != 200 or "content" not in attach_content:
-            continue
-        file_bytes = base64.b64decode(attach_content["content"])
+        json_entries = []
+        receipt_entries = []
+        for key in keys_to_check:
+            status, listing = _github_request("GET", f"/repos/{owner}/{repo}/contents/bridge/{key}", token)
+            if status == 200:
+                json_entries.extend(f for f in listing if f["name"].endswith(".json"))
+            elif status != 404:
+                return jsonify({"error": f"Erreur GitHub ({status})."}), 502
 
-        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-        tag = sanitize(meta.get("sender_institution", "DISTANT")).replace(" ", "")[:30]
-        safe_name = sanitize(meta.get("file_original_name", "document"))
-        local_path = os.path.join(paths["entrant"], f"{ts}_{tag}_{safe_name}")
-        try:
-            # Encrypts with THIS profile's own active key, if it has
-            # encryption enabled — safe no-op otherwise. We're the
-            # recipient and unlocked right now, so (unlike local
-            # delivery) applying our own encryption here is correct.
-            with open(local_path, "wb") as f:
-                f.write(encrypt_file_bytes(file_bytes))
-        except OSError:
-            continue
+            r_status, r_listing = _github_request(
+                "GET", f"/repos/{owner}/{repo}/contents/bridge/{key}/receipts", token
+            )
+            if r_status == 200:
+                receipt_entries.extend(f for f in r_listing if f["name"].endswith(".json"))
+            elif r_status != 404:
+                return jsonify({"error": f"Erreur GitHub ({r_status})."}), 502
 
-        conn.execute("""
-            INSERT INTO messages (direction, tracking_number, sender_institution,
-                                   recipient_institution, subject, body, file_path,
-                                   file_original_name, status, delivery_method, created_at)
-            VALUES ('entrant', ?, ?, ?, ?, ?, ?, ?, 'envoye', 'bridge', ?)
-        """, (meta["tracking_number"], meta.get("sender_institution", "?"),
-              meta.get("recipient_institution", profile["institution_name"]),
-              encrypt_text(meta.get("subject", "")), encrypt_text(meta.get("body", "")),
-              local_path, meta.get("file_original_name", "document"),
-              meta.get("created_at", datetime.now().isoformat())))
-        conn.commit()
-        new_count += 1
+        new_count = 0
+        for entry in json_entries:
+            meta_status, meta_content = _github_request("GET", entry["url"], token)
+            if meta_status != 200 or "content" not in meta_content:
+                continue
+            try:
+                meta = json.loads(base64.b64decode(meta_content["content"]).decode("utf-8"))
+            except (ValueError, KeyError):
+                continue
 
-        # Clean up consumed entries so the bridge queue doesn't grow
-        # forever — queue for retry instead of silently dropping if the
-        # delete itself fails (see _retry_pending_bridge_cleanup).
-        _delete_bridge_entry_or_queue(conn, owner, repo, token, entry["url"], entry["sha"])
-        _delete_bridge_entry_or_queue(
-            conn, owner, repo, token,
-            f"/repos/{owner}/{repo}/contents/{meta['attachment_path_in_repo']}",
-            attach_content["sha"]
-        )
-
-    receipts_applied = []
-    for entry in receipt_entries:
-        r_status, r_content = _github_request("GET", entry["url"], token)
-        if r_status != 200 or "content" not in r_content:
-            continue
-        try:
-            receipt = json.loads(base64.b64decode(r_content["content"]).decode("utf-8"))
-        except (ValueError, KeyError):
-            continue
-
-        tracking = receipt.get("tracking_number")
-        if tracking:
-            sent_row = conn.execute(
-                "SELECT * FROM messages WHERE tracking_number = ? AND direction = 'sortant'", (tracking,)
+            already_have = conn.execute(
+                "SELECT 1 FROM messages WHERE tracking_number = ?", (meta["tracking_number"],)
             ).fetchone()
-            if sent_row is not None and sent_row["status"] != "accuse":
-                conn.execute(
-                    "UPDATE messages SET status = 'accuse' WHERE tracking_number = ? AND direction = 'sortant'",
-                    (tracking,)
-                )
-                conn.commit()
-                receipts_applied.append({
-                    "tracking_number": tracking,
-                    "acknowledged_by": receipt.get("acknowledged_by", "?"),
-                })
+            if already_have:
+                # Already imported on a previous poll — if cleanup failed
+                # that time, _retry_pending_bridge_cleanup above already
+                # handles it.
+                continue
 
-        # Consume the receipt regardless, so it never sits in the queue forever.
-        _delete_bridge_entry_or_queue(conn, owner, repo, token, entry["url"], entry["sha"])
+            attach_status, attach_content = _github_request(
+                "GET", f"/repos/{owner}/{repo}/contents/{meta['attachment_path_in_repo']}", token
+            )
+            if attach_status != 200 or "content" not in attach_content:
+                continue
+            file_bytes = base64.b64decode(attach_content["content"])
 
-    conn.close()
+            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+            tag = sanitize(meta.get("sender_institution", "DISTANT")).replace(" ", "")[:30]
+            safe_name = sanitize(meta.get("file_original_name", "document"))
+            local_path = os.path.join(paths["entrant"], f"{ts}_{tag}_{safe_name}")
+            try:
+                # Encrypts with THIS profile's own active key, if it has
+                # encryption enabled — safe no-op otherwise. We're the
+                # recipient and unlocked right now, so (unlike local
+                # delivery) applying our own encryption here is correct.
+                with open(local_path, "wb") as f:
+                    f.write(encrypt_file_bytes(file_bytes))
+            except OSError:
+                continue
+
+            conn.execute("""
+                INSERT INTO messages (direction, tracking_number, sender_institution,
+                                       recipient_institution, subject, body, file_path,
+                                       file_original_name, status, delivery_method, created_at)
+                VALUES ('entrant', ?, ?, ?, ?, ?, ?, ?, 'envoye', 'bridge', ?)
+            """, (meta["tracking_number"], meta.get("sender_institution", "?"),
+                  meta.get("recipient_institution", profile["institution_name"]),
+                  encrypt_text(meta.get("subject", "")), encrypt_text(meta.get("body", "")),
+                  local_path, meta.get("file_original_name", "document"),
+                  meta.get("created_at", datetime.now().isoformat())))
+            new_count += 1
+
+            # Clean up consumed entries so the bridge queue doesn't grow
+            # forever — queue for retry instead of silently dropping if
+            # the delete itself fails (see _retry_pending_bridge_cleanup).
+            _delete_bridge_entry_or_queue(conn, owner, repo, token, entry["url"], entry["sha"])
+            _delete_bridge_entry_or_queue(
+                conn, owner, repo, token,
+                f"/repos/{owner}/{repo}/contents/{meta['attachment_path_in_repo']}",
+                attach_content["sha"]
+            )
+
+        receipts_applied = []
+        for entry in receipt_entries:
+            r_status, r_content = _github_request("GET", entry["url"], token)
+            if r_status != 200 or "content" not in r_content:
+                continue
+            try:
+                receipt = json.loads(base64.b64decode(r_content["content"]).decode("utf-8"))
+            except (ValueError, KeyError):
+                continue
+
+            tracking = receipt.get("tracking_number")
+            if tracking:
+                sent_row = conn.execute(
+                    "SELECT * FROM messages WHERE tracking_number = ? AND direction = 'sortant'", (tracking,)
+                ).fetchone()
+                if sent_row is not None and sent_row["status"] != "accuse":
+                    conn.execute(
+                        "UPDATE messages SET status = 'accuse' WHERE tracking_number = ? AND direction = 'sortant'",
+                        (tracking,)
+                    )
+                    receipts_applied.append({
+                        "tracking_number": tracking,
+                        "acknowledged_by": receipt.get("acknowledged_by", "?"),
+                    })
+
+            # Consume the receipt regardless, so it never sits in the queue forever.
+            _delete_bridge_entry_or_queue(conn, owner, repo, token, entry["url"], entry["sha"])
+
     return jsonify({
         "ok": True,
         "bridge_enabled": True,
