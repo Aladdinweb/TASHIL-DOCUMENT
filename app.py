@@ -35,6 +35,29 @@ v2.8.2 — Two fixes from real desktop testing:
      keeps the topbar visible as a header above the content column
      instead of hiding it; no HTML/JS changes were needed.
 
+v2.8.3 — Camera-captured photos arriving "corrupted" on the recipient's
+PC. Root cause verified, not assumed: iPhones running Safari default
+their camera to HEIC — a perfectly valid photo, but Windows' built-in
+Photos app can't open HEIC without an extra codec extension, which
+shows the user "we can't open this file" / "image corrompue". The
+upload pipeline itself (multipart file upload, Fernet encryption on raw
+bytes, base64 only for the Cloud Bridge's GitHub transport) was audited
+end to end and does NOT involve any Data-URL/base64 step on the
+frontend — a previously-suspected cause that turned out not to apply to
+this codebase, so no fix was invented for it. Two real changes instead:
+  1. static/js/app.js: HEIC/HEIF (or any non-standard image type) is now
+     converted to a normal JPEG client-side, via canvas, before upload.
+     Non-image files and images already in a standard format pass
+     through completely untouched. If the browser can't decode the
+     source (some non-Safari browsers can't decode HEIC either), the
+     original file is sent unchanged rather than losing the attachment.
+  2. app.py: a new sniff_real_extension() checks the file's actual magic
+     bytes and corrects the archived/displayed filename's extension if
+     it disagrees with what the client claimed — a safety net, not a
+     format converter, so a mislabeled file at least keeps an honest
+     name. A genuinely empty (0-byte) upload is now rejected outright
+     with a clear error instead of silently archived.
+
 ⚠️ Security honesty note: the PIN is a lock-screen deterrent against
 casual/physical snooping on a shared device (hashed with werkzeug's
 salted hash, never stored in plaintext) — it is NOT full-disk or
@@ -123,7 +146,7 @@ _LEGACY_ARCHIVE_ENTRANT = os.path.join(BASE_DIR, "archives", "Courrier_Entrant")
 os.makedirs(PROFILES_DIR, exist_ok=True)
 
 APP_ROOT = os.path.dirname(os.path.abspath(__file__))
-APP_VERSION = "2.8.2"
+APP_VERSION = "2.8.3"
 GITHUB_REPO = "Aladdinweb/TASHIL-ES"  # used by the in-app OTA update checker
 
 app = Flask(__name__,
@@ -338,6 +361,43 @@ init_registry_db()
 def sanitize(name: str) -> str:
     name = re.sub(r'[\\/:*?"<>|]', "_", name)
     return name.strip() or "document"
+
+
+def sniff_real_extension(file_bytes: bytes, fallback_ext: str) -> str:
+    """
+    Best-effort file-signature check (magic bytes), independent of
+    whatever extension the client's filename claims.
+
+    v2.8.3: added as a defense-in-depth safety net alongside the
+    frontend's HEIC→JPEG conversion (static/js/app.js,
+    normalizeImageForUpload). The frontend fix is what actually solves
+    the reported "corrupted image" symptom for camera captures — a
+    HEIC photo from an iPhone's Safari camera is a perfectly valid
+    file, but Windows Photos can't open HEIC without an extra codec,
+    which reads to a user as "corrupted". This backend check does NOT
+    convert anything (it can't — decoding image formats server-side
+    would be a much bigger dependency than this bug warrants); it only
+    makes sure the archived/displayed filename's extension matches
+    what the bytes actually are. That protects against a MISLABELED
+    extension (e.g. a client sending real HEIC bytes named "photo.jpg")
+    reaching a recipient with a name that lies about the format —
+    which would show a more confusing "file is corrupted" error
+    instead of a correct, if still unopenable-without-a-viewer, ".heic".
+    Not exhaustive by design — falls back to whatever the client
+    claimed for anything not in this short, common list.
+    """
+    if file_bytes[:3] == b"\xff\xd8\xff":
+        return ".jpg"
+    if file_bytes[:8] == b"\x89PNG\r\n\x1a\n":
+        return ".png"
+    if file_bytes[:6] in (b"GIF87a", b"GIF89a"):
+        return ".gif"
+    if file_bytes[:4] == b"RIFF" and file_bytes[8:12] == b"WEBP":
+        return ".webp"
+    if len(file_bytes) >= 12 and file_bytes[4:8] == b"ftyp" and \
+            file_bytes[8:12] in (b"heic", b"heix", b"hevc", b"heim", b"heis", b"hevm", b"hevs", b"mif1", b"msf1"):
+        return ".heic"
+    return fallback_ext
 
 
 def make_institution_key(wilaya_code: int, institution_type: str, institution_name: str) -> str:
@@ -1151,9 +1211,32 @@ def api_send_message():
     # file, which a recipient has no way to decrypt (different key/PIN).
     original_bytes = file.read()
 
+    # v2.8.3: reject a genuinely empty upload outright rather than
+    # silently archiving a 0-byte file that would later show as
+    # "corrupted" with no indication of why. This can't catch every
+    # possible network-level truncation (the server only ever sees what
+    # actually arrived), but an empty body specifically — an interrupted
+    # or failed upload — is easy to detect and worth failing loudly.
+    if not original_bytes:
+        return jsonify({"error": "Le fichier reçu est vide (0 octet) — "
+                                  "l'envoi a probablement été interrompu. Réessayez."}), 400
+
+    # v2.8.3: correct the filename's extension to match the file's REAL
+    # bytes (magic-byte signature) rather than blindly trusting whatever
+    # extension the client sent — see sniff_real_extension() docstring.
+    # This is a safety net, not the actual HEIC fix (that's the
+    # frontend's job, see static/js/app.js normalizeImageForUpload) —
+    # it only prevents a mislabeled file from reaching a recipient under
+    # a name that lies about what format it actually is.
+    original_filename = file.filename or "document"
+    name_root, current_ext = os.path.splitext(original_filename)
+    real_ext = sniff_real_extension(original_bytes, current_ext.lower())
+    if real_ext != current_ext.lower():
+        original_filename = f"{name_root}{real_ext}"
+
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     tag = sanitize(sender).replace(" ", "")[:30]
-    safe_name = sanitize(secure_filename(file.filename) or "document")
+    safe_name = sanitize(secure_filename(original_filename) or "document")
     archived_name = f"{ts}_{tag}_{safe_name}"
     archived_path = os.path.join(paths["sortant"], archived_name)
     with open(archived_path, "wb") as f:
@@ -1181,7 +1264,7 @@ def api_send_message():
                                            file_original_name, status, delivery_method, created_at)
                     VALUES ('sortant', ?, ?, ?, ?, ?, ?, ?, 'envoye', NULL, ?)
                 """, (tracking, sender, recipient, encrypt_text(subject), encrypt_text(body),
-                      archived_path, file.filename, datetime.now().isoformat()))
+                      archived_path, original_filename, datetime.now().isoformat()))
                 break
             except sqlite3.IntegrityError:
                 if attempt == 2:
@@ -1220,7 +1303,7 @@ def api_send_message():
                                                file_original_name, status, delivery_method, created_at)
                         VALUES ('entrant', ?, ?, ?, ?, ?, ?, ?, 'envoye', 'local', ?)
                     """, (recipient_tracking, sender, recipient, subject, body,
-                          recipient_archived_path, file.filename, datetime.now().isoformat()))
+                          recipient_archived_path, original_filename, datetime.now().isoformat()))
             except sqlite3.IntegrityError:
                 # Extremely rare tracking-number collision across two
                 # independent institution databases — disambiguate and retry.
@@ -1232,7 +1315,7 @@ def api_send_message():
                                                file_original_name, status, delivery_method, created_at)
                         VALUES ('entrant', ?, ?, ?, ?, ?, ?, ?, 'envoye', 'local', ?)
                     """, (recipient_tracking, sender, recipient, subject, body,
-                          recipient_archived_path, file.filename, datetime.now().isoformat()))
+                          recipient_archived_path, original_filename, datetime.now().isoformat()))
             delivered_locally = True
         except Exception:
             # Never fail the whole send just because local delivery hit an
@@ -1255,7 +1338,7 @@ def api_send_message():
             try:
                 delivered_via_bridge = push_to_bridge(
                     bridge_cfg, recipient, sender, subject, body,
-                    tracking, original_bytes, file.filename
+                    tracking, original_bytes, original_filename
                 )
             except Exception:
                 delivered_via_bridge = False

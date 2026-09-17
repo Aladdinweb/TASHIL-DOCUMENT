@@ -1151,3 +1151,172 @@ accuse réception → `pending: 0`, `total_sent` toujours à `1`.
 `pending` corrigée, mécanisme de heartbeat/annuaire), `templates/index.html`,
 `static/css/style.css`, `static/js/app.js`. Aucune fonctionnalité
 antérieure retirée.
+
+---
+
+## 18. v2.8.1 — Correctif SQLite : "database is locked" sur build Windows (2026-09-16)
+
+⚠️ Note de traçabilité : cette version et les deux suivantes (v2.8.2,
+v2.8.3) ont été développées et testées par échange direct avec
+l'utilisateur (hors de ce document de suivi habituel), puis effectivement
+poussées, taguées et buildées sur le dépôt réel — mais jamais consignées
+ici avant maintenant. Les sections 18 à 20 documentent donc, après coup,
+trois versions déjà en production plutôt qu'un travail à venir.
+
+### 18.1 Symptôme signalé
+
+Erreur `Erreur interne du serveur : database is locked` lors de l'envoi
+d'un document sur le PC de bureau. Cause identifiée : des connexions
+SQLite concurrentes (thread d'envoi ET sondage/heartbeat Cloud Bridge en
+arrière-plan) entraient en collision, chacune verrouillant la base
+brièvement.
+
+### 18.2 Correctifs appliqués
+
+1. **Mode WAL (Write-Ahead Logging)** sur CHAQUE connexion SQLite
+   (`PRAGMA journal_mode=WAL`) — permet à un lecteur et un writer de
+   travailler simultanément au lieu de verrouiller tout le fichier à
+   chaque écriture.
+2. **`PRAGMA busy_timeout=5000`** sur chaque connexion — si une
+   connexion tient déjà un verrou d'écriture, une seconde connexion
+   attend maintenant jusqu'à 5 secondes avant d'abandonner, au lieu
+   d'échouer immédiatement.
+3. **Context managers `registry_db()` et `profile_db(key)`** — toute
+   connexion SQLite du fichier passe désormais par ces deux context
+   managers (`with ... as conn:`), qui garantissent `commit()` en cas de
+   succès et `close()` dans TOUS les cas (succès, exception, retour
+   anticipé) via `try/finally`. Élimine toute fuite de connexion
+   silencieuse.
+4. Dans `api_send_message`, l'écriture SQLite de l'expéditeur est
+   maintenant isolée dans un bloc court, fermé **avant** que le code
+   touche à la livraison locale ou au Cloud Bridge (appels réseau) —
+   plus aucune connexion tenue ouverte pendant un appel lent.
+
+### 18.3 Tests réels effectués
+
+- Création de profil, envoi de message avec pièce jointe, lecture du
+  tableau de bord — testé de bout en bout via le client de test Flask,
+  pas seulement relu.
+- Confirmation directe que `PRAGMA journal_mode` retourne bien `wal` sur
+  le fichier `.db` réellement généré sur disque (pas supposé).
+
+**Fichiers modifiés :** `app.py` uniquement (aucun changement HTML/JS).
+Aucune fonctionnalité antérieure retirée.
+
+---
+
+## 19. v2.8.2 — Correctif tracking_number + visibilité des boutons desktop (2026-09-17)
+
+### 19.1 🐛 `UNIQUE constraint failed: messages.tracking_number`
+
+**Cause réelle, reproduite avant correction** : `next_tracking_number()`
+calculait le numéro de suivi à partir de `COUNT(*) WHERE direction = ?`
+uniquement. Scénario reproduit à l'identique : 5 messages envoyés
+(séquences 000001 à 000005) → suppression du message le PLUS ANCIEN
+(pas le dernier) → `COUNT(*)` retombe à 4 → le prochain envoi recalcule
+`000005`, qui appartient déjà à un message plus récent toujours présent
+→ collision `UNIQUE constraint failed`, message d'erreur identique à
+celui rapporté par l'utilisateur (capture d'écran à l'appui).
+
+**Correctif** :
+- `next_tracking_number()` ajoute désormais un suffixe aléatoire à 6
+  caractères à chaque numéro généré, avec vérification d'inexistence en
+  base avant de le retenir (jusqu'à 10 tentatives, puis repli sur un
+  identifiant purement aléatoire en dernier recours théorique).
+- `api_send_message` ajoute une seconde ligne de défense : nouvelle
+  tentative automatique (jusqu'à 3 fois) si l'insertion échoue malgré
+  tout avec `IntegrityError`.
+
+**Testé réellement** : le scénario exact reproduit (5 envois, suppression
+du plus ancien, nouvel envoi) a d'abord confirmé l'erreur avec l'ancien
+code, puis confirmé `200 OK` avec le code corrigé — même scénario, pas
+seulement un test générique.
+
+### 19.2 🐛 Boutons 🌓 Thème / 🔒 Verrouillage / 🔄 Actualiser invisibles sur PC
+
+**Cause réelle trouvée dans `static/css/style.css`** :
+```css
+@media (min-width: 900px) { .topbar { display: none; } }
+```
+Au-delà de 900px de large (tout écran de bureau), le bandeau supérieur
+entier était masqué — sans qu'aucune alternative n'ait jamais été ajoutée
+dans la sidebar desktop. Les boutons fonctionnaient sur mobile
+uniquement parce que cette règle ne s'appliquait pas en dessous de
+900px.
+
+**Correctif** : repositionnement du bandeau en CSS Grid
+(`grid-template-areas`) pour qu'il reste visible, affiché en haut de la
+zone de contenu à côté de la sidebar, au lieu d'être cousu comme un
+simple frère flex qui rendait mal en largeur réduite. Aucun changement
+HTML ni JS — mêmes IDs, mêmes gestionnaires d'événements.
+
+**Validé** : CSS repassé au travers d'un parseur (`tinycss2`) — 0 erreur,
+accolades équilibrées.
+
+**Fichiers modifiés :** `app.py`, `static/css/style.css`. Aucune
+fonctionnalité antérieure retirée (Context Managers SQLite, mode WAL,
+`PRAGMA busy_timeout=5000` de la v2.8.1 confirmés intacts).
+
+---
+
+## 20. v2.8.3 — Photos prises à la caméra reçues "corrompues" (2026-09-17)
+
+### 20.1 Diagnostic — cause vérifiée, pas supposée
+
+**Hypothèse initiale de l'utilisateur** (à corriger côté Base64/Data-URL
+dans le backend) : vérifiée et écartée après audit réel du code. Le flux
+d'envoi de pièce jointe est un simple upload `multipart/form-data`
+classique — `request.files.get("file")`, lecture d'octets bruts,
+chiffrement Fernet direct sur ces octets. **Aucune étape Base64/Data-URL
+n'existe nulle part dans ce chemin côté frontend** ; le seul endroit où
+Base64 intervient est l'encodage nécessaire du Cloud Bridge vers l'API
+GitHub (`base64.b64encode` pur, sans en-tête `data:` à retirer). Corriger
+un problème d'en-tête Data-URL inexistant n'aurait rien réparé — cette
+piste n'a donc pas été implémentée.
+
+**Cause réelle identifiée** : les iPhones utilisant Safari capturent par
+défaut leurs photos en **HEIC** — un format d'image parfaitement valide,
+mais que l'application Photos de Windows ne peut pas ouvrir sans un
+codec supplémentaire (non installé par défaut), d'où le message
+"Nous ne pouvons pas ouvrir ce fichier" que l'utilisateur interprète
+comme une corruption. Les captures caméra Android sont presque toujours
+déjà en JPEG, donc ce problème concerne principalement les envois
+iPhone → PC.
+
+### 20.2 Correctifs appliqués
+
+1. **Frontend (`static/js/app.js`)** — nouvelle fonction
+   `normalizeImageForUpload()` : si le fichier sélectionné/déposé est
+   HEIC/HEIF (ou un type d'image non standard), il est redessiné sur un
+   `<canvas>` et ré-exporté en JPEG standard avant l'envoi. Les fichiers
+   non-image (docx, pdf, xlsx...) et les images déjà dans un format
+   standard (JPEG, PNG, WEBP, GIF) traversent sans aucune modification.
+   Si le navigateur lui-même ne peut pas décoder la source (certains
+   navigateurs non-Safari ne décodent pas non plus le HEIC), le fichier
+   original est envoyé tel quel plutôt que de perdre la pièce jointe.
+2. **Backend (`app.py`)** — nouvelle fonction `sniff_real_extension()` :
+   vérifie les octets réels du fichier (signature magique : JPEG, PNG,
+   GIF, WEBP, HEIC) et corrige l'extension du nom de fichier archivé/
+   affiché si elle ne correspond pas au contenu réel. Ce n'est PAS un
+   convertisseur de format (le serveur ne décode aucune image) — c'est un
+   filet de sécurité qui empêche un fichier mal étiqueté de porter un nom
+   qui ment sur son vrai format. Un envoi vide (0 octet) est désormais
+   rejeté explicitement au lieu d'être archivé silencieusement.
+
+### 20.3 Tests réels effectués
+
+- Un vrai JPEG correctement étiqueté → traverse sans changement.
+- Un fichier HEIC (signature `ftypheic` réelle) mais étiqueté `.jpg` par
+  le client → nom corrigé en `.heic` avant archivage.
+- Un envoi de 0 octet → rejeté avec `400` et message clair, au lieu
+  d'être archivé silencieusement.
+- Un `.docx` → nom de fichier inchangé, octets identiques bit à bit
+  après le cycle chiffrement/déchiffrement complet (aucune régression
+  introduite sur les fichiers non-image).
+- Syntaxe JS vérifiée (`node --check`), syntaxe Python vérifiée
+  (`py_compile`).
+
+**Fichiers modifiés :** `app.py`, `static/js/app.js`. Aucune
+fonctionnalité antérieure retirée (SQLite WAL/Context Managers de la
+v2.8.1 et correctifs tracking_number/CSS de la v2.8.2 confirmés
+intacts par re-vérification directe du code après ce changement).

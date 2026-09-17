@@ -703,6 +703,81 @@ function wireRowActions(container, onChanged) {
 // ------------------------------------------------------------------ //
 // Messaging
 // ------------------------------------------------------------------ //
+
+// v2.8.3: iPhones running Safari default their camera to HEIC — a
+// perfectly valid photo, but Windows' built-in Photos app can't open
+// it without an extra codec extension, which shows as "We can't open
+// this file" to someone who has no reason to know the format even
+// changed. Android camera captures are virtually always JPEG already,
+// so this mainly affects iPhone-to-Windows sends specifically.
+//
+// Fix: if the selected/dropped file is HEIC/HEIF (or an image type the
+// browser doesn't recognize as a standard displayable format), redraw
+// it onto a canvas and re-export as a normal JPEG before it's ever
+// attached to the send request. Non-image files (docx, pdf, xlsx...)
+// and images already in a standard format (JPEG, PNG, WEBP, GIF) pass
+// through completely untouched — this never re-encodes files that
+// don't need it, and never touches non-image attachments.
+//
+// If the browser itself can't decode the source image (some non-Safari
+// browsers can't decode HEIC either — canvas conversion depends on the
+// browser being able to display it as an <img> first), the ORIGINAL
+// file is sent unchanged rather than silently dropping the attachment.
+// That's no worse than before this fix, and Android/Chrome camera
+// captures were never HEIC to begin with, so this fallback path is
+// rarely hit in practice.
+const STANDARD_IMAGE_TYPES = new Set(["image/jpeg", "image/png", "image/webp", "image/gif"]);
+
+function looksLikeHeic(file) {
+  const type = (file.type || "").toLowerCase();
+  const name = (file.name || "").toLowerCase();
+  return type.includes("heic") || type.includes("heif") ||
+         name.endsWith(".heic") || name.endsWith(".heif");
+}
+
+function needsJpegNormalization(file) {
+  if (!file.type || !file.type.startsWith("image/")) {
+    // Non-image (docx, pdf, xlsx...) — leave untouched, UNLESS the
+    // filename itself still hints at HEIC/HEIF (some camera capture
+    // flows report an empty/generic MIME type for HEIC files).
+    return looksLikeHeic(file);
+  }
+  return looksLikeHeic(file) || !STANDARD_IMAGE_TYPES.has(file.type.toLowerCase());
+}
+
+async function normalizeImageForUpload(file) {
+  if (!needsJpegNormalization(file)) return file;
+
+  let objectUrl;
+  try {
+    objectUrl = URL.createObjectURL(file);
+    const img = await new Promise((resolve, reject) => {
+      const el = new Image();
+      el.onload = () => resolve(el);
+      el.onerror = () => reject(new Error("decode failed"));
+      el.src = objectUrl;
+    });
+
+    const canvas = document.createElement("canvas");
+    canvas.width = img.naturalWidth;
+    canvas.height = img.naturalHeight;
+    canvas.getContext("2d").drawImage(img, 0, 0);
+
+    const blob = await new Promise(resolve => canvas.toBlob(resolve, "image/jpeg", 0.92));
+    if (!blob) return file; // conversion produced nothing usable — fall back to original
+
+    const newName = (file.name || "photo").replace(/\.(heic|heif)$/i, "") + ".jpg";
+    return new File([blob], newName, { type: "image/jpeg" });
+  } catch (err) {
+    // Browser couldn't decode the source (e.g. HEIC on a non-Safari
+    // browser) — send the original file rather than lose the attachment.
+    console.warn("TASHIL: image normalization skipped —", err);
+    return file;
+  } finally {
+    if (objectUrl) URL.revokeObjectURL(objectUrl);
+  }
+}
+
 function resetMessagingForm() {
   state.selectedFile = null;
   const fileInput = document.getElementById("file-input");
@@ -736,19 +811,21 @@ function setupMessaging() {
   const fileInput = document.getElementById("file-input");
 
   dropZone.addEventListener("click", () => fileInput.click());
-  fileInput.addEventListener("change", () => {
+  fileInput.addEventListener("change", async () => {
     if (fileInput.files.length) {
-      state.selectedFile = fileInput.files[0];
+      document.getElementById("drop-zone-text").textContent = "📎 Préparation…";
+      state.selectedFile = await normalizeImageForUpload(fileInput.files[0]);
       document.getElementById("drop-zone-text").textContent = `📎 ${state.selectedFile.name}`;
     }
   });
   dropZone.addEventListener("dragover", e => { e.preventDefault(); dropZone.classList.add("dragover"); });
   dropZone.addEventListener("dragleave", () => dropZone.classList.remove("dragover"));
-  dropZone.addEventListener("drop", e => {
+  dropZone.addEventListener("drop", async e => {
     e.preventDefault();
     dropZone.classList.remove("dragover");
     if (e.dataTransfer.files.length) {
-      state.selectedFile = e.dataTransfer.files[0];
+      document.getElementById("drop-zone-text").textContent = "📎 Préparation…";
+      state.selectedFile = await normalizeImageForUpload(e.dataTransfer.files[0]);
       document.getElementById("drop-zone-text").textContent = `📎 ${state.selectedFile.name}`;
     }
   });
