@@ -294,10 +294,35 @@ label:first-child { margin-top: 0; }
 }
 
 /* ---------------- Responsive: desktop sidebar feel ---------------- */
+/*
+ * v2.8.2 fix: this block previously set `.topbar { display: none; }` on
+ * desktop — which hid the 🌓 theme toggle, 🔒 lock button, and 🔄 refresh
+ * button ENTIRELY above 900px width, with no equivalent control ever
+ * added anywhere else. That's why they worked on mobile (topbar visible,
+ * un-hidden below 900px) but vanished on any desktop-sized screen.
+ *
+ * Fix: keep .topbar in the DOM and visible, but reposition it with CSS
+ * Grid so it sits as a slim header above the content column, to the
+ * right of the sidebar, instead of stacking awkwardly to its left as a
+ * plain flex sibling (which is why it was hidden in the first place).
+ * No HTML or JS changes needed — same buttons, same IDs, same behavior.
+ */
 @media (min-width: 900px) {
-  .app { flex-direction: row; }
-  .topbar { display: none; }
+  .app {
+    display: grid;
+    grid-template-columns: 240px 1fr;
+    grid-template-rows: auto 1fr;
+    grid-template-areas:
+      "sidebar topbar"
+      "sidebar content";
+    min-height: 100vh;
+  }
+  .topbar {
+    grid-area: topbar;
+    display: flex; /* was: none — this is the actual fix */
+  }
   .tabbar {
+    grid-area: sidebar;
     flex-direction: column; width: 240px; min-height: 100vh;
     border-right: 1px solid var(--border); border-bottom: none;
     padding: 20px 12px; align-items: stretch;
@@ -307,5 +332,5 @@ label:first-child { margin-top: 0; }
     font-weight: 700; font-size: 20px; padding: 0 10px 20px;
   }
   .tab { justify-content: flex-start; padding: 12px 14px; }
-  .content { padding: 32px; max-width: 900px; }
+  .content { grid-area: content; padding: 32px; max-width: 900px; }
 }
