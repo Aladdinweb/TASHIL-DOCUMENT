@@ -628,6 +628,17 @@ function setupThemeToggle() {
 // ------------------------------------------------------------------ //
 // Dashboard
 // ------------------------------------------------------------------ //
+
+// v2.8.4: short one-line preview shown under the message title —
+// prefers the body text; falls back to the attached filename when the
+// body is empty (still gives the reader something concrete to scan).
+function messageExcerpt(row) {
+  const body = (row.body || "").trim();
+  if (body) return body.length > 60 ? body.slice(0, 60) + "…" : body;
+  if (row.file_original_name) return `📎 ${row.file_original_name}`;
+  return "—";
+}
+
 async function loadDashboard() {
   const data = await fetch("/api/dashboard").then(r => r.json());
   document.getElementById("stat-sent").textContent = data.total_sent;
@@ -640,11 +651,16 @@ async function loadDashboard() {
     container.innerHTML = `<p class="empty-state">Aucune activité pour le moment.</p>`;
     return;
   }
-  container.innerHTML = data.recent.map(row => `
+  container.innerHTML = data.recent.map(row => {
+    const institution = row.direction === "sortant"
+      ? (row.recipient_institution || "—")
+      : (row.sender_institution || "—");
+    return `
     <div class="list-row">
       <div class="list-row-main">
-        <span class="list-row-title">${row.direction === "sortant" ? "📤" : "📥"} ${escapeHtml(row.tracking_number)}</span>
-        <span class="list-row-sub">${escapeHtml(row.subject || "(sans objet)")}</span>
+        <span class="list-row-title">${row.direction === "sortant" ? "📤" : "📥"} ${escapeHtml(row.subject && row.subject.trim() ? row.subject : "Sans objet")}</span>
+        <span class="list-row-sub">${escapeHtml(institution)} — ${escapeHtml(messageExcerpt(row))}</span>
+        <span class="tracking-badge">${escapeHtml(row.tracking_number)}</span>
       </div>
       <span class="list-row-badge">${escapeHtml(row.status)}</span>
       <div class="list-row-actions">
@@ -652,7 +668,8 @@ async function loadDashboard() {
         <button class="row-btn danger" data-delete="${row.id}" data-scope="dashboard" title="Supprimer">🗑️</button>
       </div>
     </div>
-  `).join("");
+  `;
+  }).join("");
   wireRowActions(container, loadDashboard);
 }
 
@@ -909,8 +926,9 @@ async function loadInbox() {
   container.innerHTML = data.messages.map(row => `
     <div class="list-row">
       <div class="list-row-main">
-        <span class="list-row-title">📥 ${escapeHtml(row.tracking_number)} — ${escapeHtml(row.subject || "(sans objet)")}</span>
-        <span class="list-row-sub">De : ${escapeHtml(row.sender_institution || "—")}</span>
+        <span class="list-row-title">📥 ${escapeHtml(row.subject && row.subject.trim() ? row.subject : "Sans objet")}</span>
+        <span class="list-row-sub">De : ${escapeHtml(row.sender_institution || "—")} — ${escapeHtml(messageExcerpt(row))}</span>
+        <span class="tracking-badge">${escapeHtml(row.tracking_number)}</span>
       </div>
       <div class="list-row-actions">
         ${row.status === "accuse"
@@ -934,11 +952,14 @@ async function loadRegistre(filter) {
     container.innerHTML = `<p class="empty-state">Aucun enregistrement.</p>`;
     return;
   }
-  container.innerHTML = data.entries.map(row => `
+  container.innerHTML = data.entries.map(row => {
+    const institution = row.recipient_institution || row.sender_institution || "—";
+    return `
     <div class="list-row">
       <div class="list-row-main">
-        <span class="list-row-title">${row.direction === "sortant" ? "📤" : "📥"} ${escapeHtml(row.tracking_number)}</span>
-        <span class="list-row-sub">${escapeHtml(row.recipient_institution || row.sender_institution || "—")} — ${escapeHtml(row.subject || "(sans objet)")}</span>
+        <span class="list-row-title">${row.direction === "sortant" ? "📤" : "📥"} ${escapeHtml(row.subject && row.subject.trim() ? row.subject : "Sans objet")}</span>
+        <span class="list-row-sub">${escapeHtml(institution)} — ${escapeHtml(messageExcerpt(row))}</span>
+        <span class="tracking-badge">${escapeHtml(row.tracking_number)}</span>
       </div>
       <span class="list-row-badge">${row.created_at.slice(0, 16).replace("T", " ")}</span>
       <div class="list-row-actions">
@@ -946,7 +967,8 @@ async function loadRegistre(filter) {
         <button class="row-btn danger" data-delete="${row.id}" title="Supprimer">🗑️</button>
       </div>
     </div>
-  `).join("");
+  `;
+  }).join("");
   wireRowActions(container, () => loadRegistre(filter));
 }
 

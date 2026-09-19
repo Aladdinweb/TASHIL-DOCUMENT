@@ -47,19 +47,37 @@ certifi_datas, certifi_binaries, certifi_hiddenimports = collect_all('certifi')
 # _QR_DECODE_IMPORT_ERROR in app.py) instead of a dead-end "not available".
 pyzbar_datas, pyzbar_binaries, pyzbar_hiddenimports = collect_all('pyzbar')
 
+# pystray + plyer (v2.8.4 — optional system-tray icon, unread badge, and
+# toast notifications). Both wrapped in try/except at import time in
+# tray.py, so a packaging failure here degrades to "no tray" rather than
+# crashing the app — same safety net already proven necessary for every
+# other native-feeling dependency in this project (pywebview, pyzbar).
+# collect_all() still applies: pystray's Windows backend touches native
+# Win32 APIs, and plyer resolves its notification backend per-OS at
+# import time, both of which can have submodules plain hiddenimports miss.
+# ⚠️ Neither has been confirmed working in an actual built exe yet — see
+# the honesty note at the top of tray.py. If the tray fails silently on a
+# real build the way opencv once did, this collect_all() call is the
+# first thing to revisit.
+pystray_datas, pystray_binaries, pystray_hiddenimports = collect_all('pystray')
+plyer_datas, plyer_binaries, plyer_hiddenimports = collect_all('plyer')
+
 a = Analysis(
     ['desktop_launcher.py'],
     pathex=[],
     binaries=webview_binaries + qrcode_binaries + pil_binaries + crypto_binaries
-             + certifi_binaries + pyzbar_binaries,
+             + certifi_binaries + pyzbar_binaries + pystray_binaries + plyer_binaries,
     datas=[
         ('templates', 'templates'),
         ('static', 'static'),
         ('app.py', '.'),
-    ] + webview_datas + qrcode_datas + pil_datas + crypto_datas + certifi_datas + pyzbar_datas,
+        ('tray.py', '.'),
+    ] + webview_datas + qrcode_datas + pil_datas + crypto_datas + certifi_datas + pyzbar_datas
+      + pystray_datas + plyer_datas,
     hiddenimports=['flask', 'werkzeug', 'jinja2'] + webview_hiddenimports
                   + qrcode_hiddenimports + pil_hiddenimports + crypto_hiddenimports
-                  + certifi_hiddenimports + pyzbar_hiddenimports,
+                  + certifi_hiddenimports + pyzbar_hiddenimports
+                  + pystray_hiddenimports + plyer_hiddenimports,
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],

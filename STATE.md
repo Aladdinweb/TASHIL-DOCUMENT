@@ -1320,3 +1320,133 @@ iPhone → PC.
 fonctionnalité antérieure retirée (SQLite WAL/Context Managers de la
 v2.8.1 et correctifs tracking_number/CSS de la v2.8.2 confirmés
 intacts par re-vérification directe du code après ce changement).
+
+---
+
+## 21. v2.8.4 — Lisibilité des cartes de messages + System Tray Windows (2026-09-17)
+
+### 21.1 🎨 Refonte des cartes (Tableau de Bord, Boîte de réception, Registre)
+
+**Problème signalé** : le `tracking_number` (long, ex.
+`TASHIL-31EP-S-2026-000001-BD6C08`) s'affichait comme titre principal des
+cartes ; l'Objet et un aperçu du message n'étaient pas visibles
+directement.
+
+**Correctif** (frontend uniquement, `static/js/app.js` +
+`static/css/style.css`) :
+- **Titre** : l'Objet du message (`"Sans objet"` si vide).
+- **Sous-titre** : établissement expéditeur/destinataire + extrait —
+  le corps du message tronqué à 60 caractères, ou à défaut le nom du
+  fichier joint (`📎 nom_fichier`) si le corps est vide, ou `—` si aucun
+  des deux.
+- **Badge secondaire discret** : le `tracking_number` conservé, mais en
+  petit texte monospace atténué (`.tracking-badge`), sous le sous-titre.
+
+**Testé réellement** : logique de rendu exécutée directement en Node.js
+avec des données réalistes (objet vide + pièce jointe ; objet renseigné
++ corps long à tronquer) — sortie HTML inspectée, troncature à 60
+caractères confirmée, échappement HTML toujours actif. Syntaxe JS
+(`node --check`) et CSS (`tinycss2`) validées sans erreur.
+
+Aucun changement backend/API pour cette partie.
+
+### 21.2 🔔 Suivi des messages non lus (backend)
+
+Nouvelle colonne `is_read` sur la table `messages` (migration idempotente
+`ALTER TABLE`, valeur par défaut `1` = lu — donc toute ligne existante
+avant cette version reste inchangée ; seuls les nouveaux messages
+`entrant` insérés à partir de maintenant reçoivent explicitement
+`is_read=0`).
+
+- `GET /api/messages?direction=entrant` marque désormais automatiquement
+  tous les messages entrants non lus comme lus (effet de bord de la
+  consultation de la boîte de réception), via une connexion courte
+  séparée, ouverte après la lecture — même principe d'isolation des
+  écritures que depuis la v2.8.1.
+- Nouvelle route `GET /api/messages/unread-count` — retourne le nombre
+  de messages entrants non lus pour le profil actif. Aucune logique
+  spécifique à un OS ici ; c'est un simple compteur interrogeable par
+  n'importe quel client.
+
+**Testé réellement, cycle complet** via le client de test Flask : envoi
+d'un message avec livraison locale → `unread: 1` côté destinataire avant
+consultation → consultation de la boîte de réception → `unread: 0` →
+comportement `423` propre (pas de crash) quand le profil est verrouillé.
+
+### 21.3 🖥️ System Tray Windows — minimisation, badge, notifications (nouveau module `tray.py`)
+
+**Objectif** : garder l'application active dans la zone de notification
+Windows (à côté de l'horloge) à la fermeture de la fenêtre, avec un badge
+rouge du nombre de non-lus directement dessiné sur l'icône du tray, et
+une notification Windows native (toast) à la réception d'un nouveau
+message.
+
+**Conception** : nouveau module isolé `tray.py`, entièrement optionnel —
+`pystray` (icône + menu Afficher/Quitter) et `plyer` (notification toast
+cross-plateforme) sont importés avec `try/except`, exactement le même
+schéma défensif déjà utilisé pour `qrcode`, `cryptography`, `certifi` et
+`pyzbar` dans ce projet. Si l'un des deux manque, ou si n'importe quelle
+partie de `tray.py` lève une exception, l'application entière continue
+de fonctionner exactement comme en v2.8.3 : la fenêtre s'ouvre, et la
+fermer quitte normalement l'application (aucune régression possible sur
+la stabilité existante).
+
+`desktop_launcher.py` n'attache le gestionnaire "minimiser au lieu de
+fermer" QUE si le tray a réellement démarré avec succès
+(`tray_controller.available`) — sinon, aucun changement de comportement
+par rapport à v2.8.3.
+
+**⚠️ Note d'honnêteté impérative, à lire avant de considérer cette partie
+comme validée** : ce bac à sable de développement est un Linux headless,
+sans serveur d'affichage ni GTK — `pystray` lui-même échoue à l'import
+ici (`ValueError: Namespace Gtk not available`), ce qui est **spécifique
+à cet environnement de test**, pas au build Windows réel (qui utilise le
+backend natif `win32` de pystray, sans dépendance GTK). Cet échec a
+cependant permis de vérifier une chose utile : la dégradation gracieuse
+fonctionne bel et bien — `TrayController.available` passe à `False`
+et `run()`/`stop()` restent des no-op sûrs, sans jamais lever
+d'exception, testé explicitement.
+
+Ce qui a donc pu être vérifié réellement dans ce bac à sable :
+- ✅ La composition de l'image du badge (`draw_badge`, via Pillow pur,
+  indépendamment de `pystray`) — rendue et inspectée visuellement à
+  plusieurs tailles, y compris un downscale réel à 24×24px (taille
+  typique d'une icône de tray Windows). **Premier essai illisible** à
+  cette taille avec la police par défaut de Pillow → corrigé en utilisant
+  `ImageFont.load_default(size=...)` dimensionnée par rapport au badge —
+  lisible ensuite à 48px, tout juste discernable à 24px (limite physique
+  inhérente à la taille d'une icône de tray, pas un défaut du code).
+- ✅ `desktop_launcher._setup_tray()` et `TrayController` se dégradent
+  bien sans jamais planter quand `pystray`/`plyer` sont indisponibles
+  (testé avec une fausse fenêtre simulée).
+- ✅ Le compteur `/api/messages/unread-count` interrogé par le thread de
+  sondage du tray (voir section 21.2).
+
+Ce qui n'a **pas** pu être vérifié ici et reste à confirmer sur un vrai
+build Windows, comme cela a déjà été le cas pour pywebview/pyzbar/certifi
+dans l'historique de ce projet :
+- L'icône apparaît-elle réellement dans la zone de notification à côté
+  de l'horloge ?
+- Cliquer dessus restaure-t-il réellement la fenêtre ?
+- La notification toast s'affiche-t-elle réellement (le backend Windows
+  de `plyer` a ses propres dépendances, qui pourraient échouer à
+  l'empaquetage PyInstaller de la même façon qu'`opencv-python-headless`
+  ou `pywebview` l'ont fait par le passé dans ce projet) ?
+- Le rendu réel de l'icône par Windows (anti-aliasing, densité de
+  pixels) à la taille de tray effective.
+
+**Fichiers ajoutés :** `tray.py`. **Fichiers modifiés :**
+`desktop_launcher.py` (intégration tray optionnelle), `app.py` (colonne
+`is_read`, routes de suivi des non-lus), `static/js/app.js`,
+`static/css/style.css` (refonte des cartes), `requirements.txt` (+
+`pystray`, `plyer`), `tashil_web.spec` (+ `collect_all` pour ces deux
+nouvelles dépendances + `tray.py` ajouté aux données empaquetées).
+Aucune fonctionnalité antérieure retirée — SQLite WAL/Context Managers
+(v2.8.1), correctif `tracking_number` (v2.8.2), CSS desktop (v2.8.2),
+et normalisation HEIC/JPEG (v2.8.3) tous reconfirmés intacts.
+
+**Recommandation avant mise en production** : tester impérativement le
+system tray sur un vrai poste Windows avant de considérer cette partie
+aussi stable que le reste — contrairement aux corrections précédentes de
+ce fichier, celle-ci touche à des API natives Windows qui n'ont jamais pu
+être exercées dans l'environnement de développement.

@@ -6,4 +6,6 @@ Pillow==10.4.0
 cryptography==43.0.1
 certifi==2024.8.30
 pyzbar==0.1.9
+pystray==0.19.5
+plyer==2.1.0
 pyinstaller==6.10.0

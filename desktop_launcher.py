@@ -70,6 +70,14 @@ def _try_native_window(icon_path: str | None) -> bool:
     Attempts to show the app in a native pywebview window. Returns True if
     the window ran and closed normally, False if it could not start at all
     (caller should fall back to the browser in that case).
+
+    v2.8.4: also attempts to wire up the optional system-tray integration
+    (tray.py) — minimize-to-tray on close, unread badge, toast
+    notifications. This is entirely best-effort: if tray.py's own
+    dependencies (pystray, plyer) are missing or anything about the tray
+    setup fails, the window still opens and behaves EXACTLY like v2.8.3
+    (closing it exits the app normally). The tray is strictly additive;
+    it is never allowed to be a reason the window fails to open.
     """
     try:
         import webview
@@ -77,7 +85,7 @@ def _try_native_window(icon_path: str | None) -> bool:
         return False  # pywebview not available in this build — fall back silently
 
     try:
-        window_kwargs = dict(
+        window = webview.create_window(
             title="TASHIL DOCUMENT HUB",
             url=APP_URL,
             width=1180,
@@ -85,13 +93,78 @@ def _try_native_window(icon_path: str | None) -> bool:
             min_size=(980, 620),
             text_select=True,
         )
-        webview.create_window(**window_kwargs)
+
+        tray_controller = _setup_tray(window, icon_path)
+
+        if tray_controller is not None and tray_controller.available:
+            def handle_closing():
+                # Minimize to tray instead of exiting — ONLY reachable
+                # when the tray actually started successfully. If the
+                # tray isn't available, this handler is never attached
+                # at all (see below), so closing behaves exactly like
+                # v2.8.3: a real exit, since there'd be no way left to
+                # reopen a hidden window.
+                try:
+                    window.hide()
+                except Exception:
+                    pass
+                return False  # cancels the default close
+
+            window.events.closing += handle_closing
+            threading.Thread(target=tray_controller.run, daemon=True).start()
+
         webview.start(icon=icon_path) if icon_path else webview.start()
         return True
     except Exception:
         # WebView2 runtime missing, DLL bundling issue, etc. — don't crash,
         # let main() fall back to the browser instead.
         return False
+
+
+def _setup_tray(window, icon_path: str | None):
+    """
+    Builds the optional TrayController for this window. Returns None (or
+    a controller with .available == False) on ANY failure — pystray/plyer
+    missing, tray.py itself unavailable, an unreadable icon file, etc.
+    Callers must always check .available before relying on tray behavior.
+    """
+    try:
+        import tray as tray_module
+    except Exception:
+        return None
+
+    def poll_unread():
+        # Deliberately plain urllib (already a proven pattern in this
+        # project — see app.py's own GitHub client) rather than adding a
+        # new HTTP dependency just for this internal, localhost-only call.
+        import json
+        import urllib.request
+        try:
+            with urllib.request.urlopen(f"{APP_URL}api/messages/unread-count", timeout=3) as resp:
+                return json.loads(resp.read().decode("utf-8")).get("unread")
+        except Exception:
+            # Locked profile, server briefly busy, etc. — treated as "no
+            # new information this cycle", never as "zero unread" (which
+            # would wrongly clear a real badge).
+            return None
+
+    def show_window():
+        try:
+            window.show()
+            window.restore()
+        except Exception:
+            pass
+
+    def quit_app():
+        try:
+            window.destroy()
+        finally:
+            os._exit(0)
+
+    try:
+        return tray_module.TrayController(icon_path, show_window, quit_app, poll_unread)
+    except Exception:
+        return None
 
 
 def main():

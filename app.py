@@ -58,6 +58,44 @@ this codebase, so no fix was invented for it. Two real changes instead:
      name. A genuinely empty (0-byte) upload is now rejected outright
      with a clear error instead of silently archived.
 
+v2.8.4 — Message card readability + optional Windows system-tray
+integration:
+  1. Dashboard/Inbox/Registre cards previously showed the long
+     tracking_number as the title, with the subject barely visible. The
+     title is now the subject ("Sans objet" when empty), the subtitle
+     shows the institution plus a short excerpt (message body, or the
+     attached filename when the body is empty), and the tracking number
+     is now a small monospace badge, kept for reference but no longer
+     the headline. Frontend-only change (static/js/app.js,
+     static/css/style.css) — no backend/API changes.
+  2. A new is_read column tracks unread received messages (default 1 =
+     read, so every pre-existing row stays unaffected; new entrant
+     messages are inserted with is_read=0). Opening the inbox
+     (GET /api/messages?direction=entrant) marks them read as a side
+     effect. A new GET /api/messages/unread-count endpoint exposes the
+     current unread count — this part has no OS-specific code and was
+     tested end to end with the Flask test client.
+  3. tray.py (new, fully optional module) + desktop_launcher.py: minimize
+     -to-tray instead of exiting when the window is closed, a red
+     unread-count badge drawn directly onto the tray icon (Pillow), and
+     a toast notification (via plyer) when new messages arrive while the
+     window is hidden. Every piece degrades to a complete no-op if
+     pystray/plyer are unavailable or anything in tray.py raises — with
+     or without a working tray, the window opens and closing it behaves
+     at minimum exactly like v2.8.3.
+     ⚠️ HONESTY NOTE: this sandbox has no Windows GUI and no display
+     server pystray's own backends need even to import cleanly — the
+     badge image COMPOSITION was rendered and visually verified with
+     Pillow directly (including at a real 24×24px tray-icon size, which
+     is why the badge font was resized after the first attempt proved
+     illegible that small), and the unread-count endpoint was verified
+     against the real database — but the actual on-screen tray behavior
+     (does the icon appear next to the clock, does clicking it restore
+     the window, does the toast actually pop up) has NOT been confirmed
+     here and needs a real test on the Windows build, the same way
+     pywebview/pyzbar/certifi each needed one real-device test in this
+     project's history before being trusted.
+
 ⚠️ Security honesty note: the PIN is a lock-screen deterrent against
 casual/physical snooping on a shared device (hashed with werkzeug's
 salted hash, never stored in plaintext) — it is NOT full-disk or
@@ -146,7 +184,7 @@ _LEGACY_ARCHIVE_ENTRANT = os.path.join(BASE_DIR, "archives", "Courrier_Entrant")
 os.makedirs(PROFILES_DIR, exist_ok=True)
 
 APP_ROOT = os.path.dirname(os.path.abspath(__file__))
-APP_VERSION = "2.8.3"
+APP_VERSION = "2.8.4"
 GITHUB_REPO = "Aladdinweb/TASHIL-ES"  # used by the in-app OTA update checker
 
 app = Flask(__name__,
@@ -484,6 +522,14 @@ def get_profile_db(institution_key: str) -> sqlite3.Connection:
     existing_cols = [r[1] for r in conn.execute("PRAGMA table_info(messages)").fetchall()]
     if "delivery_method" not in existing_cols:
         conn.execute("ALTER TABLE messages ADD COLUMN delivery_method TEXT")
+    # v2.8.4: unread tracking for the desktop system-tray badge/toast
+    # notification feature (see desktop_launcher.py). Default 1 ("read")
+    # so every EXISTING row — sent or received, before this column
+    # existed — is treated as already seen; only newly-inserted entrant
+    # messages from this version onward are explicitly written with
+    # is_read=0, which is what actually drives the unread count.
+    if "is_read" not in existing_cols:
+        conn.execute("ALTER TABLE messages ADD COLUMN is_read INTEGER DEFAULT 1")
     conn.execute("""
         CREATE TABLE IF NOT EXISTS bridge_pending_cleanup (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1182,7 +1228,37 @@ def api_list_messages():
             (direction,)
         ).fetchall()
         rows = [decrypt_message_row(r) for r in rows]
+
+    # v2.8.4: consulting the inbox marks its unread entrant messages as
+    # read — this is what actually clears the desktop system-tray badge
+    # counter (see /api/messages/unread-count and desktop_launcher.py).
+    # Deliberately a SEPARATE short connection, opened only after the
+    # read-only SELECT above has already closed — same "never hold a
+    # connection open longer than one clear step" pattern as the rest of
+    # this file since the v2.8.1 SQLite fix.
+    if direction == "entrant":
+        with profile_db(_active_key) as conn:
+            conn.execute("UPDATE messages SET is_read = 1 WHERE direction = 'entrant' AND is_read = 0")
+
     return jsonify({"messages": rows})
+
+
+@app.route("/api/messages/unread-count", methods=["GET"])
+def api_unread_count():
+    """
+    v2.8.4: how many received messages the active profile hasn't opened
+    the inbox to see yet. Polled by desktop_launcher.py's background
+    thread to drive the Windows system-tray badge and toast
+    notifications — this endpoint itself has no OS-specific code in it,
+    it's a plain count any client could poll.
+    """
+    if _active_key is None:
+        return locked_response()
+    with profile_db(_active_key, commit=False) as conn:
+        count = conn.execute(
+            "SELECT COUNT(*) c FROM messages WHERE direction = 'entrant' AND is_read = 0"
+        ).fetchone()["c"]
+    return jsonify({"unread": count})
 
 
 @app.route("/api/messages/send", methods=["POST"])
@@ -1300,8 +1376,8 @@ def api_send_message():
                     recipient_conn.execute("""
                         INSERT INTO messages (direction, tracking_number, sender_institution,
                                                recipient_institution, subject, body, file_path,
-                                               file_original_name, status, delivery_method, created_at)
-                        VALUES ('entrant', ?, ?, ?, ?, ?, ?, ?, 'envoye', 'local', ?)
+                                               file_original_name, status, delivery_method, is_read, created_at)
+                        VALUES ('entrant', ?, ?, ?, ?, ?, ?, ?, 'envoye', 'local', 0, ?)
                     """, (recipient_tracking, sender, recipient, subject, body,
                           recipient_archived_path, original_filename, datetime.now().isoformat()))
             except sqlite3.IntegrityError:
@@ -1312,8 +1388,8 @@ def api_send_message():
                     recipient_conn.execute("""
                         INSERT INTO messages (direction, tracking_number, sender_institution,
                                                recipient_institution, subject, body, file_path,
-                                               file_original_name, status, delivery_method, created_at)
-                        VALUES ('entrant', ?, ?, ?, ?, ?, ?, ?, 'envoye', 'local', ?)
+                                               file_original_name, status, delivery_method, is_read, created_at)
+                        VALUES ('entrant', ?, ?, ?, ?, ?, ?, ?, 'envoye', 'local', 0, ?)
                     """, (recipient_tracking, sender, recipient, subject, body,
                           recipient_archived_path, original_filename, datetime.now().isoformat()))
             delivered_locally = True
@@ -1987,8 +2063,8 @@ def api_bridge_poll():
             conn.execute("""
                 INSERT INTO messages (direction, tracking_number, sender_institution,
                                        recipient_institution, subject, body, file_path,
-                                       file_original_name, status, delivery_method, created_at)
-                VALUES ('entrant', ?, ?, ?, ?, ?, ?, ?, 'envoye', 'bridge', ?)
+                                       file_original_name, status, delivery_method, is_read, created_at)
+                VALUES ('entrant', ?, ?, ?, ?, ?, ?, ?, 'envoye', 'bridge', 0, ?)
             """, (meta["tracking_number"], meta.get("sender_institution", "?"),
                   meta.get("recipient_institution", profile["institution_name"]),
                   encrypt_text(meta.get("subject", "")), encrypt_text(meta.get("body", "")),
