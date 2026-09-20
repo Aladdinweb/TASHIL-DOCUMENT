@@ -1719,3 +1719,39 @@ complète ci-dessus.
 script d'export en production, et traiter la limite de la section 22.9
 avant de compter sur les accusés de réception pour des institutions
 multi-rôles.
+
+---
+
+## 23. v2.8.5.1 — Correctif registre : EPH/CHU/Polyclinique manquants (2026-09-20)
+
+**Signalé en production** : un poste onboardé sous
+`POLYCLINIQUE AADL AIN BEIDA MABROUK LOUCIF` (SECRETARIAT) n'avait
+aucune entrée dans le registre national — bloqué sans clé de
+récupération possible.
+
+**Cause réelle** : `tools/generate_serial_registry.py` (v2.8.5) ne
+couvrait que DSP et EPSP, exactement le périmètre demandé à l'origine —
+mais Polyclinique, EPH et CHU sont des types d'établissement réels et
+onboardables (`INSTITUTION_TYPES`), tout aussi susceptibles d'un PIN
+oublié.
+
+**Correctif** : le script couvre maintenant l'intégralité des types —
+DSP, EPSP, EPH, CHU (wilayas concernées uniquement), Polyclinique
+générique par wilaya, **et les 7 vraies polycliniques d'Oran nommément**
+(`_REAL_ESSENIA_POLYCLINICS`), puisque ce sont celles réellement
+onboardées en pratique. 348 → **482 entrées**, vérifié par calcul exact
+(58×2 + 58×4 + 58×1 + 11×1 + 58×1 + 7×1 = 482).
+
+**Testé réellement** : registre régénéré, entrée
+`POLYCLINIQUE AADL AIN BEIDA MABROUK LOUCIF — SECRETARIAT` confirmée
+présente avec sa clé série.
+
+⚠️ **Rappel non résolu par ce correctif** : la clé générée n'est valable
+que si `TASHIL_HMAC_SECRET` était identique au moment de l'onboarding
+réel de ce poste et au moment de l'export. Si le poste a été onboardé
+après configuration d'un secret personnalisé, il faut relancer l'export
+avec ce même secret.
+
+**Fichiers modifiés :** `tools/generate_serial_registry.py` uniquement.
+Aucun changement à `app.py` — ce correctif touche seulement l'outil
+d'export, pas l'application elle-même.

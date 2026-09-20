@@ -4,9 +4,18 @@ TASHIL DOCUMENT HUB — tools/generate_serial_registry.py
 Copyright ILINE TECH 2026 BY FERAK ALADDIN
 
 v2.8.5 — Generates the national ILINE TECH reference registry of every
-institution's recovery serial_key: all 58 DSP (2 roles each: DIRECTEUR,
-SECRETARIAT) and one representative EPSP per wilaya (4 roles each:
-DIRECTEUR, DRH, DAS, SECRETARIAT) — 58×2 + 58×4 = 348 entries total.
+institution's recovery serial_key.
+
+⚠️ v2.8.5.1 fix: the first version of this script covered ONLY DSP and
+EPSP — a real gap found in production, since Polycliniques, EPH, and
+CHU are also real, onboardable institution types (SECRETARIAT-only) with
+no way to recover a forgotten PIN if they're missing from this registry.
+Now covers every type in app.py's INSTITUTION_TYPES: DSP (2 roles),
+EPSP (4 roles), EPH and generic Polyclinique (1 role each, per wilaya),
+CHU (1 role, only for wilayas that have one), PLUS every REAL, specif-
+ically-named Oran polyclinic (app.py's _REAL_ESSENIA_POLYCLINICS) under
+its own name — since those are the ones actually onboarded in practice,
+not the generic "Polyclinique <Wilaya>" placeholder.
 
 ⚠️⚠️⚠️ READ BEFORE RUNNING — THIS FILE'S OUTPUT IS SENSITIVE ⚠️⚠️⚠️
 
@@ -113,6 +122,55 @@ def build_registry_rows():
                 "role": role,
                 "serial_key": tashil_app.generate_serial_key(wilaya_code, "EPSP", epsp_name, role),
             })
+
+        # v2.8.5.1 fix — gap found in production: EPH, CHU, and
+        # Polyclinique were MISSING from this registry entirely. They
+        # are SECRETARIAT-only (allowed_roles() returns exactly one
+        # role for them), but they are real, onboardable institution
+        # types in app.py's own INSTITUTION_TYPES and directory — an
+        # onboarded Polyclinique with no registry entry has no way to
+        # recover a forgotten PIN. This mirrors app.py's own
+        # _build_institutions_directory() so the registry's coverage
+        # matches what the app itself actually lets someone onboard.
+        eph_name = f"EPH {wilaya_name}"
+        for role in tashil_app.allowed_roles("EPH"):
+            rows.append({
+                "wilaya_code": wilaya_code, "wilaya_name": wilaya_name,
+                "institution_type": "EPH", "institution_name": eph_name, "role": role,
+                "serial_key": tashil_app.generate_serial_key(wilaya_code, "EPH", eph_name, role),
+            })
+
+        if wilaya_name in tashil_app._CHU_WILAYAS:
+            chu_name = f"CHU {wilaya_name}"
+            for role in tashil_app.allowed_roles("CHU"):
+                rows.append({
+                    "wilaya_code": wilaya_code, "wilaya_name": wilaya_name,
+                    "institution_type": "CHU", "institution_name": chu_name, "role": role,
+                    "serial_key": tashil_app.generate_serial_key(wilaya_code, "CHU", chu_name, role),
+                })
+
+        # Generic "Polyclinique <Wilaya>" placeholder — same convention
+        # as EPSP above — PLUS every REAL, specifically-named Oran
+        # polyclinic (the only wilaya with real names on file in
+        # app.py's _REAL_ESSENIA_POLYCLINICS), since those are the ones
+        # actually being onboarded in practice, under their real names,
+        # not the generic placeholder.
+        poly_name = f"Polyclinique {wilaya_name}"
+        for role in tashil_app.allowed_roles("Polyclinique"):
+            rows.append({
+                "wilaya_code": wilaya_code, "wilaya_name": wilaya_name,
+                "institution_type": "Polyclinique", "institution_name": poly_name, "role": role,
+                "serial_key": tashil_app.generate_serial_key(wilaya_code, "Polyclinique", poly_name, role),
+            })
+
+        if wilaya_code == 31:  # Oran — the only wilaya with real named polyclinics on file
+            for real_name in tashil_app._REAL_ESSENIA_POLYCLINICS:
+                for role in tashil_app.allowed_roles("Polyclinique"):
+                    rows.append({
+                        "wilaya_code": wilaya_code, "wilaya_name": wilaya_name,
+                        "institution_type": "Polyclinique", "institution_name": real_name, "role": role,
+                        "serial_key": tashil_app.generate_serial_key(wilaya_code, "Polyclinique", real_name, role),
+                    })
     return rows
 
 
@@ -122,7 +180,8 @@ def write_markdown(rows, path):
         "",
         f"**Généré le :** {datetime.now().strftime('%Y-%m-%d %H:%M')}",
         f"**Nombre d'entrées :** {len(rows)} "
-        f"({len(tashil_app.WILAYAS)} wilayas × (2 rôles DSP + 4 rôles EPSP))",
+        f"(DSP, EPSP, EPH, CHU, Polyclinique — génériques par wilaya + "
+        f"7 polycliniques d'Oran nommément)",
         "",
         "⚠️ Voir l'en-tête de `generate_serial_registry.py` pour les "
         "consignes de sécurité complètes avant toute diffusion de ce fichier.",
