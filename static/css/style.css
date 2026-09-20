@@ -84,6 +84,10 @@ textarea { resize: vertical; }
   background: transparent; color: var(--text); border: 1px solid var(--border);
 }
 .btn-secondary:hover { border-color: var(--primary); color: var(--primary); }
+.btn-link {
+  background: none; border: none; color: var(--primary); text-decoration: underline;
+  font-size: 13px; cursor: pointer; padding: 6px 0; display: block; margin: 4px auto 0;
+}
 .small-note { font-size: 12px; margin: 6px 0 0; }
 
 .pin-input {

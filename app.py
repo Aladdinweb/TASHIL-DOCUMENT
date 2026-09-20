@@ -96,6 +96,21 @@ integration:
      pywebview/pyzbar/certifi each needed one real-device test in this
      project's history before being trusted.
 
+v2.8.5 — National DSP coverage (58 wilayas), an institutional role
+hierarchy (DIRECTEUR/DRH/DAS/SECRETARIAT for EPSP and DSP, SECRETARIAT-
+only everywhere else, enforced server-side not just in the UI),
+automatic hardware pairing, and serial_key-based recovery — replacing an
+earlier proposal for a single shared "admin master key" that was
+refused: a universal backdoor key baked into a publicly-distributed .exe
+is exactly the concentration-of-risk problem this project already
+refused once for the Cloud Bridge token (see v2.5.0, section 13.1),
+worse here since it would touch confidential director/HR/social-affairs
+mail nationwide. See STATE.md v2.8.5 for the full writeup, including a
+real bug caught during testing (a misplaced decorator meant the hardware
+pairing check silently never ran until fixed) and honestly-documented
+known limitations (read-receipt routing doesn't yet know a sender's
+specific role, only their institution name).
+
 ⚠️ Security honesty note: the PIN is a lock-screen deterrent against
 casual/physical snooping on a shared device (hashed with werkzeug's
 salted hash, never stored in plaintext) — it is NOT full-disk or
@@ -125,6 +140,8 @@ import hashlib
 import hmac
 import base64
 import uuid
+import platform
+import subprocess
 from io import BytesIO
 from datetime import datetime
 from contextlib import contextmanager
@@ -184,7 +201,7 @@ _LEGACY_ARCHIVE_ENTRANT = os.path.join(BASE_DIR, "archives", "Courrier_Entrant")
 os.makedirs(PROFILES_DIR, exist_ok=True)
 
 APP_ROOT = os.path.dirname(os.path.abspath(__file__))
-APP_VERSION = "2.8.4"
+APP_VERSION = "2.8.5"
 GITHUB_REPO = "Aladdinweb/TASHIL-ES"  # used by the in-app OTA update checker
 
 app = Flask(__name__,
@@ -226,8 +243,29 @@ def handle_unexpected_error(e):
         return jsonify({"error": f"Erreur interne du serveur : {e}"}), 500
     raise e
 
-INSTITUTION_TYPES = ["EPSP", "EPH", "CHU", "EHU", "Polyclinique"]
-_TYPE_CODES = {"EPSP": "EP", "EPH": "EH", "CHU": "CU", "EHU": "HU", "Polyclinique": "PC"}
+INSTITUTION_TYPES = ["DSP", "EPSP", "EPH", "CHU", "EHU", "Polyclinique"]
+_TYPE_CODES = {"DSP": "DS", "EPSP": "EP", "EPH": "EH", "CHU": "CU", "EHU": "HU", "Polyclinique": "PC"}
+
+# v2.8.5: institutional role hierarchy. A DSP or an EPSP has several
+# real distinct services that each need their own isolated inbox
+# (DIRECTEUR sees confidential mail, DRH sees personnel matters, etc.) —
+# every other structure type (EPH, CHU, EHU, Polyclinique) has a single
+# SECRETARIAT role, no exceptions. ROLE_RULES is the single source of
+# truth for both the onboarding form (role choice, or auto-locked when
+# there's only one) and the send form's service selector.
+ROLE_RULES = {
+    "DSP": ["DIRECTEUR", "SECRETARIAT"],
+    "EPSP": ["DIRECTEUR", "DRH", "DAS", "SECRETARIAT"],
+}
+DEFAULT_ROLE = "SECRETARIAT"
+
+
+def allowed_roles(institution_type: str) -> list:
+    """Every structure type not explicitly listed in ROLE_RULES (EPH,
+    CHU, EHU, Polyclinique) gets exactly one role: SECRETARIAT — by
+    design, not omission, per the v2.8.5 role hierarchy."""
+    return ROLE_RULES.get(institution_type, [DEFAULT_ROLE])
+
 WILAYAS = [
     (1, "Adrar"), (2, "Chlef"), (3, "Laghouat"), (4, "Oum El Bouaghi"),
     (5, "Batna"), (6, "Béjaïa"), (7, "Biskra"), (8, "Béchar"),
@@ -269,6 +307,7 @@ _CHU_WILAYAS = {"Alger", "Oran", "Constantine", "Annaba", "Tlemcen", "Sétif",
 def _build_institutions_directory():
     entries = list(_REAL_ESSENIA_POLYCLINICS)
     for _, wilaya_name in WILAYAS:
+        entries.append(f"DSP {wilaya_name}")  # v2.8.5: one DSP per wilaya, all 58 covered
         entries.append(f"EPSP {wilaya_name}")
         entries.append(f"EPH {wilaya_name}")
         entries.append(f"Polyclinique {wilaya_name}")
@@ -391,6 +430,22 @@ def init_registry_db():
         existing_cols = [r[1] for r in conn.execute("PRAGMA table_info(profiles)").fetchall()]
         if "encryption_salt" not in existing_cols:
             conn.execute("ALTER TABLE profiles ADD COLUMN encryption_salt TEXT")
+        # v2.8.5: role hierarchy (DIRECTEUR/DRH/DAS/SECRETARIAT for
+        # EPSP, DIRECTEUR/SECRETARIAT for DSP, SECRETARIAT-only for
+        # everything else) and hardware pairing. DEFAULT 'SECRETARIAT'
+        # means every profile created before this version — which had
+        # no concept of roles — is treated as a plain secretariat inbox,
+        # exactly matching its prior behavior (nothing was filtered by
+        # role before, so nothing changes for it now). Re-running this
+        # ALTER on an already-migrated database is a silent no-op thanks
+        # to the "not in existing_cols" guard, same pattern as every
+        # other migration in this function.
+        if "role" not in existing_cols:
+            conn.execute(f"ALTER TABLE profiles ADD COLUMN role TEXT DEFAULT '{DEFAULT_ROLE}'")
+        # NULL until the first successful unlock on a given machine —
+        # see get_hardware_fingerprint() and api_session_unlock().
+        if "paired_hardware_hash" not in existing_cols:
+            conn.execute("ALTER TABLE profiles ADD COLUMN paired_hardware_hash TEXT")
 
 
 init_registry_db()
@@ -438,10 +493,17 @@ def sniff_real_extension(file_bytes: bytes, fallback_ext: str) -> str:
     return fallback_ext
 
 
-def make_institution_key(wilaya_code: int, institution_type: str, institution_name: str) -> str:
+def make_institution_key(wilaya_code: int, institution_type: str, institution_name: str, role: str) -> str:
+    """
+    v2.8.5: now incorporates the ROLE, not just the institution — each
+    (institution, role) pair is a fully separate profile/poste with its
+    own isolated inbox, so the DRH and DIRECTEUR of the same EPSP are
+    two distinct keys, never sharing a database.
+    """
     type_code = _TYPE_CODES.get(institution_type, "XX")
     slug = re.sub(r'[^A-Za-z0-9]+', '_', institution_name.strip().upper()).strip('_')
-    base_key = f"{wilaya_code:02d}_{type_code}_{slug}"[:80]
+    role_slug = re.sub(r'[^A-Za-z0-9]+', '_', role.strip().upper()).strip('_') or DEFAULT_ROLE
+    base_key = f"{wilaya_code:02d}_{type_code}_{slug}_{role_slug}"[:90]
 
     with registry_db(commit=False) as conn:
         key = base_key
@@ -452,11 +514,47 @@ def make_institution_key(wilaya_code: int, institution_type: str, institution_na
     return key
 
 
-def generate_serial_key(wilaya_code, institution_type, institution_name) -> str:
-    secret = b"ILINE-TECH-2026-FERAK-ALADDIN-TASHIL-DOCUMENT-HUB"
+# v2.8.5: this secret used to be hardcoded here — fine as long as this
+# file stayed private, but app.py lives in a PUBLIC GitHub repository.
+# Anyone reading the source could already recompute any institution's
+# serial key, since wilaya codes, type codes, and institution-naming
+# conventions are ALSO all in this same public file. Moving the secret
+# to an environment variable doesn't retroactively protect any key
+# already issued with the old hardcoded value (see the honesty note in
+# generate_serial_key below), but it means a real, private secret set
+# at deployment time actually protects every key issued from here on.
+# The fallback below exists ONLY so a fresh install still works before
+# anyone has configured a real secret — it must be overridden via the
+# TASHIL_HMAC_SECRET environment variable for any real deployment.
+_DEFAULT_INSECURE_SECRET = b"ILINE-TECH-2026-FERAK-ALADDIN-TASHIL-DOCUMENT-HUB"
+
+
+def _hmac_secret() -> bytes:
+    env_value = os.environ.get("TASHIL_HMAC_SECRET")
+    return env_value.encode("utf-8") if env_value else _DEFAULT_INSECURE_SECRET
+
+
+def generate_serial_key(wilaya_code, institution_type, institution_name, role: str = DEFAULT_ROLE) -> str:
+    """
+    v2.8.5: made fully deterministic (the previous version mixed in
+    today's date, which was fine when the key was only ever generated
+    once at real onboarding and stored — but is incompatible with
+    PRE-generating a national reference registry ahead of time, per
+    tools/generate_serial_registry.py: the central export and the real
+    onboarding on the institution's own machine, possibly months apart,
+    must compute the exact same value. Role is now part of the input so
+    the DRH and DIRECTEUR of the same EPSP get different keys, matching
+    make_institution_key.
+
+    ⚠️ Verification never recomputes this — api_session_recover compares
+    a submitted key against the STORED profiles.serial_key column, so
+    rotating TASHIL_HMAC_SECRET is always safe for already-issued keys;
+    it only changes what gets generated for NEW institutions from then on.
+    """
+    secret = _hmac_secret()
     type_code = _TYPE_CODES.get(institution_type, "XX")
-    salt = datetime.now().strftime("%Y%m%d")
-    payload = f"{wilaya_code:02d}|{type_code}|{institution_name.upper()}|{salt}"
+    role_norm = (role or DEFAULT_ROLE).strip().upper()
+    payload = f"{wilaya_code:02d}|{type_code}|{institution_name.strip().upper()}|{role_norm}"
     digest = hmac.new(secret, payload.encode("utf-8"), hashlib.sha256).digest()
     body_hex = digest.hex()[:4].upper()
     checksum = base64.b32encode(digest[:3]).decode("utf-8")[:4]
@@ -596,28 +694,44 @@ def next_tracking_number(conn, direction: str, institution_key: str) -> str:
     return f"TASHIL-{short}-{prefix}-{year}-{uuid.uuid4().hex[:12].upper()}"
 
 
-def find_local_profile_by_recipient(recipient_text: str, exclude_key: str = None):
+def find_local_profile_by_recipient(recipient_text: str, recipient_role: str = None, exclude_key: str = None):
     """
-    Looks for another profile registered on THIS device matching the given
-    recipient string — either an exact institution ID/key (e.g.
-    '31_EP_EPSP_ES_SENIA', shown to each institution as its "ID de routage"
-    in Paramètres) or a plain institution name (case/whitespace-insensitive).
-    Matching by ID first lets two institutions communicate unambiguously
-    even if names collide; name matching remains the friendly default.
+    Looks for another profile registered on THIS device matching the
+    given recipient. Three ways to match, tried in order:
+      1. An exact institution ID/key (e.g. '31_EP_EPSP_ES_SENIA_DRH',
+         shown to each poste as its "ID de routage" in Paramètres) —
+         unambiguous by construction, works regardless of role.
+      2. institution_name + role together (v2.8.5) — REQUIRED now that
+         a single institution can have several role-specific profiles
+         (DIRECTEUR, DRH, DAS, SECRETARIAT for an EPSP/DSP); matching by
+         name alone would be ambiguous and could deliver to the wrong
+         service. recipient_role defaults to SECRETARIAT when omitted,
+         matching "si non spécifié, orienté vers le SECRETARIAT".
+      3. institution_name alone, ONLY when recipient_role is not given
+         AND exactly one profile with that name exists locally — a
+         narrow backward-compatible path for pre-v2.8.5 senders/data
+         that never specified a service.
     Returns None if no match — this does NOT reach across a network to a
     different computer; see the honesty note in api_send_message().
     """
+    role_norm = (recipient_role or DEFAULT_ROLE).strip().upper()
     with registry_db(commit=False) as conn:
-        rows = conn.execute("SELECT * FROM profiles").fetchall()
+        rows = [dict(r) for r in conn.execute("SELECT * FROM profiles").fetchall()]
+    rows = [r for r in rows if r["institution_key"] != exclude_key]
+
     target_key = recipient_text.strip()
     target_name = recipient_text.strip().casefold()
+
     for row in rows:
-        if row["institution_key"] == exclude_key:
-            continue
         if row["institution_key"] == target_key:
-            return dict(row)
-        if row["institution_name"].strip().casefold() == target_name:
-            return dict(row)
+            return row
+
+    name_matches = [r for r in rows if r["institution_name"].strip().casefold() == target_name]
+    role_matches = [r for r in name_matches if (r.get("role") or DEFAULT_ROLE).strip().upper() == role_norm]
+    if role_matches:
+        return role_matches[0]
+    if recipient_role is None and len(name_matches) == 1:
+        return name_matches[0]
     return None
 
 
@@ -690,23 +804,31 @@ def get_bridge_config():
     return dict(row) if row else None
 
 
-def bridge_slug(institution_name: str) -> str:
+def bridge_slug(institution_name: str, role: str = None) -> str:
     """
-    Normalizes an institution name into a stable Cloud Bridge address.
-    ⚠️ Name-only, no wilaya/type disambiguation — two different real
-    institutions that happen to share an identical name would collide on
-    the same bridge folder. Same limitation as local delivery matching
-    (find_local_profile_by_name) for consistency; worth revisiting if the
-    recipient picker ever becomes a structured Wilaya+Type+Name selection
-    instead of free text.
+    Normalizes an institution (+ optional role) into a stable Cloud
+    Bridge address. v2.8.5: a role suffix is appended ONLY when it's
+    something other than SECRETARIAT — this keeps every pre-v2.8.5
+    address (every institution was implicitly SECRETARIAT-only back
+    then) byte-for-byte unchanged, so existing Cloud Bridge folders and
+    in-flight messages keep resolving correctly. Only the NEW
+    DIRECTEUR/DRH/DAS roles get a distinct address, because they didn't
+    exist before this version.
+    ⚠️ Still name-only for anything else — two institutions sharing both
+    name and role would still collide, same pre-existing limitation as
+    local delivery matching.
     """
-    return re.sub(r'[^A-Za-z0-9]+', '_', institution_name.strip().upper()).strip('_')[:80]
+    base = re.sub(r'[^A-Za-z0-9]+', '_', institution_name.strip().upper()).strip('_')
+    role_norm = (role or DEFAULT_ROLE).strip().upper()
+    if role_norm != DEFAULT_ROLE:
+        base = f"{base}_{role_norm}"
+    return base[:80]
 
 
-def push_to_bridge(cfg: dict, recipient_name: str, sender_name: str, subject: str,
+def push_to_bridge(cfg: dict, recipient_name: str, recipient_role: str, sender_name: str, subject: str,
                     body: str, tracking: str, file_bytes: bytes, original_filename: str) -> bool:
     owner, repo, token = cfg["github_owner"], cfg["github_repo"], cfg["github_token"]
-    key = bridge_slug(recipient_name)
+    key = bridge_slug(recipient_name, recipient_role)
 
     file_ext = os.path.splitext(original_filename)[1]
     attachment_repo_path = f"bridge/{key}/{tracking}{file_ext}"
@@ -716,6 +838,7 @@ def push_to_bridge(cfg: dict, recipient_name: str, sender_name: str, subject: st
         "tracking_number": tracking,
         "sender_institution": sender_name,
         "recipient_institution": recipient_name,
+        "recipient_role": recipient_role,
         "subject": subject,
         "body": body,
         "file_original_name": original_filename,
@@ -792,11 +915,7 @@ def migrate_legacy_single_tenant_if_needed():
     serial_key = legacy_profile["serial_key"]
     theme = legacy_profile["theme"] if "theme" in legacy_profile.keys() else "dark"
 
-    key = make_institution_key(wilaya_code, institution_type, institution_name)
-    paths = profile_paths(key)
-    os.makedirs(paths["folder"], exist_ok=True)
-    os.makedirs(os.path.join(paths["folder"], "archives"), exist_ok=True)
-
+    key = make_institution_key(wilaya_code, institution_type, institution_name, DEFAULT_ROLE)
     legacy_conn.close()
 
     # Move (not copy) the legacy db and archive folders into the new location
@@ -1007,6 +1126,7 @@ def api_session():
                 "institution_name": p["institution_name"],
                 "wilaya_name": p["wilaya_name"],
                 "institution_type": p["institution_type"],
+                "role": p.get("role") or DEFAULT_ROLE,
                 "pin_set": p["pin_hash"] is not None,
             }
             for p in profiles
@@ -1050,6 +1170,49 @@ def api_session_set_pin():
     return jsonify({"ok": True, "profile": profile_public_dict(updated_row)})
 
 
+def get_hardware_fingerprint() -> str:
+    """
+    v2.8.5: best-effort hardware identifier for automatic device
+    pairing. Tries the Windows motherboard/product UUID first (stable
+    across reinstalls, reboots, and even OS reinstalls on the same
+    physical machine); falls back to a MAC-address-derived value
+    (uuid.getnode()) on any platform where the Windows-specific command
+    isn't available or fails — including this Linux development sandbox,
+    where the fallback path is the only one ever exercised.
+
+    ⚠️ Honesty note: the Windows path (wmic) could NOT be exercised in
+    this sandbox — there is no Windows machine here to run it against.
+    The fallback path was tested directly. wmic itself is also
+    deprecated by Microsoft in newer Windows builds in favor of
+    PowerShell's Get-CimInstance; if pairing behaves unexpectedly on a
+    very recent Windows version, this is the first place to check.
+
+    The raw fingerprint is never stored — only its SHA-256 hash (see
+    api_session_unlock) — same privacy principle already applied to PINs.
+    """
+    try:
+        if platform.system() == "Windows":
+            output = subprocess.check_output(
+                ["wmic", "csproduct", "get", "UUID"],
+                stderr=subprocess.DEVNULL, timeout=5
+            ).decode("utf-8", errors="ignore")
+            lines = [l.strip() for l in output.splitlines() if l.strip() and "UUID" not in l.upper()]
+            if lines and lines[0]:
+                return lines[0]
+    except Exception:
+        pass  # wmic missing/deprecated/blocked — fall through to the generic fallback
+
+    # Generic fallback: derived from the network interface's MAC address.
+    # Weaker than a real motherboard UUID (changes if the network adapter
+    # changes, and uuid.getnode() can fall back to a random value on some
+    # systems if no MAC is readable at all) — documented, not hidden.
+    return f"fallback-{uuid.getnode()}"
+
+
+def hash_hardware_fingerprint(raw_fingerprint: str) -> str:
+    return hashlib.sha256(raw_fingerprint.encode("utf-8")).hexdigest()
+
+
 @app.route("/api/session/unlock", methods=["POST"])
 def api_session_unlock():
     data = request.get_json(force=True)
@@ -1061,11 +1224,98 @@ def api_session_unlock():
         return jsonify({"error": "Établissement introuvable."}), 404
     if row["pin_hash"] is None:
         return jsonify({"error": "Aucun code PIN défini pour ce profil.", "pin_not_set": True}), 400
+
+    # v2.8.5: automatic hardware pairing, checked BEFORE the PIN. A
+    # profile pairs itself to whatever machine first unlocks it
+    # successfully — no manual serial-number entry. Once paired, any
+    # OTHER machine attempting to unlock this profile is rejected
+    # immediately, regardless of whether the PIN it supplied was
+    # correct, so a stolen database file alone is useless without the
+    # original paired hardware. Legitimate hardware changes (replacement
+    # PC) go through /api/session/recover with the institution's own
+    # serial_key, never through this endpoint.
+    current_hash = hash_hardware_fingerprint(get_hardware_fingerprint())
+    if row["paired_hardware_hash"] is not None and row["paired_hardware_hash"] != current_hash:
+        return jsonify({
+            "error": "Ce poste n'est pas autorisé pour cet établissement. "
+                     "Utilisez la récupération avec la clé série de l'établissement "
+                     "si ce poste est un remplacement légitime.",
+            "hardware_mismatch": True,
+        }), 403
+
     if not check_password_hash(row["pin_hash"], pin):
         return jsonify({"error": "Code PIN incorrect."}), 401
 
+    if row["paired_hardware_hash"] is None:
+        with registry_db() as conn:
+            conn.execute("UPDATE profiles SET paired_hardware_hash = ? WHERE institution_key = ?",
+                         (current_hash, key))
+        row = get_profile_row(key)  # re-read so the returned/cached row reflects the new pairing
+
     set_active_session(key, pin, row)
     return jsonify({"ok": True, "profile": profile_public_dict(row)})
+
+
+@app.route("/api/session/recover", methods=["POST"])
+def api_session_recover():
+    """
+    v2.8.5: "Mot de passe oublié" recovery — verifies the INSTITUTION's
+    own serial_key (shown to that institution at onboarding, and kept
+    centrally in the ILINE TECH reference registry, see
+    tools/generate_serial_registry.py) rather than any shared master
+    key. Resets the PIN and re-pairs the current machine as this
+    profile's authorized hardware — covering both "forgot PIN on the
+    same machine" and "legitimate replacement machine" with one flow.
+
+    ⚠️ Told to the user, not hidden: this resets ACCESS, not encrypted
+    CONTENT. Changing the PIN changes the Fernet key derived from it
+    (see derive_fernet) — any message/file this profile encrypted under
+    the OLD PIN becomes permanently unreadable under the new one. This
+    is the same tradeoff already documented for encryption at rest since
+    v2.7.0, not a new limitation introduced here: a real encryption
+    scheme that could be bypassed by a recovery flow wouldn't be real
+    encryption. The response says so explicitly.
+    """
+    data = request.get_json(force=True)
+    key = data.get("institution_key", "")
+    submitted_serial = data.get("serial_key", "").strip()
+    new_pin = data.get("new_pin", "")
+
+    if not re.fullmatch(r"\d{4,6}", new_pin):
+        return jsonify({"error": "Le nouveau code PIN doit contenir 4 à 6 chiffres."}), 400
+
+    row = get_profile_row(key)
+    if row is None:
+        return jsonify({"error": "Établissement introuvable."}), 404
+
+    # Constant-time comparison — this is a credential check, same care
+    # as a password compare, even though serial_key isn't itself hashed
+    # (it's meant to be looked up from the ILINE TECH registry by an
+    # administrator, not memorized like a PIN).
+    if not hmac.compare_digest(submitted_serial, row["serial_key"] or ""):
+        return jsonify({"error": "Clé série invalide pour cet établissement."}), 401
+
+    current_hash = hash_hardware_fingerprint(get_hardware_fingerprint())
+    encryption_warning = row["encryption_salt"] is not None
+
+    with registry_db() as conn:
+        conn.execute(
+            "UPDATE profiles SET pin_hash = ?, paired_hardware_hash = ? WHERE institution_key = ?",
+            (generate_password_hash(new_pin), current_hash, key)
+        )
+
+    updated_row = get_profile_row(key)
+    set_active_session(key, new_pin, updated_row)
+    return jsonify({
+        "ok": True,
+        "profile": profile_public_dict(updated_row),
+        "warning": (
+            "Accès réinitialisé et ce poste ré-appairé. Les documents déjà "
+            "chiffrés avec l'ancien code PIN restent définitivement "
+            "illisibles — c'est le fonctionnement normal d'un vrai "
+            "chiffrement, pas une erreur."
+        ) if encryption_warning else None,
+    })
 
 
 @app.route("/api/session/lock", methods=["POST"])
@@ -1137,6 +1387,7 @@ def api_save_profile():
     wilaya_code = int(data.get("wilaya_code"))
     institution_type = data.get("institution_type", "").strip()
     institution_name = data.get("institution_name", "").strip()
+    requested_role = data.get("role", DEFAULT_ROLE).strip().upper() or DEFAULT_ROLE
     pin = data.get("pin", "")
 
     if not institution_name or institution_type not in INSTITUTION_TYPES:
@@ -1148,18 +1399,28 @@ def api_save_profile():
     if wilaya_name is None:
         return jsonify({"error": "Wilaya invalide."}), 400
 
-    key = make_institution_key(wilaya_code, institution_type, institution_name)
-    serial_key = generate_serial_key(wilaya_code, institution_type, institution_name)
+    # v2.8.5: the server is the actual authority on which role is valid
+    # for this institution type — never trust a frontend lock alone.
+    # When only one role exists for this type (every structure except
+    # DSP/EPSP), it's silently enforced regardless of what was submitted,
+    # exactly matching "le rôle est automatiquement verrouillé" from the
+    # spec — a client bug or a tampered request can't create a
+    # DIRECTEUR profile for a Polyclinique.
+    valid_roles = allowed_roles(institution_type)
+    role = requested_role if requested_role in valid_roles else valid_roles[0]
+
+    key = make_institution_key(wilaya_code, institution_type, institution_name, role)
+    serial_key = generate_serial_key(wilaya_code, institution_type, institution_name, role)
     salt = generate_encryption_salt()
 
     with registry_db() as conn:
         conn.execute("""
             INSERT INTO profiles (institution_key, wilaya_code, wilaya_name,
                                    institution_type, institution_name, serial_key,
-                                   pin_hash, theme, encryption_salt, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, 'dark', ?, ?)
+                                   pin_hash, theme, encryption_salt, role, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, 'dark', ?, ?, ?)
         """, (key, wilaya_code, wilaya_name, institution_type, institution_name,
-              serial_key, generate_password_hash(pin), salt, datetime.now().isoformat()))
+              serial_key, generate_password_hash(pin), salt, role, datetime.now().isoformat()))
 
     # Ensure the isolated storage folder + schema exist immediately
     with profile_db(key):
@@ -1168,6 +1429,18 @@ def api_save_profile():
     updated_row = get_profile_row(key)
     set_active_session(key, pin, updated_row)
     return jsonify({"ok": True, "profile": profile_public_dict(updated_row)})
+
+
+@app.route("/api/roles", methods=["GET"])
+def api_roles():
+    """v2.8.5: lets the onboarding form ask the server which roles are
+    valid for a given institution type, rather than duplicating
+    ROLE_RULES in JavaScript — one source of truth."""
+    institution_type = request.args.get("institution_type", "")
+    if institution_type not in INSTITUTION_TYPES:
+        return jsonify({"error": "Type d'établissement invalide."}), 400
+    roles = allowed_roles(institution_type)
+    return jsonify({"roles": roles, "locked": len(roles) == 1})
 
 
 @app.route("/api/profile/theme", methods=["POST"])
@@ -1267,6 +1540,10 @@ def api_send_message():
         return locked_response()
 
     recipient = request.form.get("recipient", "").strip()
+    # v2.8.5: two-level send form — Établissement -> Service. Left blank,
+    # every send is routed to SECRETARIAT by default, matching the spec's
+    # "si non spécifié, le courrier est orienté vers le SECRETARIAT".
+    recipient_role = (request.form.get("service", "") or "").strip().upper() or DEFAULT_ROLE
     subject = request.form.get("subject", "").strip()
     body = request.form.get("body", "").strip()
     file = request.files.get("file")
@@ -1355,7 +1632,7 @@ def api_send_message():
     # (LAN push / Cloud Bridge) not yet built. See STATE.md.
     # --------------------------------------------------------------- #
     delivered_locally = False
-    recipient_profile = find_local_profile_by_recipient(recipient, exclude_key=_active_key)
+    recipient_profile = find_local_profile_by_recipient(recipient, recipient_role, exclude_key=_active_key)
     if recipient_profile is not None:
         try:
             recipient_key = recipient_profile["institution_key"]
@@ -1413,7 +1690,7 @@ def api_send_message():
             bridge_attempted = True
             try:
                 delivered_via_bridge = push_to_bridge(
-                    bridge_cfg, recipient, sender, subject, body,
+                    bridge_cfg, recipient, recipient_role, sender, subject, body,
                     tracking, original_bytes, original_filename
                 )
             except Exception:
@@ -1996,12 +2273,18 @@ def api_bridge_poll():
         except Exception:
             pass  # a missed heartbeat just means this device looks offline a bit longer, not a real failure
 
-        # A sender may have addressed this institution either by its plain
-        # name or by its exact routing ID (institution_key) — check both
-        # folders so neither addressing style silently gets lost.
-        # Deduplicated by set() since the two can occasionally normalize
-        # to the same slug.
-        keys_to_check = {bridge_slug(profile["institution_name"]), bridge_slug(profile["institution_key"])}
+        # A sender may have addressed this institution by its plain name
+        # (v2.8.5: now role-aware for non-SECRETARIAT roles), or by its
+        # exact routing ID (institution_key, always role-specific by
+        # construction) — check every form so no addressing style
+        # silently gets lost. Deduplicated by set() since some of these
+        # can normalize to the same slug (e.g. a SECRETARIAT profile's
+        # plain-name slug is unchanged from pre-v2.8.5).
+        profile_role = profile.get("role") or DEFAULT_ROLE
+        keys_to_check = {
+            bridge_slug(profile["institution_name"], profile_role),
+            bridge_slug(profile["institution_key"]),
+        }
 
         json_entries = []
         receipt_entries = []

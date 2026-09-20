@@ -1450,3 +1450,272 @@ system tray sur un vrai poste Windows avant de considérer cette partie
 aussi stable que le reste — contrairement aux corrections précédentes de
 ce fichier, celle-ci touche à des API natives Windows qui n'ont jamais pu
 être exercées dans l'environnement de développement.
+
+---
+
+## 22. v2.8.5 — Couverture DSP nationale, hiérarchie des rôles, appairage matériel, récupération (2026-09-19)
+
+### 22.1 ⚠️ Demande refusée puis remplacée — clé Master Admin universelle
+
+Le cahier des charges initial demandait une **clé Master Admin unique et
+universelle** (`ADMIN-ILINE-2024`, codée en dur, modifiable via config)
+capable de débloquer *n'importe quel poste* du réseau national.
+
+**Cette demande a été refusée telle quelle**, pour exactement la même
+raison déjà documentée en v2.5.0 (section 13.1) à propos du token GitHub
+du Cloud Bridge — avec un rayon d'impact plus grave ici :
+- Une clé unique codée en dur se retrouve identique dans **chaque**
+  exécutable distribué sur des centaines de postes.
+- `strings TASHIL.exe | grep ADMIN` l'extrait en quelques secondes.
+- Un seul poste compromis donnerait accès à **tous les autres**
+  (courriers de direction, dossiers RH, dossiers sociaux), sans
+  révocation individuelle possible.
+
+**Alternative validée par l'utilisateur** : récupération via le
+`serial_key` **propre à chaque institution** (déjà existant dans le
+projet), jamais un secret partagé. Voir section 22.5.
+
+### 22.2 🌐 Couverture nationale des DSP (58 wilayas)
+
+`INSTITUTION_TYPES` inclut désormais `"DSP"`. Chaque wilaya reçoit
+automatiquement sa DSP (`f"DSP {wilaya_name}"`) dans le répertoire
+national ET dans le tirage d'onboarding, en réutilisant directement la
+table `WILAYAS` déjà présente — aucune saisie manuelle, aucune donnée
+supplémentaire à maintenir.
+
+**Testé réellement** : `GET /api/institutions/onboarding?wilaya_code=1&institution_type=DSP`
+→ `DSP Adrar` ; même requête avec `wilaya_code=58` → `DSP El Meniaa`.
+Les 58 wilayas confirmées couvertes.
+
+### 22.3 🏛️ Hiérarchie des rôles (DIRECTEUR / DRH / DAS / SECRETARIAT)
+
+Nouvelle table de règles `ROLE_RULES` :
+```python
+ROLE_RULES = {
+    "DSP":  ["DIRECTEUR", "SECRETARIAT"],
+    "EPSP": ["DIRECTEUR", "DRH", "DAS", "SECRETARIAT"],
+}
+```
+Tout autre type (EPH, CHU, EHU, Polyclinique) → `SECRETARIAT` uniquement,
+par construction (`allowed_roles()` retourne `["SECRETARIAT"]` par
+défaut pour tout type absent de `ROLE_RULES`).
+
+**Appliqué côté SERVEUR, pas seulement en façade** : `api_save_profile`
+recalcule `allowed_roles(institution_type)` et **corrige silencieusement**
+tout rôle invalide vers la seule option autorisée — un client trafiqué ou
+buggé ne peut pas créer un `DIRECTEUR` pour une Polyclinique. Nouvelle
+route `GET /api/roles?institution_type=X` pour que le frontend
+interroge la même source de vérité plutôt que de dupliquer la règle en
+JavaScript.
+
+Chaque combinaison (établissement, rôle) devient un profil et une boîte
+isolée à part entière — `make_institution_key()` et `generate_serial_key()`
+incorporent désormais le rôle. Le DRH et le DIRECTEUR du même EPSP ont
+deux `institution_key` et deux `serial_key` totalement distincts.
+
+**Testé réellement** :
+- Création EPSP × DRH puis EPSP × DIRECTEUR (même établissement) →
+  `institution_key` confirmés différents (`..._DRH` vs `..._DIRECTEUR`).
+- Tentative de créer un `DIRECTEUR` pour une Polyclinique → rôle stocké
+  confirmé forcé à `SECRETARIAT`.
+- `GET /api/roles` vérifié pour DSP, EPSP et Polyclinique — `locked: true`
+  correctement renvoyé quand une seule option existe.
+
+### 22.4 🔐 Secret HMAC déplacé hors du code source public
+
+**Problème réel découvert en concevant cette version** (pas signalé par
+l'utilisateur, trouvé en auditant `generate_serial_key`) : le secret HMAC
+utilisé pour générer les `serial_key` était codé en dur dans `app.py` —
+qui est sur un dépôt GitHub **public**. N'importe qui lisant le code
+source pouvait déjà recalculer le `serial_key` de n'importe quelle
+institution, puisque `WILAYAS` et les conventions de nommage sont
+également dans ce même fichier public.
+
+**Correctif** : le secret est désormais lu depuis la variable
+d'environnement `TASHIL_HMAC_SECRET`, avec repli sur l'ancienne valeur
+codée en dur **uniquement** pour qu'une installation fraîche continue de
+fonctionner avant toute configuration — ce repli n'offre aucune sécurité
+réelle et doit être remplacé par un vrai secret privé en production.
+
+**`generate_serial_key` rendu déterministe** (l'ancienne version mélangeait
+la date du jour dans le calcul — cohérent pour une génération unique au
+moment de l'onboarding réel, mais incompatible avec la pré-génération
+d'un registre national à l'avance). La vérification ne recalcule jamais
+la clé — elle compare la valeur soumise à la colonne `profiles.serial_key`
+stockée — donc faire tourner `TASHIL_HMAC_SECRET` reste toujours sans
+risque pour les clés déjà émises.
+
+**Testé réellement** : le registre central généré à l'instant T et un
+recalcul simulé "plus tard" (avec une pause explicite) produisent
+**exactement** la même clé série pour la même institution+rôle, avec le
+même secret. Confirmé octet pour octet.
+
+### 22.5 🔒 Appairage matériel automatique + 🐛 bug réel trouvé et corrigé pendant les tests
+
+`get_hardware_fingerprint()` : UUID matériel via `wmic csproduct get UUID`
+sur Windows, repli sur une valeur dérivée de l'adresse MAC
+(`uuid.getnode()`) sur toute autre plateforme — y compris ce bac à sable
+Linux, où seul le repli a pu être exercé. Le brut n'est jamais stocké,
+seul son hash SHA-256 l'est (`paired_hardware_hash`), même principe que
+pour les PIN.
+
+Au premier déverrouillage réussi d'un profil, l'empreinte de la machine
+est enregistrée automatiquement. Toute tentative ultérieure depuis une
+machine différente est bloquée avec `HTTP 403` **avant même** la
+vérification du PIN.
+
+**🐛 Bug réel trouvé et corrigé avant livraison** : lors de la première
+implémentation, le décorateur `@app.route("/api/session/unlock", ...)`
+s'est retrouvé accroché par erreur à la fonction `get_hardware_fingerprint()`
+plutôt qu'à `api_session_unlock()` (effet de bord d'une édition de code
+mal positionnée). Conséquence : Flask acheminait bien les requêtes vers
+la vraie fonction de déverrouillage, MAIS la logique d'appairage,
+elle-même définie plus bas dans le fichier sans décorateur, n'était
+**jamais exécutée** — `paired_hardware_hash` restait `NULL` indéfiniment,
+rendant le blocage matériel totalement inopérant sans qu'aucune erreur
+ne soit visible (les déverrouillages continuaient de réussir
+normalement). **Trouvé uniquement parce que le test de simulation d'une
+« autre machine » attendait un `403` et recevait un `200`** — sans ce
+test spécifique, ce bug serait passé inaperçu jusqu'en production.
+Corrigé en replaçant le décorateur directement au-dessus de la bonne
+fonction.
+
+**Tests réels effectués, cycle complet (7 scénarios)**, TOUS reproduits
+après correction :
+1. Premier déverrouillage réel → `paired_hardware_hash` confirmé défini.
+2. Re-déverrouillage même machine → `200`.
+3. Déverrouillage depuis une empreinte différente → `403`,
+   `hardware_mismatch: true`.
+4. Récupération avec un `serial_key` invalide → `401`.
+5. Récupération avec le bon `serial_key` → `200`, PIN réinitialisé,
+   avertissement de chiffrement renvoyé.
+6. Nouveau PIN fonctionne sur la machine venant d'être ré-appairée.
+7. L'ancienne machine (empreinte d'origine) est désormais bloquée.
+
+### 22.6 🔑 Récupération via `serial_key` (pas de clé partagée)
+
+Nouvelle route `POST /api/session/recover` : vérifie le `serial_key`
+**propre à l'institution** (comparaison à temps constant,
+`hmac.compare_digest`) contre la valeur stockée dans `registry.db`,
+réinitialise le PIN et ré-appaire automatiquement la machine courante —
+couvrant à la fois "PIN oublié sur la même machine" et "remplacement de
+machine légitime" en un seul flux.
+
+**⚠️ Compromis honnête, affiché à l'utilisateur, pas caché** : changer le
+PIN change la clé Fernet dérivée (`derive_fernet`) — tout document déjà
+chiffré avec l'ancien PIN devient **définitivement illisible**. Ce n'est
+pas un bug introduit par cette fonctionnalité : c'est ce qu'implique un
+vrai chiffrement, déjà documenté depuis la v2.7.0. Un mécanisme de
+récupération qui contournerait ce fait ne serait pas un vrai chiffrement.
+Le message d'avertissement est renvoyé par l'API et affiché explicitement
+côté frontend avant l'entrée dans l'application.
+
+### 22.7 ⚙️ Adressage à deux niveaux (Établissement → Service)
+
+Le formulaire d'envoi comporte désormais un champ **Service destinataire**
+(`SECRETARIAT` par défaut, `DIRECTEUR`/`DRH`/`DAS` sélectionnables). Côté
+serveur, `find_local_profile_by_recipient()` et `bridge_slug()` ont été
+étendus pour désambiguïser par rôle — une même institution peut
+désormais avoir plusieurs profils (un par rôle), et un courrier adressé
+sans préciser de service est automatiquement orienté vers le
+`SECRETARIAT`.
+
+**Rétrocompatibilité de l'adressage Cloud Bridge préservée** :
+`bridge_slug()` n'ajoute un suffixe de rôle que pour les rôles autres que
+`SECRETARIAT` — toute adresse déjà en usage pour une institution
+SECRETARIAT-only (100 % des institutions avant cette version) reste
+identique, octet pour octet.
+
+**Testé réellement, isolation complète confirmée** : création de 3
+profils pour le même `EPSP ES SENIA` (DRH, DAS, SECRETARIAT) → 3 envois
+adressés respectivement à chaque service (+ 1 envoi sans service précisé)
+→ vérification de la boîte de réception de chacun des 3 profils : chaque
+boîte ne contient **que** le message qui lui était destiné, aucune fuite
+croisée.
+
+### 22.8 📄 Registre national des `serial_key` (`tools/generate_serial_registry.py`)
+
+Nouveau script autonome, **volontairement absent de `tashil_web.spec`**
+(jamais empaqueté dans l'exécutable distribué, jamais destiné aux postes
+de terrain) — à exécuter une seule fois, en central, par ILINE TECH.
+
+Génère 348 entrées (58 wilayas × (2 rôles DSP + 4 rôles EPSP)) en
+réutilisant **exactement** `WILAYAS`, `allowed_roles()` et
+`generate_serial_key()` de `app.py`, garantissant que le registre central
+correspond mot pour mot à ce que produira l'onboarding réel sur le poste
+de chaque institution, du moment que le même `TASHIL_HMAC_SECRET` est
+configuré des deux côtés.
+
+Sortie : un fichier Markdown et un fichier Excel (bannière de sécurité
+rouge en première ligne, colonnes Wilaya / Type / Établissement / Rôle /
+Clé série). ⚠️ Seul l'EPSP d'Oran a une liste réelle nommée
+(`_ONBOARDING_KNOWN`) ; toutes les autres wilayas utilisent le nom
+générique `EPSP <Wilaya>` — la même convention déjà utilisée par
+l'application elle-même. Si l'EPSP réel d'une wilaya est onboardé sous un
+nom différent, sa vraie clé série divergera de cette entrée générique et
+devra être relevée sur son propre écran Paramètres.
+
+**⚠️ Avertissement de sécurité intégré au script et rappelé dans son
+en-tête** : ce fichier exporté est, en cumulé, une liste de clés de
+réinitialisation pour tout le réseau national — jamais à commiter sur le
+dépôt Git public, jamais à partager sans contrôle d'accès.
+
+**Testé réellement** :
+- Exécution réelle → 348 entrées générées, fichiers `.md` et `.xlsx`
+  physiquement présents et inspectés (structure du classeur Excel
+  vérifiée ligne par ligne : bannière, en-têtes, première et dernière
+  ligne de données).
+- **Déterminisme confirmé** : deux exécutions successives avec le même
+  `TASHIL_HMAC_SECRET` → fichiers Markdown identiques (`diff` sans sortie).
+- **Cohérence centrale/terrain confirmée** : la clé calculée par le
+  script d'export et celle qu'un onboarding réel calculerait "plus tard"
+  (simulé avec une pause explicite) sont identiques.
+- Avertissement affiché correctement quand `TASHIL_HMAC_SECRET` n'est pas
+  défini.
+
+### 22.9 ⚠️ Limite connue, documentée et non résolue — routage des accusés de réception
+
+Le routage d'un accusé de réception (local et Cloud Bridge) ne connaît
+que le **nom** de l'institution émettrice (`messages.sender_institution`),
+jamais son rôle précis. Pour une institution multi-rôles (EPSP avec
+DIRECTEUR/DRH/DAS/SECRETARIAT), un accusé pourrait ne pas revenir
+exactement au bon service si plusieurs profils partagent ce nom.
+
+**Non corrigé dans cette version** — la correction complète nécessiterait
+d'ajouter une colonne `sender_institution_key` (ou `sender_role`) à la
+table `messages` et de la propager dans l'INSERT, les métadonnées Cloud
+Bridge, et la logique de `route_read_receipt()`. Périmètre jugé trop
+large pour cette livraison ; à traiter en v2.8.6. Documenté ici
+explicitement plutôt que laissé silencieux.
+
+### 22.10 Régression complète (v2.8.1 → v2.8.5)
+
+Suite exécutée sur l'arborescence finale, TOUT confirmé fonctionnel
+ensemble sans collision :
+- ✅ Mode WAL + `PRAGMA busy_timeout=5000` (v2.8.1)
+- ✅ `tracking_number` : scénario exact de collision reproduit puis
+  confirmé résolu (v2.8.2)
+- ✅ Correctif CSS desktop topbar (v2.8.2)
+- ✅ Normalisation HEIC → extension corrigée, upload vide rejeté (v2.8.3)
+- ✅ Suivi des messages non lus, cycle complet (v2.8.4)
+- ✅ Hiérarchie des rôles appliquée côté serveur, DSP × 58 wilayas,
+  appairage matériel (7 scénarios), récupération via `serial_key`,
+  isolation complète de l'adressage à deux niveaux (v2.8.5)
+
+**Fichiers ajoutés :** `tools/generate_serial_registry.py`. **Fichiers
+modifiés :** `app.py` (DSP, rôles, `institution_key`/`serial_key` avec
+rôle, secret HMAC en variable d'environnement, appairage matériel,
+récupération, adressage à deux niveaux), `templates/index.html`
+(sélecteur de rôle onboarding, champ Service destinataire, écran de
+récupération), `static/js/app.js` (câblage complet des trois flux),
+`static/css/style.css` (`.btn-link`). Aucune fonctionnalité antérieure
+retirée — WAL/Context Managers (v2.8.1), `tracking_number` (v2.8.2),
+CSS desktop (v2.8.2), HEIC/JPEG (v2.8.3), suivi des non-lus et System
+Tray (v2.8.4) tous reconfirmés intacts par la suite de régression
+complète ci-dessus.
+
+**Recommandation avant déploiement national** : configurer un vrai
+`TASHIL_HMAC_SECRET` (jamais la valeur par défaut) avant de lancer le
+script d'export en production, et traiter la limite de la section 22.9
+avant de compter sur les accusés de réception pour des institutions
+multi-rôles.

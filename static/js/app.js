@@ -85,8 +85,9 @@ function showOnboarding({ allowCancel }) {
   });
 
   wilayaSelect.addEventListener("change", refreshOnboardingInstitutions);
-  typeSelect.addEventListener("change", refreshOnboardingInstitutions);
+  typeSelect.addEventListener("change", () => { refreshOnboardingInstitutions(); refreshOnboardingRoles(); });
   refreshOnboardingInstitutions();
+  refreshOnboardingRoles();
 
   document.getElementById("ob-submit").onclick = submitOnboarding;
 
@@ -99,6 +100,36 @@ function showOnboarding({ allowCancel }) {
     };
   } else {
     cancelBtn.classList.add("hidden");
+  }
+}
+
+// v2.8.5: asks the server which roles apply to the selected institution
+// type — DIRECTEUR/DRH/DAS/SECRETARIAT for an EPSP, DIRECTEUR/SECRETARIAT
+// for a DSP, SECRETARIAT-only (auto-locked, disabled) for everything else
+// (a Polyclinique, EPH, CHU, EHU never has its own DRH/DAS/DIRECTEUR
+// service in this system). The server enforces this too (api_save_profile
+// silently corrects an invalid role) — this is for a good default
+// experience, not the actual security boundary.
+async function refreshOnboardingRoles() {
+  const institutionType = document.getElementById("ob-type").value;
+  const roleSelect = document.getElementById("ob-role");
+  const roleNote = document.getElementById("ob-role-note");
+  roleSelect.innerHTML = "";
+  try {
+    const data = await fetch(`/api/roles?institution_type=${encodeURIComponent(institutionType)}`).then(r => r.json());
+    (data.roles || ["SECRETARIAT"]).forEach(role => {
+      const opt = document.createElement("option");
+      opt.value = role;
+      opt.textContent = role;
+      roleSelect.appendChild(opt);
+    });
+    roleSelect.disabled = !!data.locked;
+    roleNote.textContent = data.locked
+      ? "Ce type d'établissement n'a qu'un seul service : Secrétariat."
+      : "";
+  } catch (err) {
+    roleSelect.innerHTML = `<option value="SECRETARIAT">SECRETARIAT</option>`;
+    roleSelect.disabled = true;
   }
 }
 
@@ -171,6 +202,7 @@ async function submitOnboarding() {
     wilaya_code: parseInt(document.getElementById("ob-wilaya").value, 10),
     institution_type: document.getElementById("ob-type").value,
     institution_name: institutionName,
+    role: document.getElementById("ob-role").value || "SECRETARIAT",
     pin,
   };
 
@@ -284,6 +316,85 @@ function selectProfileForUnlock(key, profiles) {
     document.getElementById("lock-profile-list").classList.remove("hidden");
     document.getElementById("lock-add-profile-btn").classList.remove("hidden");
   };
+  // v2.8.5: "Mot de passe oublié" — only meaningful once a profile has
+  // been selected, since recovery needs to know WHICH institution's
+  // serial_key to check against.
+  const forgotBtn = document.getElementById("lock-forgot-btn");
+  forgotBtn.classList.toggle("hidden", state.pendingUnlockNeedsSetup);
+  forgotBtn.onclick = () => showRecoverStep(profile.institution_name);
+}
+
+// ------------------------------------------------------------------ //
+// Recovery via institution serial_key (v2.8.5)
+// ------------------------------------------------------------------ //
+function showRecoverStep(institutionLabel) {
+  document.getElementById("lock-pin-step").classList.add("hidden");
+  const step = document.getElementById("lock-recover-step");
+  step.classList.remove("hidden");
+  document.getElementById("recover-serial").value = "";
+  document.getElementById("recover-new-pin").value = "";
+  document.getElementById("recover-error").classList.add("hidden");
+  document.getElementById("recover-warning").classList.add("hidden");
+
+  document.getElementById("recover-cancel-btn").onclick = () => {
+    step.classList.add("hidden");
+    document.getElementById("lock-pin-step").classList.remove("hidden");
+  };
+  document.getElementById("recover-submit-btn").onclick = submitRecovery;
+}
+
+async function submitRecovery() {
+  const errorEl = document.getElementById("recover-error");
+  const warningEl = document.getElementById("recover-warning");
+  errorEl.classList.add("hidden");
+  warningEl.classList.add("hidden");
+
+  const serialKey = document.getElementById("recover-serial").value.trim();
+  const newPin = document.getElementById("recover-new-pin").value.trim();
+
+  if (!serialKey) {
+    errorEl.textContent = "Veuillez saisir la clé série de l'établissement.";
+    errorEl.classList.remove("hidden");
+    return;
+  }
+  if (!/^\d{4,6}$/.test(newPin)) {
+    errorEl.textContent = "Le nouveau code PIN doit contenir 4 à 6 chiffres.";
+    errorEl.classList.remove("hidden");
+    return;
+  }
+
+  try {
+    const res = await fetch("/api/session/recover", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        institution_key: state.pendingUnlockKey,
+        serial_key: serialKey,
+        new_pin: newPin,
+      }),
+    });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.error || "Échec de la récupération.");
+
+    state.profile = data.profile;
+    if (data.warning) {
+      // Shown once, deliberately, before entering the app — the person
+      // needs to see this BEFORE they go looking for old documents that
+      // are genuinely gone, not buried in a toast they might miss.
+      warningEl.textContent = `⚠️ ${data.warning}`;
+      warningEl.classList.remove("hidden");
+      setTimeout(() => {
+        document.getElementById("lock-overlay").classList.add("hidden");
+        showApp();
+      }, 4000);
+    } else {
+      document.getElementById("lock-overlay").classList.add("hidden");
+      showApp();
+    }
+  } catch (err) {
+    errorEl.textContent = err.message;
+    errorEl.classList.remove("hidden");
+  }
 }
 
 async function submitUnlock() {
@@ -319,7 +430,22 @@ async function submitUnlock() {
       });
     }
     data = await res.json();
-    if (!res.ok) throw new Error(data.error || "Échec du déverrouillage.");
+    if (!res.ok) {
+      // v2.8.5: a hardware-pairing rejection is a DIFFERENT situation
+      // from a wrong PIN — this poste was simply never authorized for
+      // this institution. Say so plainly and point at the actual way
+      // out (recovery with the institution's own serial_key) rather
+      // than leaving the person to retry a PIN that was never the issue.
+      if (data.hardware_mismatch) {
+        throw new Error(
+          "⛔ Ce poste n'est pas autorisé pour cet établissement. " +
+          "Si c'est un remplacement de machine légitime, utilisez " +
+          "\"Mot de passe oublié / Déblocage\" ci-dessous avec la clé " +
+          "série de l'établissement."
+        );
+      }
+      throw new Error(data.error || "Échec du déverrouillage.");
+    }
 
     state.profile = data.profile;
     document.getElementById("lock-overlay").classList.add("hidden");
@@ -867,6 +993,7 @@ function setupMessaging() {
     const formData = new FormData();
     formData.append("file", state.selectedFile);
     formData.append("recipient", recipient);
+    formData.append("service", document.getElementById("msg-service").value || "SECRETARIAT");
     formData.append("subject", document.getElementById("msg-subject").value.trim());
     formData.append("body", document.getElementById("msg-body").value.trim());
 
@@ -906,6 +1033,7 @@ function setupMessaging() {
 
       resetMessagingForm();
       document.getElementById("msg-recipient").value = "";
+      document.getElementById("msg-service").value = "SECRETARIAT";
       document.getElementById("msg-subject").value = "";
       document.getElementById("msg-body").value = "";
       loadDashboard();

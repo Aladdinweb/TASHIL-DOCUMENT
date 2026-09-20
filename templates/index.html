@@ -33,6 +33,10 @@
       <select id="ob-name-select"></select>
       <input id="ob-name-manual" type="text" placeholder="Nom de l'établissement" class="hidden">
 
+      <label>Service / Rôle</label>
+      <select id="ob-role"></select>
+      <p class="muted small-note" id="ob-role-note"></p>
+
       <label>Code PIN (4 à 6 chiffres)</label>
       <input id="ob-pin" type="password" inputmode="numeric" pattern="\d*" maxlength="6"
              placeholder="····" autocomplete="new-password" class="pin-input">
@@ -65,6 +69,20 @@
       <button class="btn btn-primary" id="lock-unlock-btn">🔓 Déverrouiller</button>
       <button class="btn btn-secondary" id="lock-back-btn">← Changer d'établissement</button>
       <p id="lock-error" class="error hidden"></p>
+      <button class="btn-link" id="lock-forgot-btn">Mot de passe oublié / Déblocage</button>
+    </div>
+
+    <div id="lock-recover-step" class="onboarding-step hidden">
+      <p class="muted">Réinitialisation via la clé série de l'établissement (fournie par ILINE TECH).</p>
+      <label>Clé série de l'établissement</label>
+      <input id="recover-serial" type="text" placeholder="TSH-XX-XX-XXXX-XXXX" autocomplete="off">
+      <label>Nouveau code PIN</label>
+      <input id="recover-new-pin" type="password" inputmode="numeric" pattern="\d*" maxlength="6"
+             placeholder="····" class="pin-input" autocomplete="new-password">
+      <button class="btn btn-primary" id="recover-submit-btn">Réinitialiser l'accès</button>
+      <button class="btn btn-secondary" id="recover-cancel-btn">← Retour</button>
+      <p id="recover-error" class="error hidden"></p>
+      <p id="recover-warning" class="muted small-note hidden"></p>
     </div>
 
     <button class="btn btn-secondary" id="lock-add-profile-btn">➕ Ajouter un nouvel établissement</button>
@@ -152,6 +170,13 @@
           <input type="text" id="msg-recipient" list="institutions-list"
                  placeholder="Tapez pour rechercher (ex: EPH, Polyclinique...)" autocomplete="off">
           <datalist id="institutions-list"></datalist>
+          <label>Service destinataire</label>
+          <select id="msg-service">
+            <option value="SECRETARIAT">Secrétariat (par défaut)</option>
+            <option value="DIRECTEUR">Directeur</option>
+            <option value="DRH">DRH</option>
+            <option value="DAS">DAS</option>
+          </select>
           <label>Objet</label>
           <input type="text" id="msg-subject">
           <label>Message</label>
