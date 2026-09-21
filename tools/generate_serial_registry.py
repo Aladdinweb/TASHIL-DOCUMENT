@@ -149,27 +149,25 @@ def build_registry_rows():
                     "serial_key": tashil_app.generate_serial_key(wilaya_code, "CHU", chu_name, role),
                 })
 
-        # Generic "Polyclinique <Wilaya>" placeholder — same convention
-        # as EPSP above — PLUS every REAL, specifically-named Oran
-        # polyclinic (the only wilaya with real names on file in
-        # app.py's _REAL_ESSENIA_POLYCLINICS), since those are the ones
-        # actually being onboarded in practice, under their real names,
-        # not the generic placeholder.
-        poly_name = f"Polyclinique {wilaya_name}"
-        for role in tashil_app.allowed_roles("Polyclinique"):
-            rows.append({
-                "wilaya_code": wilaya_code, "wilaya_name": wilaya_name,
-                "institution_type": "Polyclinique", "institution_name": poly_name, "role": role,
-                "serial_key": tashil_app.generate_serial_key(wilaya_code, "Polyclinique", poly_name, role),
-            })
-
+        # v2.8.6: Polyclinique is no longer a separate institution_type —
+        # a polyclinic is a specific NAME chosen under its EPSP, with
+        # institution_type "EPSP" and role SECRETARIAT_POLYCLINIQUE.
+        # Only Oran (wilaya 31) has real, confirmed polyclinic names on
+        # file (_REAL_ESSENIA_POLYCLINICS); every other wilaya's
+        # polyclinics, if any, must be looked up from that specific
+        # poste's own onboarding screen once created — there is no
+        # generic "Polyclinique <Wilaya>" placeholder anymore, since a
+        # polyclinic without a real name to onboard under isn't
+        # onboardable in the first place (its parent EPSP head office,
+        # already covered above, is what a generic placeholder would
+        # have meant).
         if wilaya_code == 31:  # Oran — the only wilaya with real named polyclinics on file
             for real_name in tashil_app._REAL_ESSENIA_POLYCLINICS:
-                for role in tashil_app.allowed_roles("Polyclinique"):
+                for role in tashil_app.allowed_roles("EPSP", real_name):
                     rows.append({
                         "wilaya_code": wilaya_code, "wilaya_name": wilaya_name,
-                        "institution_type": "Polyclinique", "institution_name": real_name, "role": role,
-                        "serial_key": tashil_app.generate_serial_key(wilaya_code, "Polyclinique", real_name, role),
+                        "institution_type": "EPSP", "institution_name": real_name, "role": role,
+                        "serial_key": tashil_app.generate_serial_key(wilaya_code, "EPSP", real_name, role),
                     })
     return rows
 
@@ -180,8 +178,8 @@ def write_markdown(rows, path):
         "",
         f"**Généré le :** {datetime.now().strftime('%Y-%m-%d %H:%M')}",
         f"**Nombre d'entrées :** {len(rows)} "
-        f"(DSP, EPSP, EPH, CHU, Polyclinique — génériques par wilaya + "
-        f"7 polycliniques d'Oran nommément)",
+        f"(DSP, EPSP — siège + polycliniques nommées sous tutelle —, "
+        f"EPH, CHU : génériques par wilaya)",
         "",
         "⚠️ Voir l'en-tête de `generate_serial_registry.py` pour les "
         "consignes de sécurité complètes avant toute diffusion de ce fichier.",

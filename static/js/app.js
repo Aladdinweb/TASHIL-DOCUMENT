@@ -84,10 +84,21 @@ function showOnboarding({ allowCancel }) {
     typeSelect.appendChild(opt);
   });
 
-  wilayaSelect.addEventListener("change", refreshOnboardingInstitutions);
-  typeSelect.addEventListener("change", () => { refreshOnboardingInstitutions(); refreshOnboardingRoles(); });
-  refreshOnboardingInstitutions();
-  refreshOnboardingRoles();
+  // v2.8.6 fix: showOnboarding() runs every time the onboarding overlay
+  // is shown (first launch AND "Ajouter un nouvel établissement" from
+  // the lock screen) — these <select> elements themselves are never
+  // recreated, only their options. addEventListener STACKS a new
+  // listener on every call instead of replacing the old one, so after
+  // N invocations, a single "change" event fired N overlapping async
+  // refreshes, each appending its own copy of the role list before the
+  // previous one's clear had a chance to "win" — that's the exact cause
+  // of the reported repeating DIRECTEUR/DRH/DAS/SECRETARIAT entries.
+  // Direct property assignment (.onchange =) REPLACES any previous
+  // handler instead of stacking, regardless of how many times this
+  // function runs.
+  wilayaSelect.onchange = async () => { await refreshOnboardingInstitutions(); refreshOnboardingRoles(); };
+  typeSelect.onchange = async () => { await refreshOnboardingInstitutions(); refreshOnboardingRoles(); };
+  refreshOnboardingInstitutions().then(refreshOnboardingRoles);
 
   document.getElementById("ob-submit").onclick = submitOnboarding;
 
@@ -103,21 +114,27 @@ function showOnboarding({ allowCancel }) {
   }
 }
 
-// v2.8.5: asks the server which roles apply to the selected institution
-// type — DIRECTEUR/DRH/DAS/SECRETARIAT for an EPSP, DIRECTEUR/SECRETARIAT
-// for a DSP, SECRETARIAT-only (auto-locked, disabled) for everything else
-// (a Polyclinique, EPH, CHU, EHU never has its own DRH/DAS/DIRECTEUR
-// service in this system). The server enforces this too (api_save_profile
+// v2.8.5/6: asks the server which roles apply to the selected institution
+// type + name — DIRECTEUR/DRH/DAS/SECRETARIAT_DIRECTION for an EPSP head
+// office, DIRECTEUR/SECRETARIAT_DIRECTION for a DSP, SECRETARIAT_
+// DIRECTION-only (auto-locked, disabled) for EPH/CHU/EHU, and
+// SECRETARIAT_POLYCLINIQUE-only for a polyclinic NAME chosen under an
+// EPSP. The server enforces this too (api_save_profile
 // silently corrects an invalid role) — this is for a good default
 // experience, not the actual security boundary.
 async function refreshOnboardingRoles() {
   const institutionType = document.getElementById("ob-type").value;
+  const nameSelect = document.getElementById("ob-name-select");
+  const nameManual = document.getElementById("ob-name-manual");
+  const effectiveName = nameSelect.value === "__other__" ? nameManual.value.trim() : nameSelect.value;
   const roleSelect = document.getElementById("ob-role");
   const roleNote = document.getElementById("ob-role-note");
   roleSelect.innerHTML = "";
   try {
-    const data = await fetch(`/api/roles?institution_type=${encodeURIComponent(institutionType)}`).then(r => r.json());
-    (data.roles || ["SECRETARIAT"]).forEach(role => {
+    const params = new URLSearchParams({ institution_type: institutionType });
+    if (effectiveName) params.set("institution_name", effectiveName);
+    const data = await fetch(`/api/roles?${params.toString()}`).then(r => r.json());
+    (data.roles || ["SECRETARIAT_DIRECTION"]).forEach(role => {
       const opt = document.createElement("option");
       opt.value = role;
       opt.textContent = role;
@@ -125,10 +142,10 @@ async function refreshOnboardingRoles() {
     });
     roleSelect.disabled = !!data.locked;
     roleNote.textContent = data.locked
-      ? "Ce type d'établissement n'a qu'un seul service : Secrétariat."
+      ? "Ce choix n'a qu'un seul service possible."
       : "";
   } catch (err) {
-    roleSelect.innerHTML = `<option value="SECRETARIAT">SECRETARIAT</option>`;
+    roleSelect.innerHTML = `<option value="SECRETARIAT_DIRECTION">SECRETARIAT_DIRECTION</option>`;
     roleSelect.disabled = true;
   }
 }
@@ -161,7 +178,9 @@ async function refreshOnboardingInstitutions() {
       const manual = nameSelect.value === "__other__";
       nameManual.classList.toggle("hidden", !manual);
       if (manual) nameManual.focus();
+      refreshOnboardingRoles();
     };
+    nameManual.oninput = () => refreshOnboardingRoles();
     nameManual.classList.add("hidden");
   } catch (err) {
     nameSelect.innerHTML = `<option value="__other__">Autre (saisir manuellement)</option>`;
@@ -202,7 +221,7 @@ async function submitOnboarding() {
     wilaya_code: parseInt(document.getElementById("ob-wilaya").value, 10),
     institution_type: document.getElementById("ob-type").value,
     institution_name: institutionName,
-    role: document.getElementById("ob-role").value || "SECRETARIAT",
+    role: document.getElementById("ob-role").value || "SECRETARIAT_DIRECTION",
     pin,
   };
 
@@ -993,7 +1012,7 @@ function setupMessaging() {
     const formData = new FormData();
     formData.append("file", state.selectedFile);
     formData.append("recipient", recipient);
-    formData.append("service", document.getElementById("msg-service").value || "SECRETARIAT");
+    formData.append("service", document.getElementById("msg-service").value || "SECRETARIAT_DIRECTION");
     formData.append("subject", document.getElementById("msg-subject").value.trim());
     formData.append("body", document.getElementById("msg-body").value.trim());
 
@@ -1033,7 +1052,7 @@ function setupMessaging() {
 
       resetMessagingForm();
       document.getElementById("msg-recipient").value = "";
-      document.getElementById("msg-service").value = "SECRETARIAT";
+      document.getElementById("msg-service").value = "SECRETARIAT_DIRECTION";
       document.getElementById("msg-subject").value = "";
       document.getElementById("msg-body").value = "";
       loadDashboard();

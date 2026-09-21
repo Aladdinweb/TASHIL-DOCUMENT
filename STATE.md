@@ -1755,3 +1755,140 @@ avec ce même secret.
 **Fichiers modifiés :** `tools/generate_serial_registry.py` uniquement.
 Aucun changement à `app.py` — ce correctif touche seulement l'outil
 d'export, pas l'application elle-même.
+
+---
+
+## 24. v2.8.6 — Polyclinique rattachée à l'EPSP, Secrétariats distincts, correctifs UI (2026-09-20)
+
+### 24.1 ⚠️ Clarification demandée, pas appliquée telle quelle
+
+Le cahier des charges demandait d'"harmoniser" le calcul de
+`institution_key` entre `app.py` et `generate_serial_registry.py` pour
+que le registre débloque les postes sans erreur. Vérification faite :
+**aucune divergence n'existe** — le script appelle littéralement
+`tashil_app.generate_serial_key(...)`, la même fonction, importée
+directement depuis `app.py`. La confusion venait d'un raccourci de
+vocabulaire (`institution_key`, qui sert à l'isolement des bases par
+rôle, n'est pas le `serial_key` utilisé pour la récupération).
+
+Le vrai échec de récupération signalé par l'utilisateur venait d'un
+poste onboardé **avant** la v2.8.5 (quand `generate_serial_key` mélangeait
+encore la date du jour dans le calcul) — aucune formule actuelle ne peut
+reconstruire une valeur calculée avec une date désormais inconnue. Rien
+n'a été changé dans `institution_key` : retirer le rôle de sa formule
+aurait cassé l'isolement DRH/DAS/DIRECTEUR introduit en v2.8.5.
+
+### 24.2 🏥 Polyclinique n'est plus un type d'établissement
+
+`INSTITUTION_TYPES` = `["DSP", "EPSP", "EPH", "CHU", "EHU"]` — une
+polyclinique est désormais un **nom** choisi dans "Nom de l'établissement"
+sous le type `EPSP`, "sous la tutelle de son EPSP". `_TYPE_CODES` garde
+`"Polyclinique": "PC"` pour que les clés déjà émises avant cette version
+restent décodables, mais `api_save_profile` bloque toute nouvelle
+création avec ce type (`400`).
+
+`get_onboarding_institutions("EPSP", ...)` retourne désormais le siège
+EPSP **et** ses polycliniques rattachées dans la même liste (ex. pour
+Oran : `["EPSP Oran", "POLYCLINIQUE ES SENIA", ...]`) — avant cette
+version, il n'existait même aucun moyen d'onboarder le siège EPSP d'Oran
+lui-même (seules les 7 polycliniques étaient proposées).
+
+### 24.3 🏛️ Deux secrétariats distincts, plus de `SECRETARIAT` générique
+
+`SECRETARIAT_DIRECTION` (siège EPSP/DSP, EPH, CHU, EHU) et
+`SECRETARIAT_POLYCLINIQUE` (toute institution dont le **nom** commence
+par "POLYCLINIQUE", détecté via `_is_polyclinique_name()` — fonctionne
+pour toute polyclinique actuelle ou future sans modification de code).
+
+`allowed_roles(institution_type, institution_name)` prend maintenant le
+nom en compte : `allowed_roles("EPSP", "EPSP Oran")` → 4 rôles direction ;
+`allowed_roles("EPSP", "POLYCLINIQUE ES SENIA")` → verrouillé sur
+`SECRETARIAT_POLYCLINIQUE` uniquement. Appliqué côté serveur dans
+`api_save_profile` — un client trafiqué ne peut pas créer un `DIRECTEUR`
+pour une polyclinique nommée.
+
+**Migration des données existantes, avec un vrai bug trouvé et corrigé
+avant livraison** : la première version de la migration utilisait
+`ALTER TABLE profiles ADD COLUMN role TEXT DEFAULT 'SECRETARIAT_DIRECTION'`
+— sur une base **pré-v2.8.5** (sans colonne `role` du tout), cela
+assignait directement la nouvelle valeur par défaut à toutes les lignes,
+y compris les anciennes Polycliniques, qui ne passaient donc jamais par
+l'ancienne valeur littérale `'SECRETARIAT'` que la requête de
+reclassification cherchait — une ancienne Polyclinique restait donc
+incorrectement classée `SECRETARIAT_DIRECTION`. **Trouvé en testant
+explicitement ce scénario précis** (simulation d'une base pré-v2.8.5).
+Corrigé : la colonne est ajoutée sans valeur par défaut (`NULL`), puis
+une classification explicite tourne à chaque démarrage
+(`WHERE role IS NULL OR role = 'SECRETARIAT'`), couvrant à la fois le cas
+pré-v2.8.5 (`NULL` après l'ALTER) et le cas v2.8.5-seul (valeur littérale
+`'SECRETARIAT'` déjà stockée). **Testé réellement sur les deux
+scénarios** : ancienne Polyclinique → `SECRETARIAT_POLYCLINIQUE` ; ancien
+EPH → `SECRETARIAT_DIRECTION` ; ligne v2.8.5 avec `'SECRETARIAT'` déjà
+stocké littéralement → `SECRETARIAT_POLYCLINIQUE` si Polyclinique.
+
+### 24.4 🐛 Doublons dans le menu Service/Rôle — cause réelle trouvée
+
+**Cause** : `showOnboarding()` s'exécute à chaque ouverture de l'écran
+d'onboarding (premier lancement ET "Ajouter un nouvel établissement"
+depuis l'écran de verrouillage), mais les `<select>` eux-mêmes ne sont
+jamais recréés — seules leurs options le sont. `wilayaSelect.
+addEventListener("change", ...)` et `typeSelect.addEventListener(...)`
+**empilaient** un nouvel écouteur à chaque appel au lieu de remplacer
+l'ancien. Après N ouvertures de l'onboarding, un seul changement
+déclenchait N rafraîchissements asynchrones qui se chevauchaient, chacun
+ajoutant sa propre copie de la liste avant que le `.innerHTML = ""` d'un
+autre appel n'ait eu le temps de nettoyer — exactement le symptôme
+"DIRECTEUR, DRH, DAS, SECRETARIAT répétés à la chaîne" signalé.
+
+**Correctif** : `addEventListener` remplacé par une assignation directe
+(`.onchange = fn`), qui remplace un gestionnaire précédent au lieu de
+s'empiler dessus, quel que soit le nombre de fois où `showOnboarding()`
+est appelée. Le vidage du menu (`innerHTML = ""`) déjà présent depuis la
+v2.8.5 reste en place — la vraie cause était l'empilement des
+écouteurs, pas l'absence de vidage.
+
+Le rafraîchissement des rôles est maintenant aussi déclenché par un
+changement de **nom** (pas seulement de type), puisque le rôle disponible
+dépend désormais du nom choisi (siège EPSP vs. polyclinique nommée) —
+chaîné après le rafraîchissement des noms (`await refreshOnboardingInstitutions()`
+puis `refreshOnboardingRoles()`) pour éviter une course où le rôle serait
+calculé sur un nom pas encore à jour.
+
+### 24.5 ⚙️ Adressage assoupli pour les institutions à rôle unique
+
+`find_local_profile_by_recipient()` : le repli "un seul profil sous ce
+nom → le livrer, même si le rôle précisé ne correspond pas exactement"
+s'applique désormais **que le service ait été précisé ou non** (avant :
+uniquement si omis). Nécessaire car le formulaire d'envoi soumet
+toujours une valeur de service (jamais `null`) — sans cet assouplissement,
+une polyclinique (qui n'a qu'un seul rôle possible) devenait injoignable
+dès que l'expéditeur laissait le service par défaut sur
+`SECRETARIAT_DIRECTION`. Aucune ambiguïté introduite pour les
+institutions multi-rôles (un siège EPSP), puisque `len(name_matches)`
+n'est égal à 1 que lorsqu'il n'existe réellement qu'un seul profil à
+livrer.
+
+### 24.6 📄 Registre régénéré (structure mise à jour)
+
+`tools/generate_serial_registry.py` : les polycliniques réelles d'Oran
+sont désormais générées avec `institution_type="EPSP"` et
+`role="SECRETARIAT_POLYCLINIQUE"` — leur code de clé change en
+conséquence (`TSH-31-EP-...` au lieu de l'ancien `TSH-31-PC-...`). Toute
+clé notée avant cette version pour une polyclinique ne correspondra plus
+et doit être régénérée après ré-onboarding sous le nouveau système.
+424 entrées au total (58 wilayas × DSP(2) + EPSP siège(4) + EPH(1) +
+CHU(1, wilayas concernées) + 7 polycliniques d'Oran(1 rôle chacune)).
+
+### 24.7 Régression complète (v2.8.1 → v2.8.6)
+
+Suite exécutée sur l'arborescence finale — WAL, `tracking_number`, HEIC,
+suivi des non-lus, appairage matériel + récupération (v2.8.5), retrait de
+Polyclinique, verrouillage serveur du rôle, et adressage vers une
+polyclinique malgré un service par défaut incorrect : **tout confirmé
+fonctionnel ensemble**, aucune régression.
+
+**Fichiers modifiés :** `app.py` (types, rôles, migration, adressage),
+`templates/index.html` (options du sélecteur de service),
+`static/js/app.js` (correctif des écouteurs empilés, rafraîchissement des
+rôles par nom), `tools/generate_serial_registry.py` (structure
+polyclinique sous EPSP). Aucune fonctionnalité antérieure retirée.

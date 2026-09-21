@@ -201,7 +201,7 @@ _LEGACY_ARCHIVE_ENTRANT = os.path.join(BASE_DIR, "archives", "Courrier_Entrant")
 os.makedirs(PROFILES_DIR, exist_ok=True)
 
 APP_ROOT = os.path.dirname(os.path.abspath(__file__))
-APP_VERSION = "2.8.5"
+APP_VERSION = "2.8.6"
 GITHUB_REPO = "Aladdinweb/TASHIL-ES"  # used by the in-app OTA update checker
 
 app = Flask(__name__,
@@ -243,28 +243,62 @@ def handle_unexpected_error(e):
         return jsonify({"error": f"Erreur interne du serveur : {e}"}), 500
     raise e
 
-INSTITUTION_TYPES = ["DSP", "EPSP", "EPH", "CHU", "EHU", "Polyclinique"]
+INSTITUTION_TYPES = ["DSP", "EPSP", "EPH", "CHU", "EHU"]
+# v2.8.6: "Polyclinique" removed from INSTITUTION_TYPES — a polyclinic is
+# no longer onboarded as its own institution type; it's a specific NAME
+# chosen under an EPSP (see get_onboarding_institutions), with its own
+# distinct role (SECRETARIAT_POLYCLINIQUE). "Polyclinique" stays mapped
+# in _TYPE_CODES so any institution_key/serial_key already stored for a
+# pre-v2.8.6 profile of that type still decodes/regenerates correctly —
+# removing it here would only affect NEW onboarding, which is already
+# blocked by its absence from INSTITUTION_TYPES above.
 _TYPE_CODES = {"DSP": "DS", "EPSP": "EP", "EPH": "EH", "CHU": "CU", "EHU": "HU", "Polyclinique": "PC"}
 
-# v2.8.5: institutional role hierarchy. A DSP or an EPSP has several
+# v2.8.6: the generic "SECRETARIAT" role is retired in favor of two
+# explicit, non-ambiguous labels — a secretariat can mean two very
+# different things in this system (an EPSP/DSP's own direction-level
+# secretariat, vs. a specific polyclinic's front-desk secretariat), and
+# collapsing them into one label made addressing genuinely ambiguous
+# once polyclinics started sharing their parent EPSP's institution type.
+ROLE_SECRETARIAT_DIRECTION = "SECRETARIAT_DIRECTION"
+ROLE_SECRETARIAT_POLYCLINIQUE = "SECRETARIAT_POLYCLINIQUE"
+DEFAULT_ROLE = ROLE_SECRETARIAT_DIRECTION
+
+# v2.8.5/6: institutional role hierarchy. A DSP or an EPSP has several
 # real distinct services that each need their own isolated inbox
-# (DIRECTEUR sees confidential mail, DRH sees personnel matters, etc.) —
-# every other structure type (EPH, CHU, EHU, Polyclinique) has a single
-# SECRETARIAT role, no exceptions. ROLE_RULES is the single source of
-# truth for both the onboarding form (role choice, or auto-locked when
-# there's only one) and the send form's service selector.
+# (DIRECTEUR sees confidential mail, DRH sees personnel matters, etc.).
+# EPH/CHU/EHU (standalone facilities, not polyclinics) get exactly one
+# role: SECRETARIAT_DIRECTION, via the fallback in allowed_roles() below.
 ROLE_RULES = {
-    "DSP": ["DIRECTEUR", "SECRETARIAT"],
-    "EPSP": ["DIRECTEUR", "DRH", "DAS", "SECRETARIAT"],
+    "DSP": ["DIRECTEUR", ROLE_SECRETARIAT_DIRECTION],
+    "EPSP": ["DIRECTEUR", "DRH", "DAS", ROLE_SECRETARIAT_DIRECTION],
 }
-DEFAULT_ROLE = "SECRETARIAT"
 
 
-def allowed_roles(institution_type: str) -> list:
-    """Every structure type not explicitly listed in ROLE_RULES (EPH,
-    CHU, EHU, Polyclinique) gets exactly one role: SECRETARIAT — by
-    design, not omission, per the v2.8.5 role hierarchy."""
+def _is_polyclinique_name(institution_name: str) -> bool:
+    """
+    v2.8.6: a polyclinic is now identified by its NAME starting with
+    "POLYCLINIQUE" (case-insensitive) rather than by a separate
+    institution_type — matches every curated real name in
+    _REAL_ESSENIA_POLYCLINICS, and any future one typed the same way,
+    with no code change needed per new polyclinic.
+    """
+    return institution_name.strip().upper().startswith("POLYCLINIQUE")
+
+
+def allowed_roles(institution_type: str, institution_name: str = None) -> list:
+    """
+    v2.8.6: role availability now depends on the NAME too, not just the
+    type — an EPSP's own head office (e.g. "EPSP Oran") gets the full
+    direction-level role set, but a polyclinic NAMED under that same
+    EPSP type gets exactly one role: SECRETARIAT_POLYCLINIQUE. Every
+    other structure type (EPH, CHU, EHU) still gets exactly one role,
+    SECRETARIAT_DIRECTION, via the fallback below — by design.
+    """
+    if institution_type == "EPSP" and institution_name and _is_polyclinique_name(institution_name):
+        return [ROLE_SECRETARIAT_POLYCLINIQUE]
     return ROLE_RULES.get(institution_type, [DEFAULT_ROLE])
+
 
 WILAYAS = [
     (1, "Adrar"), (2, "Chlef"), (3, "Laghouat"), (4, "Oum El Bouaghi"),
@@ -310,10 +344,13 @@ def _build_institutions_directory():
         entries.append(f"DSP {wilaya_name}")  # v2.8.5: one DSP per wilaya, all 58 covered
         entries.append(f"EPSP {wilaya_name}")
         entries.append(f"EPH {wilaya_name}")
-        entries.append(f"Polyclinique {wilaya_name}")
+        # v2.8.6: no more generic "Polyclinique <Wilaya>" entry — a
+        # polyclinic is now a specific NAME under its EPSP (see
+        # _REAL_ESSENIA_POLYCLINICS above), not its own institution type.
         if wilaya_name in _CHU_WILAYAS:
             entries.append(f"CHU {wilaya_name}")
     return sorted(set(entries))
+
 
 INSTITUTIONS_DIRECTORY = _build_institutions_directory()
 
@@ -329,20 +366,29 @@ INSTITUTIONS_DIRECTORY = _build_institutions_directory()
 # --------------------------------------------------------------------------- #
 _ONBOARDING_KNOWN = {
     (31, "EPSP"): list(_REAL_ESSENIA_POLYCLINICS),
-    (31, "Polyclinique"): list(_REAL_ESSENIA_POLYCLINICS),
     (31, "EPH"): ["EPH AIN TURCK"],
     (31, "CHU"): ["CHU ORAN"],
     (31, "EHU"): ["EHU ORAN"],
 }
 
 def get_onboarding_institutions(wilaya_code: int, institution_type: str):
-    known = _ONBOARDING_KNOWN.get((wilaya_code, institution_type))
-    if known:
-        return list(known)
     wilaya_name = dict(WILAYAS).get(wilaya_code)
     if wilaya_name is None:
         return []
-    return [f"{institution_type} {wilaya_name}"]
+    generic = f"{institution_type} {wilaya_name}"
+    known = _ONBOARDING_KNOWN.get((wilaya_code, institution_type), [])
+
+    if institution_type == "EPSP":
+        # v2.8.6: an EPSP's onboarding list must ALWAYS include its own
+        # head office (the generic name) — a polyclinic is chosen from
+        # this SAME list, as a curated real name, "sous la tutelle de
+        # son EPSP" rather than as its own institution type. Without
+        # this, wilaya 31 previously had no way to onboard the EPSP
+        # head office itself, only its polyclinics.
+        return [generic] + [n for n in known if n != generic]
+
+    return list(known) if known else [generic]
+
 
 
 # --------------------------------------------------------------------------- #
@@ -441,11 +487,39 @@ def init_registry_db():
         # to the "not in existing_cols" guard, same pattern as every
         # other migration in this function.
         if "role" not in existing_cols:
-            conn.execute(f"ALTER TABLE profiles ADD COLUMN role TEXT DEFAULT '{DEFAULT_ROLE}'")
+            # v2.8.6 fix: do NOT default straight to DEFAULT_ROLE here —
+            # a pre-v2.8.5 database has no role information at all yet,
+            # and defaulting it immediately to today's DEFAULT_ROLE would
+            # make it indistinguishable from a genuinely SECRETARIAT_
+            # DIRECTION row, so a legacy Polyclinique-typed profile would
+            # never get correctly reclassified as SECRETARIAT_POLYCLINIQUE
+            # by the UPDATE just below. Leave it NULL; the classification
+            # step handles both this case and the v2.8.5-only case (where
+            # the column already existed with the literal 'SECRETARIAT').
+            conn.execute("ALTER TABLE profiles ADD COLUMN role TEXT")
         # NULL until the first successful unlock on a given machine —
         # see get_hardware_fingerprint() and api_session_unlock().
         if "paired_hardware_hash" not in existing_cols:
             conn.execute("ALTER TABLE profiles ADD COLUMN paired_hardware_hash TEXT")
+
+        # v2.8.6: classify any row with no role info yet (NULL — a
+        # freshly-added column on a pre-v2.8.5 database) OR the legacy
+        # generic 'SECRETARIAT' value (a v2.8.5-only database, before
+        # this split existed) — a pre-v2.8.6 Polyclinique-typed profile
+        # becomes SECRETARIAT_POLYCLINIQUE; everything else (DSP/EPSP/
+        # EPH/CHU/EHU) becomes SECRETARIAT_DIRECTION. Runs every startup
+        # rather than being gated behind a one-time flag — cheap,
+        # targeted UPDATE ... WHERE that becomes a genuine no-op (0 rows
+        # matched) once every legacy row has been classified once.
+        conn.execute(
+            "UPDATE profiles SET role = ? WHERE (role IS NULL OR role = 'SECRETARIAT') "
+            "AND institution_type = 'Polyclinique'",
+            (ROLE_SECRETARIAT_POLYCLINIQUE,)
+        )
+        conn.execute(
+            "UPDATE profiles SET role = ? WHERE role IS NULL OR role = 'SECRETARIAT'",
+            (ROLE_SECRETARIAT_DIRECTION,)
+        )
 
 
 init_registry_db()
@@ -703,14 +777,21 @@ def find_local_profile_by_recipient(recipient_text: str, recipient_role: str = N
          unambiguous by construction, works regardless of role.
       2. institution_name + role together (v2.8.5) — REQUIRED now that
          a single institution can have several role-specific profiles
-         (DIRECTEUR, DRH, DAS, SECRETARIAT for an EPSP/DSP); matching by
-         name alone would be ambiguous and could deliver to the wrong
-         service. recipient_role defaults to SECRETARIAT when omitted,
-         matching "si non spécifié, orienté vers le SECRETARIAT".
-      3. institution_name alone, ONLY when recipient_role is not given
-         AND exactly one profile with that name exists locally — a
-         narrow backward-compatible path for pre-v2.8.5 senders/data
-         that never specified a service.
+         (DIRECTEUR, DRH, DAS, SECRETARIAT_DIRECTION for an EPSP/DSP);
+         matching by name alone would be ambiguous and could deliver to
+         the wrong service. recipient_role defaults to
+         SECRETARIAT_DIRECTION when omitted, matching "si non spécifié,
+         orienté vers le SECRETARIAT".
+      3. institution_name alone, whenever exactly ONE profile with that
+         name exists locally — regardless of whether a role was given
+         (v2.8.6: relaxed from "only when role omitted", since a named
+         polyclinic only ever has a single SECRETARIAT_POLYCLINIQUE
+         profile, and the send form always submits SOME service value;
+         requiring an exact role match there would make a polyclinic
+         unreachable whenever the sender left the default service
+         selection untouched). This never introduces ambiguity for a
+         multi-role institution (EPSP head office), since len(name_matches)
+         is only 1 when there truly is just one profile to deliver to.
     Returns None if no match — this does NOT reach across a network to a
     different computer; see the honesty note in api_send_message().
     """
@@ -730,7 +811,7 @@ def find_local_profile_by_recipient(recipient_text: str, recipient_role: str = N
     role_matches = [r for r in name_matches if (r.get("role") or DEFAULT_ROLE).strip().upper() == role_norm]
     if role_matches:
         return role_matches[0]
-    if recipient_role is None and len(name_matches) == 1:
+    if len(name_matches) == 1:
         return name_matches[0]
     return None
 
@@ -1399,14 +1480,12 @@ def api_save_profile():
     if wilaya_name is None:
         return jsonify({"error": "Wilaya invalide."}), 400
 
-    # v2.8.5: the server is the actual authority on which role is valid
-    # for this institution type — never trust a frontend lock alone.
-    # When only one role exists for this type (every structure except
-    # DSP/EPSP), it's silently enforced regardless of what was submitted,
-    # exactly matching "le rôle est automatiquement verrouillé" from the
-    # spec — a client bug or a tampered request can't create a
-    # DIRECTEUR profile for a Polyclinique.
-    valid_roles = allowed_roles(institution_type)
+    # v2.8.5/6: the server is the actual authority on which role is
+    # valid — never trust a frontend lock alone. institution_name now
+    # matters too: a polyclinic NAME under an EPSP is locked to
+    # SECRETARIAT_POLYCLINIQUE regardless of what the client submitted,
+    # even though its institution_type is "EPSP" like its head office.
+    valid_roles = allowed_roles(institution_type, institution_name)
     role = requested_role if requested_role in valid_roles else valid_roles[0]
 
     key = make_institution_key(wilaya_code, institution_type, institution_name, role)
@@ -1433,13 +1512,15 @@ def api_save_profile():
 
 @app.route("/api/roles", methods=["GET"])
 def api_roles():
-    """v2.8.5: lets the onboarding form ask the server which roles are
-    valid for a given institution type, rather than duplicating
-    ROLE_RULES in JavaScript — one source of truth."""
+    """v2.8.5/6: lets the onboarding form ask the server which roles are
+    valid for a given institution type (+ name, since a polyclinic NAME
+    under an EPSP has a different role set than the EPSP head office
+    itself), rather than duplicating ROLE_RULES in JavaScript."""
     institution_type = request.args.get("institution_type", "")
+    institution_name = request.args.get("institution_name", "") or None
     if institution_type not in INSTITUTION_TYPES:
         return jsonify({"error": "Type d'établissement invalide."}), 400
-    roles = allowed_roles(institution_type)
+    roles = allowed_roles(institution_type, institution_name)
     return jsonify({"roles": roles, "locked": len(roles) == 1})
 
 
