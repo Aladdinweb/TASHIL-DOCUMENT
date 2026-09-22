@@ -101,37 +101,44 @@ def build_registry_rows():
                 "serial_key": tashil_app.generate_serial_key(wilaya_code, "DSP", dsp_name, role),
             })
 
-        # EPSP — ⚠️ only Oran (wilaya 31) has a REAL, confirmed list of
-        # named EPSP/polyclinics in this project (see app.py's
-        # _ONBOARDING_KNOWN). Every other wilaya falls back to a single
-        # generic "EPSP <Wilaya>" placeholder name — the SAME convention
-        # the app itself already uses in its own onboarding directory
-        # (get_onboarding_institutions). This registry entry is a
-        # reference for THAT generic name; if a wilaya's real EPSP is
-        # onboarded under a different, more specific name, its actual
-        # serial_key will differ from what's listed here and must be
-        # looked up from that institution's own onboarding screen
-        # instead (Paramètres shows it once created).
-        epsp_name = f"EPSP {wilaya_name}"
-        for role in tashil_app.allowed_roles("EPSP"):
-            rows.append({
-                "wilaya_code": wilaya_code,
-                "wilaya_name": wilaya_name,
-                "institution_type": "EPSP",
-                "institution_name": epsp_name,
-                "role": role,
-                "serial_key": tashil_app.generate_serial_key(wilaya_code, "EPSP", epsp_name, role),
-            })
+        # v2.8.7: a wilaya has SEVERAL distinct EPSPs, each with its own
+        # head office and its own attached satellite structures
+        # (polyclinics, salles de soin) — see app.py's _EPSP_HIERARCHY,
+        # the single source of truth this script reuses directly rather
+        # than duplicating. ⚠️ Only Oran (wilaya 31) has a real,
+        # confirmed breakdown; every other wilaya still falls back to
+        # the single generic "EPSP <Wilaya>" head-office placeholder —
+        # the SAME convention the app itself uses in its own onboarding
+        # directory (get_onboarding_institutions).
+        epsp_hierarchy = tashil_app._EPSP_HIERARCHY.get(wilaya_code)
+        if epsp_hierarchy:
+            for epsp_name, satellites in epsp_hierarchy.items():
+                for role in tashil_app.allowed_roles("EPSP", epsp_name):
+                    rows.append({
+                        "wilaya_code": wilaya_code, "wilaya_name": wilaya_name,
+                        "institution_type": "EPSP", "institution_name": epsp_name, "role": role,
+                        "serial_key": tashil_app.generate_serial_key(wilaya_code, "EPSP", epsp_name, role),
+                    })
+                for sat_name in satellites:
+                    for role in tashil_app.allowed_roles("EPSP", sat_name):
+                        rows.append({
+                            "wilaya_code": wilaya_code, "wilaya_name": wilaya_name,
+                            "institution_type": "EPSP", "institution_name": sat_name, "role": role,
+                            "serial_key": tashil_app.generate_serial_key(wilaya_code, "EPSP", sat_name, role),
+                        })
+        else:
+            epsp_name = f"EPSP {wilaya_name}"
+            for role in tashil_app.allowed_roles("EPSP", epsp_name):
+                rows.append({
+                    "wilaya_code": wilaya_code, "wilaya_name": wilaya_name,
+                    "institution_type": "EPSP", "institution_name": epsp_name, "role": role,
+                    "serial_key": tashil_app.generate_serial_key(wilaya_code, "EPSP", epsp_name, role),
+                })
 
-        # v2.8.5.1 fix — gap found in production: EPH, CHU, and
-        # Polyclinique were MISSING from this registry entirely. They
-        # are SECRETARIAT-only (allowed_roles() returns exactly one
-        # role for them), but they are real, onboardable institution
-        # types in app.py's own INSTITUTION_TYPES and directory — an
-        # onboarded Polyclinique with no registry entry has no way to
-        # recover a forgotten PIN. This mirrors app.py's own
-        # _build_institutions_directory() so the registry's coverage
-        # matches what the app itself actually lets someone onboard.
+        # v2.8.7: EPH/CHU/EHU now get the same 4-role set as an EPSP
+        # head office (DRH, DAS, SECRETARIAT_DIRECTION, SECRETARIAT_
+        # GENERAL) instead of a single catch-all role — allowed_roles()
+        # already reflects this, no special-casing needed here.
         eph_name = f"EPH {wilaya_name}"
         for role in tashil_app.allowed_roles("EPH"):
             rows.append({
@@ -148,27 +155,6 @@ def build_registry_rows():
                     "institution_type": "CHU", "institution_name": chu_name, "role": role,
                     "serial_key": tashil_app.generate_serial_key(wilaya_code, "CHU", chu_name, role),
                 })
-
-        # v2.8.6: Polyclinique is no longer a separate institution_type —
-        # a polyclinic is a specific NAME chosen under its EPSP, with
-        # institution_type "EPSP" and role SECRETARIAT_POLYCLINIQUE.
-        # Only Oran (wilaya 31) has real, confirmed polyclinic names on
-        # file (_REAL_ESSENIA_POLYCLINICS); every other wilaya's
-        # polyclinics, if any, must be looked up from that specific
-        # poste's own onboarding screen once created — there is no
-        # generic "Polyclinique <Wilaya>" placeholder anymore, since a
-        # polyclinic without a real name to onboard under isn't
-        # onboardable in the first place (its parent EPSP head office,
-        # already covered above, is what a generic placeholder would
-        # have meant).
-        if wilaya_code == 31:  # Oran — the only wilaya with real named polyclinics on file
-            for real_name in tashil_app._REAL_ESSENIA_POLYCLINICS:
-                for role in tashil_app.allowed_roles("EPSP", real_name):
-                    rows.append({
-                        "wilaya_code": wilaya_code, "wilaya_name": wilaya_name,
-                        "institution_type": "EPSP", "institution_name": real_name, "role": role,
-                        "serial_key": tashil_app.generate_serial_key(wilaya_code, "EPSP", real_name, role),
-                    })
     return rows
 
 
@@ -178,8 +164,9 @@ def write_markdown(rows, path):
         "",
         f"**Généré le :** {datetime.now().strftime('%Y-%m-%d %H:%M')}",
         f"**Nombre d'entrées :** {len(rows)} "
-        f"(DSP, EPSP — siège + polycliniques nommées sous tutelle —, "
-        f"EPH, CHU : génériques par wilaya)",
+        f"(DSP ; EPSP — plusieurs sièges réels par wilaya + leurs "
+        f"polycliniques/salles de soin rattachées ; EPH/CHU avec "
+        f"DRH/DAS/Secrétariat Direction/Secrétariat Général)",
         "",
         "⚠️ Voir l'en-tête de `generate_serial_registry.py` pour les "
         "consignes de sécurité complètes avant toute diffusion de ce fichier.",

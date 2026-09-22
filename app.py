@@ -201,7 +201,7 @@ _LEGACY_ARCHIVE_ENTRANT = os.path.join(BASE_DIR, "archives", "Courrier_Entrant")
 os.makedirs(PROFILES_DIR, exist_ok=True)
 
 APP_ROOT = os.path.dirname(os.path.abspath(__file__))
-APP_VERSION = "2.8.6"
+APP_VERSION = "2.8.7"
 GITHUB_REPO = "Aladdinweb/TASHIL-ES"  # used by the in-app OTA update checker
 
 app = Flask(__name__,
@@ -254,48 +254,59 @@ INSTITUTION_TYPES = ["DSP", "EPSP", "EPH", "CHU", "EHU"]
 # blocked by its absence from INSTITUTION_TYPES above.
 _TYPE_CODES = {"DSP": "DS", "EPSP": "EP", "EPH": "EH", "CHU": "CU", "EHU": "HU", "Polyclinique": "PC"}
 
-# v2.8.6: the generic "SECRETARIAT" role is retired in favor of two
-# explicit, non-ambiguous labels — a secretariat can mean two very
-# different things in this system (an EPSP/DSP's own direction-level
-# secretariat, vs. a specific polyclinic's front-desk secretariat), and
-# collapsing them into one label made addressing genuinely ambiguous
-# once polyclinics started sharing their parent EPSP's institution type.
+# v2.8.6: the generic "SECRETARIAT" role is retired in favor of
+# explicit, non-ambiguous labels — a secretariat can mean different
+# things in this system (a direction-level secretariat, a general/front
+# secretariat, or a specific polyclinic's front-desk secretariat), and
+# collapsing them into one label made addressing genuinely ambiguous.
 ROLE_SECRETARIAT_DIRECTION = "SECRETARIAT_DIRECTION"
+ROLE_SECRETARIAT_GENERAL = "SECRETARIAT_GENERAL"
 ROLE_SECRETARIAT_POLYCLINIQUE = "SECRETARIAT_POLYCLINIQUE"
 DEFAULT_ROLE = ROLE_SECRETARIAT_DIRECTION
 
-# v2.8.5/6: institutional role hierarchy. A DSP or an EPSP has several
-# real distinct services that each need their own isolated inbox
-# (DIRECTEUR sees confidential mail, DRH sees personnel matters, etc.).
-# EPH/CHU/EHU (standalone facilities, not polyclinics) get exactly one
-# role: SECRETARIAT_DIRECTION, via the fallback in allowed_roles() below.
+# v2.8.5/6/7: institutional role hierarchy. A DSP or an EPSP head office
+# has several real distinct services that each need their own isolated
+# inbox (DIRECTEUR sees confidential mail, DRH sees personnel matters,
+# etc.). EPH/CHU/EHU now get the same kind of precise service choice
+# (DRH, DAS, a direction-level secretariat, and a general secretariat)
+# rather than a single catch-all role — requested explicitly so staff at
+# these standalone facilities can pick their exact service too.
 ROLE_RULES = {
     "DSP": ["DIRECTEUR", ROLE_SECRETARIAT_DIRECTION],
     "EPSP": ["DIRECTEUR", "DRH", "DAS", ROLE_SECRETARIAT_DIRECTION],
+    "EPH": ["DRH", "DAS", ROLE_SECRETARIAT_DIRECTION, ROLE_SECRETARIAT_GENERAL],
+    "CHU": ["DRH", "DAS", ROLE_SECRETARIAT_DIRECTION, ROLE_SECRETARIAT_GENERAL],
+    "EHU": ["DRH", "DAS", ROLE_SECRETARIAT_DIRECTION, ROLE_SECRETARIAT_GENERAL],
 }
 
 
-def _is_polyclinique_name(institution_name: str) -> bool:
+def _is_satellite_structure_name(institution_name: str) -> bool:
     """
-    v2.8.6: a polyclinic is now identified by its NAME starting with
-    "POLYCLINIQUE" (case-insensitive) rather than by a separate
-    institution_type — matches every curated real name in
-    _REAL_ESSENIA_POLYCLINICS, and any future one typed the same way,
-    with no code change needed per new polyclinic.
+    v2.8.7: a "satellite" structure — a polyclinic OR a salle de soin —
+    attached to an EPSP, identified by its NAME starting with
+    "POLYCLINIQUE" or "SALLE DE SOIN" (case-insensitive), rather than by
+    a separate institution_type. Matches every curated real name in
+    _EPSP_HIERARCHY, and any future one typed the same way, with no code
+    change needed per new satellite structure. (Named
+    _is_polyclinique_name through v2.8.6; renamed when "salle de soin"
+    entries were added — same role, SECRETARIAT_POLYCLINIQUE, applies to
+    both kinds, since neither has direction-level staff of its own.)
     """
-    return institution_name.strip().upper().startswith("POLYCLINIQUE")
+    name = institution_name.strip().upper()
+    return name.startswith("POLYCLINIQUE") or name.startswith("SALLE DE SOIN")
 
 
 def allowed_roles(institution_type: str, institution_name: str = None) -> list:
     """
-    v2.8.6: role availability now depends on the NAME too, not just the
-    type — an EPSP's own head office (e.g. "EPSP Oran") gets the full
-    direction-level role set, but a polyclinic NAMED under that same
-    EPSP type gets exactly one role: SECRETARIAT_POLYCLINIQUE. Every
-    other structure type (EPH, CHU, EHU) still gets exactly one role,
-    SECRETARIAT_DIRECTION, via the fallback below — by design.
+    v2.8.6/7: role availability depends on the NAME too, not just the
+    type — an EPSP's own head office (e.g. "EPSP ES SENIA") gets the
+    full direction-level role set, but a polyclinic or salle de soin
+    NAMED under that same EPSP type gets exactly one role:
+    SECRETARIAT_POLYCLINIQUE. EPH/CHU/EHU get their own 4-role set via
+    ROLE_RULES above; anything else not listed falls back to
+    DEFAULT_ROLE alone, defensively.
     """
-    if institution_type == "EPSP" and institution_name and _is_polyclinique_name(institution_name):
+    if institution_type == "EPSP" and institution_name and _is_satellite_structure_name(institution_name):
         return [ROLE_SECRETARIAT_POLYCLINIQUE]
     return ROLE_RULES.get(institution_type, [DEFAULT_ROLE])
 
@@ -326,27 +337,68 @@ WILAYAS = [
 # ⚠️ STARTER LIST, NOT AN OFFICIAL REGISTRY — see onboarding directory notes
 # further down for the same caveat, which applies here too.
 # --------------------------------------------------------------------------- #
-_REAL_ESSENIA_POLYCLINICS = [
-    "POLYCLINIQUE ES SENIA",
-    "POLYCLINIQUE AADL AIN BEIDA MABROUK LOUCIF",
-    "POLYCLINIQUE AIN BEIDA 1",
-    "POLYCLINIQUE AIN BEIDA 2",
-    "POLYCLINIQUE SIDI MAAROUF",
-    "POLYCLINIQUE SIDI CHAHMI",
-    "POLYCLINIQUE EL KERMA",
-]
+# v2.8.7: a wilaya has SEVERAL distinct EPSPs, each with its own head
+# office and its own specifically-attached satellite structures
+# (polyclinics, salles de soin) — NOT one undifferentiated "EPSP
+# <Wilaya>" covering everything, which was the pre-v2.8.7 model and
+# caused real institutions to be unfindable (e.g. "EPSP MISSERGHIN" or
+# "EPSP SEDDIKIA" simply didn't exist as onboarding choices).
+#
+# ⚠️ Only Oran (wilaya 31) has a real, user-confirmed hierarchy below —
+# every other wilaya still falls back to the single generic
+# "EPSP <Wilaya>" head-office option with no satellites, exactly as
+# before v2.8.7, until its own real EPSP breakdown is provided the same
+# way. Guessing a hierarchy for a wilaya without confirmed data would
+# risk misrouting real administrative/medical correspondence — worse
+# than temporarily offering only the generic head-office option, which
+# every "Autre (saisir manuellement)" fallback already covers today.
+_EPSP_HIERARCHY = {
+    31: {
+        "EPSP ES SENIA": [
+            "POLYCLINIQUE ES SENIA",
+            "POLYCLINIQUE AADL AIN BEIDA MABROUK LOUCIF",
+            "POLYCLINIQUE AIN BEIDA 1",
+            "POLYCLINIQUE AIN BEIDA 2",
+            "POLYCLINIQUE SIDI MAAROUF",
+            "POLYCLINIQUE SIDI CHAHMI",
+            "POLYCLINIQUE EL KERMA",
+            "SALLE DE SOIN TERMINUS",
+        ],
+        "EPSP SEDDIKIA": [  # also known locally as "Front de Mer"
+            "POLYCLINIQUE AKID LOTFI",
+            "POLYCLINIQUE SEDDIKIA",
+            "POLYCLINIQUE GAMBETTA",
+        ],
+        "EPSP ARZEW": [
+            "POLYCLINIQUE ARZEW",
+            "POLYCLINIQUE BETHIOUA",
+            "POLYCLINIQUE GDYEL",
+        ],
+        "EPSP BOUTLELIS": [
+            "POLYCLINIQUE MISSERGHIN",
+            "POLYCLINIQUE BOUTLELIS",
+        ],
+    }
+}
 _CHU_WILAYAS = {"Alger", "Oran", "Constantine", "Annaba", "Tlemcen", "Sétif",
                 "Batna", "Blida", "Béjaïa", "Sidi Bel Abbès", "Tizi Ouzou"}
 
 def _build_institutions_directory():
-    entries = list(_REAL_ESSENIA_POLYCLINICS)
-    for _, wilaya_name in WILAYAS:
+    entries = []
+    for wilaya_code, wilaya_name in WILAYAS:
         entries.append(f"DSP {wilaya_name}")  # v2.8.5: one DSP per wilaya, all 58 covered
-        entries.append(f"EPSP {wilaya_name}")
+        epsp_hierarchy = _EPSP_HIERARCHY.get(wilaya_code)
+        if epsp_hierarchy:
+            # v2.8.7: every real, distinctly-named EPSP head office AND
+            # every satellite structure attached to it — not the generic
+            # "EPSP <Wilaya>" placeholder, which no longer applies once
+            # a wilaya's real breakdown is known.
+            for epsp_name, satellites in epsp_hierarchy.items():
+                entries.append(epsp_name)
+                entries.extend(satellites)
+        else:
+            entries.append(f"EPSP {wilaya_name}")
         entries.append(f"EPH {wilaya_name}")
-        # v2.8.6: no more generic "Polyclinique <Wilaya>" entry — a
-        # polyclinic is now a specific NAME under its EPSP (see
-        # _REAL_ESSENIA_POLYCLINICS above), not its own institution type.
         if wilaya_name in _CHU_WILAYAS:
             entries.append(f"CHU {wilaya_name}")
     return sorted(set(entries))
@@ -365,7 +417,6 @@ INSTITUTIONS_DIRECTORY = _build_institutions_directory()
 # too, so no one is ever blocked by an incomplete list.
 # --------------------------------------------------------------------------- #
 _ONBOARDING_KNOWN = {
-    (31, "EPSP"): list(_REAL_ESSENIA_POLYCLINICS),
     (31, "EPH"): ["EPH AIN TURCK"],
     (31, "CHU"): ["CHU ORAN"],
     (31, "EHU"): ["EHU ORAN"],
@@ -375,18 +426,27 @@ def get_onboarding_institutions(wilaya_code: int, institution_type: str):
     wilaya_name = dict(WILAYAS).get(wilaya_code)
     if wilaya_name is None:
         return []
-    generic = f"{institution_type} {wilaya_name}"
-    known = _ONBOARDING_KNOWN.get((wilaya_code, institution_type), [])
 
     if institution_type == "EPSP":
-        # v2.8.6: an EPSP's onboarding list must ALWAYS include its own
-        # head office (the generic name) — a polyclinic is chosen from
-        # this SAME list, as a curated real name, "sous la tutelle de
-        # son EPSP" rather than as its own institution type. Without
-        # this, wilaya 31 previously had no way to onboard the EPSP
-        # head office itself, only its polyclinics.
-        return [generic] + [n for n in known if n != generic]
+        # v2.8.7: list EVERY real, distinctly-named EPSP for this
+        # wilaya, each immediately followed by its own satellite
+        # structures — "[Nom EPSP] - SIÈGE" is shown as the label in the
+        # frontend's <option> text (see app.js), while the stored
+        # institution_name stays the clean "EPSP X" (no suffix), so
+        # addressing/registry entries remain simple exact-name matches.
+        # Falls back to the single generic head-office option for any
+        # wilaya without a confirmed real breakdown yet.
+        epsp_hierarchy = _EPSP_HIERARCHY.get(wilaya_code)
+        if epsp_hierarchy:
+            result = []
+            for epsp_name, satellites in epsp_hierarchy.items():
+                result.append(epsp_name)
+                result.extend(satellites)
+            return result
+        return [f"EPSP {wilaya_name}"]
 
+    generic = f"{institution_type} {wilaya_name}"
+    known = _ONBOARDING_KNOWN.get((wilaya_code, institution_type), [])
     return list(known) if known else [generic]
 
 
@@ -702,6 +762,19 @@ def get_profile_db(institution_key: str) -> sqlite3.Connection:
     # is_read=0, which is what actually drives the unread count.
     if "is_read" not in existing_cols:
         conn.execute("ALTER TABLE messages ADD COLUMN is_read INTEGER DEFAULT 1")
+        # v2.8.7: fixes a real, previously-documented bug (STATE.md
+        # v2.8.5 §22.9) — read-receipt routing only knew the sender's
+        # institution NAME, so it silently failed (leaving "En attente"
+        # stuck forever) whenever the sender's role wasn't the default
+        # one, or several role-specific profiles shared that name. This
+        # column records the sender's own exact institution_key on
+        # every message it delivers to someone else's inbox — an
+        # unambiguous address to route the accusé back to, no name/role
+        # guessing needed. NULL for messages received before this
+        # column existed; route_read_receipt() falls back to the old
+        # name-based matching for those.
+        if "sender_institution_key" not in existing_cols:
+            conn.execute("ALTER TABLE messages ADD COLUMN sender_institution_key TEXT")
     conn.execute("""
         CREATE TABLE IF NOT EXISTS bridge_pending_cleanup (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -906,7 +979,8 @@ def bridge_slug(institution_name: str, role: str = None) -> str:
     return base[:80]
 
 
-def push_to_bridge(cfg: dict, recipient_name: str, recipient_role: str, sender_name: str, subject: str,
+def push_to_bridge(cfg: dict, recipient_name: str, recipient_role: str, sender_name: str,
+                    sender_institution_key: str, subject: str,
                     body: str, tracking: str, file_bytes: bytes, original_filename: str) -> bool:
     owner, repo, token = cfg["github_owner"], cfg["github_repo"], cfg["github_token"]
     key = bridge_slug(recipient_name, recipient_role)
@@ -918,6 +992,7 @@ def push_to_bridge(cfg: dict, recipient_name: str, recipient_role: str, sender_n
     meta = {
         "tracking_number": tracking,
         "sender_institution": sender_name,
+        "sender_institution_key": sender_institution_key,
         "recipient_institution": recipient_name,
         "recipient_role": recipient_role,
         "subject": subject,
@@ -1734,10 +1809,11 @@ def api_send_message():
                     recipient_conn.execute("""
                         INSERT INTO messages (direction, tracking_number, sender_institution,
                                                recipient_institution, subject, body, file_path,
-                                               file_original_name, status, delivery_method, is_read, created_at)
-                        VALUES ('entrant', ?, ?, ?, ?, ?, ?, ?, 'envoye', 'local', 0, ?)
+                                               file_original_name, status, delivery_method, is_read,
+                                               sender_institution_key, created_at)
+                        VALUES ('entrant', ?, ?, ?, ?, ?, ?, ?, 'envoye', 'local', 0, ?, ?)
                     """, (recipient_tracking, sender, recipient, subject, body,
-                          recipient_archived_path, original_filename, datetime.now().isoformat()))
+                          recipient_archived_path, original_filename, _active_key, datetime.now().isoformat()))
             except sqlite3.IntegrityError:
                 # Extremely rare tracking-number collision across two
                 # independent institution databases — disambiguate and retry.
@@ -1746,10 +1822,11 @@ def api_send_message():
                     recipient_conn.execute("""
                         INSERT INTO messages (direction, tracking_number, sender_institution,
                                                recipient_institution, subject, body, file_path,
-                                               file_original_name, status, delivery_method, is_read, created_at)
-                        VALUES ('entrant', ?, ?, ?, ?, ?, ?, ?, 'envoye', 'local', 0, ?)
+                                               file_original_name, status, delivery_method, is_read,
+                                               sender_institution_key, created_at)
+                        VALUES ('entrant', ?, ?, ?, ?, ?, ?, ?, 'envoye', 'local', 0, ?, ?)
                     """, (recipient_tracking, sender, recipient, subject, body,
-                          recipient_archived_path, original_filename, datetime.now().isoformat()))
+                          recipient_archived_path, original_filename, _active_key, datetime.now().isoformat()))
             delivered_locally = True
         except Exception:
             # Never fail the whole send just because local delivery hit an
@@ -1771,7 +1848,7 @@ def api_send_message():
             bridge_attempted = True
             try:
                 delivered_via_bridge = push_to_bridge(
-                    bridge_cfg, recipient, recipient_role, sender, subject, body,
+                    bridge_cfg, recipient, recipient_role, sender, _active_key, subject, body,
                     tracking, original_bytes, original_filename
                 )
             except Exception:
@@ -1853,34 +1930,58 @@ def route_read_receipt(message_row):
     Bridge otherwise. Never raises: a receipt that can't be delivered
     isn't worth failing the accusé action itself over — the requester's
     own local status update already succeeded regardless.
+
+    v2.8.7: prefers the exact sender_institution_key stored on the
+    message (added this version) over name-based matching — fixes a
+    real bug (STATE.md v2.8.5 §22.9) where a receipt silently failed to
+    route back whenever the sender's role wasn't the default one, or
+    several role-specific profiles shared that institution name, since
+    name-only matching couldn't tell them apart. Falls back to the old
+    name-based lookup for messages received before this column existed
+    (sender_institution_key is NULL on those).
     """
     tracking = message_row["tracking_number"]
     sender_name = message_row["sender_institution"] or ""
+    sender_key = message_row.get("sender_institution_key")
     delivery_method = message_row.get("delivery_method")
 
     try:
         if delivery_method == "local":
-            sender_profile = find_local_profile_by_recipient(sender_name, exclude_key=_active_key)
-            if sender_profile is not None:
-                with profile_db(sender_profile["institution_key"]) as sender_conn:
+            if sender_key:
+                with profile_db(sender_key) as sender_conn:
                     sender_conn.execute(
                         "UPDATE messages SET status = 'accuse' "
                         "WHERE tracking_number = ? AND direction = 'sortant'",
                         (tracking,)
                     )
+            else:
+                sender_profile = find_local_profile_by_recipient(sender_name, exclude_key=_active_key)
+                if sender_profile is not None:
+                    with profile_db(sender_profile["institution_key"]) as sender_conn:
+                        sender_conn.execute(
+                            "UPDATE messages SET status = 'accuse' "
+                            "WHERE tracking_number = ? AND direction = 'sortant'",
+                            (tracking,)
+                        )
         elif delivery_method == "bridge":
             cfg = get_bridge_config()
             if cfg and cfg["enabled"]:
                 acknowledger = get_profile_row(_active_key)
                 acknowledger_name = acknowledger["institution_name"] if acknowledger else "?"
-                push_receipt_to_bridge(cfg, sender_name, tracking, acknowledger_name)
+                push_receipt_to_bridge(cfg, sender_name, sender_key, tracking, acknowledger_name)
     except Exception:
         pass  # see docstring — a failed receipt never blocks the accusé itself
 
 
-def push_receipt_to_bridge(cfg: dict, sender_name: str, tracking: str, acknowledger_name: str) -> bool:
+def push_receipt_to_bridge(cfg: dict, sender_name: str, sender_key: str, tracking: str, acknowledger_name: str) -> bool:
     owner, repo, token = cfg["github_owner"], cfg["github_repo"], cfg["github_token"]
-    key = bridge_slug(sender_name)
+    # v2.8.7: address the receipt using the sender's exact
+    # institution_key when known — this is one of the addresses the
+    # sender's OWN poll loop already checks (see api_bridge_poll's
+    # keys_to_check, which includes bridge_slug(profile["institution_key"])),
+    # so no change is needed on the polling side. Falls back to the old
+    # name-based address (role-blind) for messages that predate this column.
+    key = bridge_slug(sender_key) if sender_key else bridge_slug(sender_name)
     receipt_path = f"bridge/{key}/receipts/{tracking}.json"
     payload = {
         "type": "receipt",
@@ -2427,12 +2528,14 @@ def api_bridge_poll():
             conn.execute("""
                 INSERT INTO messages (direction, tracking_number, sender_institution,
                                        recipient_institution, subject, body, file_path,
-                                       file_original_name, status, delivery_method, is_read, created_at)
-                VALUES ('entrant', ?, ?, ?, ?, ?, ?, ?, 'envoye', 'bridge', 0, ?)
+                                       file_original_name, status, delivery_method, is_read,
+                                       sender_institution_key, created_at)
+                VALUES ('entrant', ?, ?, ?, ?, ?, ?, ?, 'envoye', 'bridge', 0, ?, ?)
             """, (meta["tracking_number"], meta.get("sender_institution", "?"),
                   meta.get("recipient_institution", profile["institution_name"]),
                   encrypt_text(meta.get("subject", "")), encrypt_text(meta.get("body", "")),
                   local_path, meta.get("file_original_name", "document"),
+                  meta.get("sender_institution_key"),
                   meta.get("created_at", datetime.now().isoformat())))
             new_count += 1
 

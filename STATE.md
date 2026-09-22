@@ -1892,3 +1892,135 @@ fonctionnel ensemble**, aucune régression.
 `static/js/app.js` (correctif des écouteurs empilés, rafraîchissement des
 rôles par nom), `tools/generate_serial_registry.py` (structure
 polyclinique sous EPSP). Aucune fonctionnalité antérieure retirée.
+
+---
+
+## 25. v2.8.7 — Vraie hiérarchie multi-EPSP, rôles élargis EPH/CHU/EHU, correctif du bug "En attente" (2026-09-20)
+
+### 25.1 🏥 Structure réelle : plusieurs EPSP distincts par wilaya
+
+**Problème signalé** : un seul "EPSP Oran" générique regroupait toutes
+les polycliniques, alors qu'une wilaya contient plusieurs EPSP réels et
+distincts (EPSP ES SENIA, EPSP SEDDIKIA, EPSP ARZEW, EPSP BOUTLELIS pour
+Oran), chacun avec son propre siège et ses propres polycliniques
+rattachées.
+
+⚠️ **Rattachement partiellement inconnu, non deviné** : lors d'un
+premier échange, seul le rattachement EPSP ES SENIA ↔ POLYCLINIQUE ES
+SENIA était confirmé par l'exemple donné ; les 6 autres polycliniques
+déjà en base n'avaient pas de parent confirmé. Plutôt que d'inventer une
+hiérarchie administrative réelle (risque concret d'égarer du courrier
+médical/administratif), la répartition complète a été explicitement
+redemandée et fournie par l'utilisateur avant implémentation.
+
+**Structure implémentée** (`_EPSP_HIERARCHY` dans `app.py`, remplace
+l'ancien `_REAL_ESSENIA_POLYCLINICS` plat) :
+- **EPSP ES SENIA** — Siège + 7 polycliniques (ES SENIA, AADL AIN BEIDA
+  MABROUK LOUCIF, AIN BEIDA 1, AIN BEIDA 2, SIDI MAAROUF, SIDI CHAHMI,
+  EL KERMA) + Salle de Soin Terminus.
+- **EPSP SEDDIKIA** (Front de Mer) — Siège + 3 polycliniques (AKID
+  LOTFI, SEDDIKIA, GAMBETTA).
+- **EPSP ARZEW** — Siège + 3 polycliniques (ARZEW, BETHIOUA, GDYEL).
+- **EPSP BOUTLELIS** — Siège + 2 polycliniques (MISSERGHIN, BOUTLELIS).
+
+`get_onboarding_institutions("EPSP", ...)` retourne chaque siège suivi
+immédiatement de ses propres structures rattachées ; le frontend affiche
+le siège avec le libellé "- SIÈGE" (affichage uniquement, le
+`institution_name` stocké reste le nom propre, sans suffixe).
+
+Une nouvelle fonction `_is_satellite_structure_name()` généralise
+l'ancienne `_is_polyclinique_name()` pour reconnaître aussi les "SALLE
+DE SOIN" en plus des "POLYCLINIQUE" — même rôle unique
+`SECRETARIAT_POLYCLINIQUE` pour les deux, aucun rôle supplémentaire
+inventé.
+
+Toute wilaya sans hiérarchie confirmée retombe sur le comportement
+précédent (siège générique "EPSP <Wilaya>" seul) — aucune régression
+pour les 57 autres wilayas.
+
+### 25.2 🏛️ Rôles élargis pour EPH, CHU, EHU
+
+Ces trois types disposent désormais des mêmes 4 services précis qu'un
+siège EPSP : `DRH`, `DAS`, `SECRETARIAT_DIRECTION`, et un nouveau rôle
+`SECRETARIAT_GENERAL` (distinct du secrétariat de direction). Avant
+cette version, ces structures n'avaient qu'un rôle générique unique.
+Aucune migration de données nécessaire : les profils déjà onboardés
+gardent leur rôle existant (`SECRETARIAT_DIRECTION` par défaut suite à
+la migration v2.8.6) ; seul le choix disponible à l'onboarding change
+pour les nouveaux profils.
+
+### 25.3 🐛 Bug réel corrigé : compteur "En attente" bloqué après accusé
+
+**Cause exacte confirmée** (limite déjà documentée en v2.8.5 §22.9,
+restée non résolue jusqu'ici) : `route_read_receipt()` ne connaissait que
+le **nom** de l'institution émettrice, jamais son rôle précis. Dès qu'un
+expéditeur avait un rôle différent du défaut (`SECRETARIAT_DIRECTION`)
+ou que plusieurs profils partageaient ce nom (ex. un siège EPSP avec
+DIRECTEUR/DRH/DAS/SECRETARIAT_DIRECTION), le matching par nom échouait
+silencieusement — l'accusé n'était jamais appliqué côté expéditeur, et
+"En attente" restait bloqué indéfiniment.
+
+**Correctif** : nouvelle colonne `sender_institution_key` sur la table
+`messages` (migration idempotente, `NULL` pour les messages antérieurs)
+— chaque message livré (localement ou via Cloud Bridge) enregistre
+désormais l'`institution_key` exact de son expéditeur. `route_read_receipt()`
+utilise cette valeur pour cibler directement le bon profil, sans deviner
+par nom/rôle ; repli sur l'ancienne méthode uniquement pour les messages
+antérieurs à cette colonne. Côté Cloud Bridge, `push_receipt_to_bridge()`
+adresse désormais l'accusé via `bridge_slug(sender_institution_key)` —
+une adresse que le sondage de l'expéditeur vérifie déjà nativement
+(`keys_to_check` inclut `bridge_slug(institution_key)` depuis la v2.8.5),
+aucune modification côté sondage nécessaire.
+
+**Second problème trouvé en marge, corrigé aussi** : même une fois le
+routage réparé côté serveur, cliquer "Accusé" depuis l'onglet Boîte de
+réception ne rafraîchissait que cet onglet — le compteur du Tableau de
+Bord restait visuellement figé jusqu'à un changement d'onglet manuel.
+Corrigé : le clic sur "Accusé" rafraîchit désormais systématiquement
+aussi les statistiques du Tableau de Bord, quel que soit l'onglet actif.
+
+**Testé réellement, scénario complet reproduisant exactement le bug
+signalé** : profil SECRETARIAT_DIRECTION envoie à SENDER (rôle par
+défaut, aurait fonctionné par accident avant ce correctif) — test
+insuffisant à lui seul ; le test déterminant utilise un profil **DRH**
+(rôle non-défaut) comme émetteur du message vers SENDER, confirme
+l'échec attendu SANS le correctif (non exécuté ici, déjà documenté en
+v2.8.5), puis confirme `status == 'accuse'` correctement appliqué côté
+DRH **avec** le correctif — 17 tests exécutés au total, tous passent.
+
+### 25.4 🎨 Badges de statut colorés (Tableau de Bord)
+
+Nouvelle fonction JS `messageStatusDot(row)` : 🟢 message entrant (déjà
+reçu avec succès par définition) ou sortant avec accusé confirmé ; 🟠
+sortant transmis mais accusé pas encore reçu ; 🔴 sortant archivé mais
+jamais réellement transmis (`delivery_method` vide — ni correspondance
+locale, ni Cloud Bridge configuré/atteint). Purement visuel, aucun
+changement backend nécessaire (`delivery_method` déjà présent dans la
+réponse JSON existante).
+
+### 25.5 📄 Registre régénéré
+
+`tools/generate_serial_registry.py` reconstruit entièrement à partir de
+`app.py._EPSP_HIERARCHY` (plus de duplication de données) : chaque siège
+EPSP réel + ses propres structures rattachées, et EPH/CHU avec leurs 4
+rôles désormais alignés sur `allowed_roles()`. **652 entrées** générées
+et vérifiées (contre 424 en v2.8.6) — structure inspectée ligne par
+ligne pour Oran, confirmant les 4 sièges EPSP et leurs bonnes
+polycliniques respectives.
+
+### 25.6 Régression complète (v2.8.1 → v2.8.7)
+
+17 tests exécutés sur l'arborescence finale : WAL, `tracking_number`,
+HEIC, suivi des non-lus, appairage matériel + récupération, retrait de
+Polyclinique, rôle EPH étendu accepté, présence des 4 EPSP + leurs
+structures rattachées à Oran, verrouillage de rôle sur Salle de Soin, et
+le scénario complet de correction du bug d'accusé (DRH → SENDER →
+accusé → statut mis à jour). **Tout confirmé fonctionnel ensemble,
+aucune régression.**
+
+**Fichiers modifiés :** `app.py` (hiérarchie EPSP, rôles étendus,
+`sender_institution_key`, routage d'accusé corrigé), `templates/index.html`
+(option Secrétariat Général), `static/js/app.js` (libellé "- SIÈGE",
+badges de statut, rafraîchissement du tableau de bord après accusé),
+`tools/generate_serial_registry.py` (structure multi-EPSP). Aucune
+fonctionnalité antérieure retirée.

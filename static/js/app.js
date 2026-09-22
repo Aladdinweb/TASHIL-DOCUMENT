@@ -166,7 +166,12 @@ async function refreshOnboardingInstitutions() {
     (data.institutions || []).forEach(name => {
       const opt = document.createElement("option");
       opt.value = name;
-      opt.textContent = name;
+      // v2.8.7: label an EPSP head office as "- SIÈGE" so it's visually
+      // distinct from its own satellite structures listed right after
+      // it — display only, the stored institution_name stays the clean
+      // name with no suffix (matches server-side _is_satellite_structure_name).
+      const isSatellite = /^(POLYCLINIQUE|SALLE DE SOIN)/i.test(name.trim());
+      opt.textContent = (institutionType === "EPSP" && !isSatellite) ? `${name} - SIÈGE` : name;
       nameSelect.appendChild(opt);
     });
     const otherOpt = document.createElement("option");
@@ -784,6 +789,20 @@ function messageExcerpt(row) {
   return "—";
 }
 
+// v2.8.7: a simple colored dot per the requested convention:
+// 🟢 received/acknowledged successfully, 🟠 sent but still awaiting
+// accusé, 🔴 archived but never actually transmitted anywhere (no local
+// match found, no Cloud Bridge configured/reachable). An entrant
+// message is always green here — it already successfully arrived in
+// this inbox by definition; the traffic-light states describe an
+// outgoing message's delivery lifecycle, not a received one's.
+function messageStatusDot(row) {
+  if (row.direction === "entrant") return "🟢";
+  if (row.status === "accuse") return "🟢";
+  if (!row.delivery_method) return "🔴";
+  return "🟠";
+}
+
 async function loadDashboard() {
   const data = await fetch("/api/dashboard").then(r => r.json());
   document.getElementById("stat-sent").textContent = data.total_sent;
@@ -803,7 +822,7 @@ async function loadDashboard() {
     return `
     <div class="list-row">
       <div class="list-row-main">
-        <span class="list-row-title">${row.direction === "sortant" ? "📤" : "📥"} ${escapeHtml(row.subject && row.subject.trim() ? row.subject : "Sans objet")}</span>
+        <span class="list-row-title">${messageStatusDot(row)} ${row.direction === "sortant" ? "📤" : "📥"} ${escapeHtml(row.subject && row.subject.trim() ? row.subject : "Sans objet")}</span>
         <span class="list-row-sub">${escapeHtml(institution)} — ${escapeHtml(messageExcerpt(row))}</span>
         <span class="tracking-badge">${escapeHtml(row.tracking_number)}</span>
       </div>
@@ -855,6 +874,12 @@ function wireRowActions(container, onChanged) {
         if (!res.ok) throw new Error(data.error || "Échec de la confirmation.");
         showToast("✅ Réception confirmée", "success");
         if (onChanged) onChanged();
+        // v2.8.7: an accusé always changes the sender's "En attente"
+        // count on the Dashboard tab — refresh it here too, regardless
+        // of which tab is currently visible, since this action can be
+        // taken from the Inbox tab while Dashboard sits stale until the
+        // person happens to switch back to it.
+        if (onChanged !== loadDashboard) loadDashboard();
       } catch (err) {
         showToast(`⛔ ${err.message}`, "error");
       }
