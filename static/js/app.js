@@ -137,7 +137,7 @@ async function refreshOnboardingRoles() {
     (data.roles || ["SECRETARIAT_DIRECTION"]).forEach(role => {
       const opt = document.createElement("option");
       opt.value = role;
-      opt.textContent = role;
+      opt.textContent = roleLabel(role);
       roleSelect.appendChild(opt);
     });
     roleSelect.disabled = !!data.locked;
@@ -965,6 +965,82 @@ async function normalizeImageForUpload(file) {
   }
 }
 
+// v2.8.8: shared French labels for role values — used by both the
+// onboarding role selector and the send form's service selector, so
+// the two never drift into showing different wording for the same role.
+const ROLE_LABELS = {
+  DIRECTEUR: "Directeur",
+  DRH: "DRH",
+  DAS: "DAS",
+  SECRETARIAT_DIRECTION: "Secrétariat de Direction",
+  SECRETARIAT_GENERAL: "Secrétariat Général",
+  SECRETARIAT_POLYCLINIQUE: "Secrétariat de Polyclinique",
+};
+function roleLabel(role) {
+  return ROLE_LABELS[role] || role;
+}
+
+// v2.8.8: the "Service destinataire" selector on the send form never
+// actually filtered by which institution was typed/selected — it
+// always showed the full static list of every possible role across
+// every institution type, letting someone address a polyclinic's
+// SECRETARIAT_POLYCLINIQUE-only inbox as "DIRECTEUR" (which the backend
+// already tolerates via the single-profile fallback, but shouldn't be
+// offered as a real choice in the first place). guessInstitutionType()
+// reads the recipient's name using the SAME naming convention already
+// used everywhere else in this app (app.py's own directory-building
+// logic) to infer which type it belongs to, then asks the server
+// (GET /api/roles — the same endpoint onboarding already uses) which
+// roles actually apply, rather than duplicating ROLE_RULES here.
+function guessInstitutionType(name) {
+  const upper = (name || "").trim().toUpperCase();
+  if (!upper) return null;
+  if (upper.startsWith("POLYCLINIQUE") || upper.startsWith("SALLE DE SOIN")) return "EPSP";
+  if (upper.startsWith("EPSP")) return "EPSP";
+  if (upper.startsWith("DSP")) return "DSP";
+  if (upper.startsWith("EHU")) return "EHU";
+  if (upper.startsWith("EPH")) return "EPH";
+  if (upper.startsWith("CHU")) return "CHU";
+  return null; // unrecognized name — fall back to the full, unfiltered list
+}
+
+function resetSendServiceOptions() {
+  const serviceSelect = document.getElementById("msg-service");
+  serviceSelect.disabled = false;
+  serviceSelect.innerHTML = `
+    <option value="SECRETARIAT_DIRECTION">${roleLabel("SECRETARIAT_DIRECTION")} (par défaut)</option>
+    <option value="SECRETARIAT_GENERAL">${roleLabel("SECRETARIAT_GENERAL")}</option>
+    <option value="SECRETARIAT_POLYCLINIQUE">${roleLabel("SECRETARIAT_POLYCLINIQUE")}</option>
+    <option value="DIRECTEUR">${roleLabel("DIRECTEUR")}</option>
+    <option value="DRH">${roleLabel("DRH")}</option>
+    <option value="DAS">${roleLabel("DAS")}</option>`;
+}
+
+async function refreshSendServiceOptions() {
+  const recipient = document.getElementById("msg-recipient").value.trim();
+  const serviceSelect = document.getElementById("msg-service");
+  const guessedType = guessInstitutionType(recipient);
+  if (!guessedType || !recipient) {
+    resetSendServiceOptions();
+    return;
+  }
+  try {
+    const params = new URLSearchParams({ institution_type: guessedType, institution_name: recipient });
+    const data = await fetch(`/api/roles?${params.toString()}`).then(r => r.json());
+    if (!data.roles || !data.roles.length) { resetSendServiceOptions(); return; }
+    serviceSelect.innerHTML = "";
+    data.roles.forEach(role => {
+      const opt = document.createElement("option");
+      opt.value = role;
+      opt.textContent = roleLabel(role);
+      serviceSelect.appendChild(opt);
+    });
+    serviceSelect.disabled = !!data.locked;
+  } catch (err) {
+    resetSendServiceOptions();
+  }
+}
+
 function resetMessagingForm() {
   state.selectedFile = null;
   const fileInput = document.getElementById("file-input");
@@ -973,6 +1049,7 @@ function resetMessagingForm() {
   if (dropText) dropText.textContent = "📎 Glissez un fichier ici ou cliquez pour choisir";
   const statusEl = document.getElementById("msg-send-status");
   if (statusEl) { statusEl.textContent = ""; statusEl.className = "status-line"; }
+  resetSendServiceOptions();
 }
 
 function setupMessaging() {
@@ -993,6 +1070,9 @@ function setupMessaging() {
       loadRegistre(btn.dataset.filter);
     });
   });
+
+  document.getElementById("msg-recipient").addEventListener("input", refreshSendServiceOptions);
+  document.getElementById("msg-recipient").addEventListener("change", refreshSendServiceOptions);
 
   const dropZone = document.getElementById("drop-zone");
   const fileInput = document.getElementById("file-input");
@@ -1077,7 +1157,6 @@ function setupMessaging() {
 
       resetMessagingForm();
       document.getElementById("msg-recipient").value = "";
-      document.getElementById("msg-service").value = "SECRETARIAT_DIRECTION";
       document.getElementById("msg-subject").value = "";
       document.getElementById("msg-body").value = "";
       loadDashboard();

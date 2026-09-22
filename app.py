@@ -201,7 +201,7 @@ _LEGACY_ARCHIVE_ENTRANT = os.path.join(BASE_DIR, "archives", "Courrier_Entrant")
 os.makedirs(PROFILES_DIR, exist_ok=True)
 
 APP_ROOT = os.path.dirname(os.path.abspath(__file__))
-APP_VERSION = "2.8.7"
+APP_VERSION = "2.8.8"
 GITHUB_REPO = "Aladdinweb/TASHIL-ES"  # used by the in-app OTA update checker
 
 app = Flask(__name__,
@@ -274,9 +274,12 @@ DEFAULT_ROLE = ROLE_SECRETARIAT_DIRECTION
 ROLE_RULES = {
     "DSP": ["DIRECTEUR", ROLE_SECRETARIAT_DIRECTION],
     "EPSP": ["DIRECTEUR", "DRH", "DAS", ROLE_SECRETARIAT_DIRECTION],
-    "EPH": ["DRH", "DAS", ROLE_SECRETARIAT_DIRECTION, ROLE_SECRETARIAT_GENERAL],
-    "CHU": ["DRH", "DAS", ROLE_SECRETARIAT_DIRECTION, ROLE_SECRETARIAT_GENERAL],
-    "EHU": ["DRH", "DAS", ROLE_SECRETARIAT_DIRECTION, ROLE_SECRETARIAT_GENERAL],
+    # v2.8.8: DIRECTEUR added for EPH/CHU/EHU (was missing in v2.8.7) —
+    # these standalone hospital facilities get the same 5-role set for
+    # BOTH staff onboarding and the send form's service filter.
+    "EPH": ["DIRECTEUR", "DRH", "DAS", ROLE_SECRETARIAT_DIRECTION, ROLE_SECRETARIAT_GENERAL],
+    "CHU": ["DIRECTEUR", "DRH", "DAS", ROLE_SECRETARIAT_DIRECTION, ROLE_SECRETARIAT_GENERAL],
+    "EHU": ["DIRECTEUR", "DRH", "DAS", ROLE_SECRETARIAT_DIRECTION, ROLE_SECRETARIAT_GENERAL],
 }
 
 

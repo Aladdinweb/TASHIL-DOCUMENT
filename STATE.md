@@ -2024,3 +2024,109 @@ aucune régression.**
 badges de statut, rafraîchissement du tableau de bord après accusé),
 `tools/generate_serial_registry.py` (structure multi-EPSP). Aucune
 fonctionnalité antérieure retirée.
+
+---
+
+## 26. v2.8.8 — Filtrage dynamique du Service destinataire, rôles EPH/CHU/EHU complétés (2026-09-21)
+
+### 26.1 🎯 Filtrage dynamique du Service destinataire (formulaire d'envoi)
+
+**Cause réelle** : `allowed_roles()` filtrait déjà correctement les
+rôles disponibles selon l'institution (utilisé depuis la v2.8.6 pour
+l'onboarding), mais le sélecteur "Service destinataire" du **formulaire
+d'envoi** n'interrogeait jamais cette logique — il affichait toujours la
+liste statique complète de tous les rôles possibles, quelle que soit
+l'institution destinataire tapée.
+
+**Correctif** (frontend uniquement) : nouvelle fonction
+`guessInstitutionType(name)` qui déduit le type d'établissement à partir
+du préfixe du nom (même convention que celle déjà utilisée par
+`app.py` : "POLYCLINIQUE"/"SALLE DE SOIN" → EPSP-satellite, "EPSP " →
+EPSP-siège, "DSP "/"EPH "/"CHU "/"EHU " → leurs types respectifs). À
+chaque saisie dans "Institution destinataire", `refreshSendServiceOptions()`
+interroge `GET /api/roles` (même endpoint que l'onboarding, aucune
+duplication de règle côté client) et reconstruit le menu déroulant en
+conséquence. Un nom non reconnu retombe sur la liste complète d'origine
+(rien n'est jamais bloqué par erreur).
+
+**Résultat, conforme à la demande** :
+- Envoi vers un siège EPSP → seulement DIRECTEUR / DRH / DAS /
+  Secrétariat de Direction proposés.
+- Envoi vers une polyclinique → verrouillé sur Secrétariat de
+  Polyclinique uniquement.
+- Envoi vers EPH/CHU/EHU → les 5 rôles complets proposés (voir 26.2).
+
+**Testé réellement** : logique `guessInstitutionType()` exécutée en
+Node.js sur 8 cas réels (EPSP, polyclinique, salle de soin, EPH, CHU,
+EHU, DSP, nom inconnu) — tous corrects. Les 3 règles de filtrage
+backend testées via `/api/roles` : siège EPSP (exactement 4 rôles, sans
+Secrétariat Général ni Secrétariat de Polyclinique), polyclinique
+(verrouillée), EPH/CHU/EHU (5 rôles chacun).
+
+Bonus de cohérence : nouveau dictionnaire `ROLE_LABELS`/`roleLabel()`
+partagé entre l'onboarding et le formulaire d'envoi — les deux affichent
+désormais les mêmes libellés français au lieu des valeurs brutes
+(`SECRETARIAT_POLYCLINIQUE`) précédemment visibles dans l'onboarding.
+
+### 26.2 🏛️ DIRECTEUR ajouté aux rôles EPH/CHU/EHU
+
+**Changement de spécification** : la v2.8.7 avait défini EPH/CHU/EHU
+avec 4 rôles (DRH, DAS, Secrétariat de Direction, Secrétariat Général) —
+sans DIRECTEUR. La v2.8.8 corrige : ces trois types ont désormais
+exactement les 5 mêmes rôles qu'un siège EPSP plus le Secrétariat
+Général (DIRECTEUR, DRH, DAS, Secrétariat de Direction, Secrétariat
+Général), appliqués identiquement à l'onboarding ET au formulaire
+d'envoi. Aucune migration nécessaire : `ROLE_RULES` ne gouverne que les
+choix proposés pour les nouveaux profils, jamais les valeurs déjà
+stockées.
+
+### 26.3 📄 Registre régénéré sans modification du script
+
+Le script `tools/generate_serial_registry.py` appelle déjà
+`tashil_app.allowed_roles("EPH")` / `("CHU")` directement — la mise à
+jour de `ROLE_RULES` dans `app.py` s'y répercute automatiquement, sans
+aucun changement de code nécessaire dans le script lui-même. **721
+entrées** générées et vérifiées (contre 652 en v2.8.7) — `DIRECTEUR`
+confirmé présent pour chaque EPH testé.
+
+### 26.4 ⚠️ Point 4 (verrouillage anti-connexions simultanées) — clarification, rien implémenté
+
+La demande ("lier la session à l'identifiant machine, rejeter toute
+tentative depuis un second poste") est déjà couverte, de façon **plus
+stricte**, par l'appairage matériel de la v2.8.5 :
+- Un profil s'appaire automatiquement au **premier** poste qui le
+  déverrouille avec succès (hash de l'empreinte matérielle stocké,
+  jamais l'empreinte brute).
+- Toute tentative de déverrouillage depuis un **second** poste échoue
+  immédiatement avec `403 hardware_mismatch`, **avant même** la
+  vérification du PIN — il n'existe donc jamais de session active sur
+  ce second poste à "déconnecter", puisqu'elle n'a jamais pu s'ouvrir.
+- Chaque poste héberge sa **propre** base SQLite locale (pas de compte
+  hébergé centralement) — il n'existe pas de scénario où le même
+  processus applicatif servirait deux sessions actives simultanément
+  pour un même profil, y compris sur une seule machine (`_active_key`
+  est une variable unique par processus depuis la conception initiale
+  du projet).
+
+**Rien n'a été ajouté ou modifié pour ce point** — construire un
+mécanisme distinct de "session active à révoquer" risquerait d'être
+**moins** sûr que l'existant : cela impliquerait qu'un second poste
+connaissant le PIN puisse un jour "prendre la main" en expulsant le
+premier, ce qui est exactement le scénario de clonage que l'appairage
+matériel a été conçu pour empêcher définitivement. À rediscuter
+explicitement si un besoin différent de celui déjà couvert existe
+réellement (ex. stockage réseau partagé entre plusieurs machines, un
+scénario distinct qui n'a pas été confirmé).
+
+### 26.5 Régression complète (v2.8.1 → v2.8.8)
+
+Suite exécutée sur l'arborescence finale : WAL, `tracking_number`,
+routage d'accusé DRH (v2.8.7), appairage matériel, hiérarchie EPSP Oran
+intacte, et les 3 nouvelles règles de filtrage v2.8.8 — **tout confirmé
+fonctionnel ensemble, aucune régression.**
+
+**Fichiers modifiés :** `app.py` (DIRECTEUR ajouté à `ROLE_RULES` pour
+EPH/CHU/EHU), `static/js/app.js` (filtrage dynamique du service,
+libellés français partagés). Aucun changement à
+`tools/generate_serial_registry.py` (récupère déjà les règles depuis
+`app.py`). Aucune fonctionnalité antérieure retirée.
