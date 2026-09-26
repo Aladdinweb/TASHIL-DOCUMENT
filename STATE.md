@@ -2130,3 +2130,126 @@ EPH/CHU/EHU), `static/js/app.js` (filtrage dynamique du service,
 libellés français partagés). Aucun changement à
 `tools/generate_serial_registry.py` (récupère déjà les règles depuis
 `app.py`). Aucune fonctionnalité antérieure retirée.
+
+---
+
+## 27. v2.8.9 — Registre EPSP externalisé (JSON), auto-retry réseau, refresh non-bloquant (2026-09-21)
+
+### 27.1 ❌ Panneau d'Administration annulé
+
+Décision de l'utilisateur : pas de canal de commandes à distance ni de
+panneau admin via le Cloud Bridge. L'architecture reste simple, autonome
+et sécurisée localement, telle qu'elle existait avant la consultation
+technique. Rien codé pour cette piste — confirmé abandonnée.
+
+### 27.2 📄 Hiérarchie EPSP déplacée vers un fichier JSON externe
+
+**Changement d'architecture demandé et implémenté** : `_EPSP_HIERARCHY`
+n'est plus un dictionnaire codé en dur dans `app.py` — il est chargé
+depuis `~/TASHIL_DATA/epsp_hierarchy.json` au démarrage de l'application.
+Un fichier par défaut (`data/epsp_hierarchy.json`, empaqueté avec l'exe
+via `tashil_web.spec`) est copié vers `TASHIL_DATA` **une seule fois**,
+à la toute première exécution sur un poste — ensuite, le fichier "live"
+dans `TASHIL_DATA` est la seule source de vérité et n'est plus jamais
+écrasé par les mises à jour de l'application.
+
+**Registre Oran mis à jour avec la répartition complète et actualisée**
+fournie par l'utilisateur — **9 EPSP** distincts (contre 4 en v2.8.7),
+remplaçant intégralement l'ancienne liste partielle : ES-SENIA,
+SEDDIKIA, HAI LEGHOUALEM, FRONT DE MER, BIR EL DJIR, AIN EL TURCK,
+ARZEW, OUED TLELAT, BOUTLELIS — chacun avec ses propres polycliniques
+rattachées, transcrites exactement telles que fournies.
+
+**Scalabilité confirmée, testée réellement** : ajouter une wilaya, un
+EPSP ou une polyclinique ne nécessite qu'une modification du fichier
+JSON — aucun changement à `app.py`, aucune recompilation. `generate_serial_key()`
+étant une fonction pure de (wilaya, type, nom, rôle), toute nouvelle
+entrée génère automatiquement sa propre clé de récupération valide dès
+la prochaine exécution de `generate_serial_registry.py` — **vérifié en
+testant que le script du registre récupère les 9 EPSP sans aucune
+modification de son propre code**, uniquement en rechargeant le nouveau
+JSON. ⚠️ Une modification du fichier nécessite un redémarrage de
+l'application pour être prise en compte (chargé une fois au démarrage,
+pas en lecture à chaque requête).
+
+**Repli sûr testé réellement** : fichier JSON corrompu ou absent →
+retombe sur `{}` (comportement générique "EPSP <Wilaya>" pour toutes les
+wilayas), sans jamais faire planter l'application.
+
+**Fichier ajouté :** `data/epsp_hierarchy.json`.
+
+### 27.3 🐛 "Erreur GitHub (0)" — vraie cause trouvée et corrigée
+
+**Cause exacte** : `_github_request()` transformait **toute** exception
+réseau (micro-coupure, timeout, résolution DNS) en un simple
+`return 0, {...}` — sans jamais retenter. Le "(0)" affiché à l'écran
+n'indique donc jamais un problème d'authentification ou de permission
+(ceux-là remontent de vrais codes HTTP 401/403/404) — c'est
+spécifiquement une exception réseau côté client qui n'a jamais atteint
+GitHub.
+
+**Correctif** : `_github_request()` retente désormais jusqu'à 2 fois
+avec un court délai (1,5s puis 3s) avant d'abandonner — uniquement pour
+les échecs réseau purs, jamais pour une vraie réponse HTTP d'erreur de
+GitHub (401/403/404), qu'un nouvel essai immédiat ne pourrait de toute
+façon pas changer. Timeout également porté de 15 à 20 secondes.
+
+### 27.4 🔁 File d'attente de réessai automatique (Auto-Retry Queue)
+
+Nouvelle table `bridge_pending_push` (par profil, migration idempotente) :
+tout envoi de message ou d'accusé de réception qui échoue malgré les
+tentatives de `_github_request()` est désormais **mis en file** plutôt
+que silencieusement perdu. À chaque cycle de sondage (`api_bridge_poll`,
+déclenché automatiquement toutes les **20 secondes** — resserré depuis
+45s pour respecter la fenêtre 15-30s demandée), `_flush_pending_pushes()`
+retente chaque entrée en attente :
+- Pour un **message** : relit le fichier archivé sur disque (déjà
+  chiffré avec la clé du profil actif), le déchiffre, et retente
+  l'envoi complet — aucune duplication des octets du fichier dans la
+  file d'attente elle-même.
+- Pour un **accusé** : retente l'envoi du signal de réception.
+
+**Nettoyage automatique après succès** : une fois le réessai réussi, le
+mécanisme de suppression déjà existant (`_delete_bridge_entry_or_queue`,
+depuis la v2.7.0) prend le relais exactement comme pour un envoi réussi
+du premier coup — aucun mécanisme de nettoyage séparé nécessaire.
+
+**Testé réellement, cycle complet, pour les deux chemins** :
+- Envoi vers une institution distante avec échec réseau simulé (0)
+  → mis en file (1 entrée), `delivery_method` reste `NULL` → réseau
+  simulé rétabli → nouveau sondage → file vidée (0 entrée),
+  `delivery_method` mis à jour à `'bridge'`.
+- Accusé de réception avec échec réseau simulé → mis en file → réseau
+  rétabli → nouveau sondage → file vidée.
+
+### 27.5 🖥️ Rafraîchissement non-bloquant
+
+⚠️ **Clarification apportée** : ce n'est pas une application Qt, donc
+"QThread" ne s'applique pas littéralement — mais l'équivalent réel a été
+implémenté. **Cause trouvée** : `manualRefresh()` exécutait
+`await pollBridge(false)` **en premier**, bloquant tout rafraîchissement
+local (tableau de bord, boîte de réception) derrière la durée du cycle
+réseau complet — d'autant plus pénalisant maintenant que
+`_github_request` retente davantage en cas de réseau instable.
+
+**Correctif** : le rafraîchissement local (toujours rapide, aucun réseau
+impliqué) s'exécute et se termine **en premier** — le bouton arrête de
+tourner et l'écran se met à jour quasi instantanément. La synchronisation
+Cloud Bridge s'exécute **ensuite**, en arrière-plan, sans être attendue
+par le bouton — un réseau lent ou instable ne bloque plus jamais
+l'interface.
+
+### 27.6 Régression complète (v2.8.1 → v2.8.9)
+
+Suite exécutée sur l'arborescence finale : WAL, `tracking_number`,
+routage d'accusé DRH, appairage matériel, nouvelle hiérarchie EPSP à 9
+sièges, rôles EPSP/EPH v2.8.8, chargement JSON externe — **tout confirmé
+fonctionnel ensemble, aucune régression.**
+
+**Fichiers modifiés :** `app.py` (chargement JSON dynamique, retry
+réseau, file d'attente `bridge_pending_push`), `tashil_web.spec` (+
+`data/` dans les ressources empaquetées), `static/js/app.js` (intervalle
+resserré à 20s, `manualRefresh` non-bloquant). **Fichier ajouté :**
+`data/epsp_hierarchy.json`. Aucun changement à
+`tools/generate_serial_registry.py` (récupère déjà la hiérarchie depuis
+`app.py`). Aucune fonctionnalité antérieure retirée.

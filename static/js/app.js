@@ -536,12 +536,17 @@ function setupRefreshButton() {
 async function manualRefresh() {
   const btn = document.getElementById("refresh-btn");
   btn.classList.add("spinning");
+  // v2.8.9: local-only refresh FIRST and awaited — this is always fast
+  // (same-device SQLite, no network involved) so the button stops
+  // spinning and the screen updates almost instantly regardless of
+  // Cloud Bridge network conditions. The Cloud Bridge sync itself runs
+  // AFTER, in the background, un-awaited — a slow or flaky GitHub
+  // connection (the exact scenario behind "Erreur GitHub (0)") no
+  // longer holds the button, or the rest of the UI, hostage. This is
+  // the practical equivalent of running the network part on a separate
+  // thread in a desktop app: the button's own responsiveness is now
+  // decoupled from how long the network call takes.
   try {
-    // Always poll the bridge (cheap no-op if not configured — pollBridge
-    // checks state.bridgeEnabled itself) so a manual refresh reliably
-    // surfaces anything new without waiting for the 45s background timer.
-    await pollBridge(false);
-
     if (state.currentView === "dashboard") await loadDashboard();
     else if (state.currentView === "messagerie") {
       await loadInbox();
@@ -560,6 +565,17 @@ async function manualRefresh() {
   } finally {
     btn.classList.remove("spinning");
   }
+
+  // Fire-and-forget: whatever this finds (new messages, applied
+  // receipts, retried pending pushes) surfaces via its own toasts/
+  // notifications once it resolves, same as the existing 20s
+  // background timer already does — the button doesn't wait for it.
+  pollBridge(false)
+    .then(() => {
+      if (state.currentView === "dashboard") loadDashboard();
+      else if (state.currentView === "messagerie") loadInbox();
+    })
+    .catch(() => {});
 }
 
 function setupCopyLanUrl() {
@@ -682,7 +698,11 @@ function startBackgroundPolling() {
   // Separate, slower interval for the Cloud Bridge — GitHub API calls,
   // spaced further apart than the local dashboard poll to stay well
   // within rate limits. Only does anything once bridge is configured.
-  setInterval(() => pollBridge(false), 45000);
+  // v2.8.9: tightened from 45s to 20s — within the 15-30s window
+  // requested, so a document stuck "En attente" after a transient
+  // network failure (see _flush_pending_pushes) gets retried well
+  // within a minute, automatically, with no user action needed.
+  setInterval(() => pollBridge(false), 20000);
 }
 
 async function loadInstitutions() {

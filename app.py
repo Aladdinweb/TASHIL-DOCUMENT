@@ -142,6 +142,7 @@ import base64
 import uuid
 import platform
 import subprocess
+import time
 from io import BytesIO
 from datetime import datetime
 from contextlib import contextmanager
@@ -201,7 +202,7 @@ _LEGACY_ARCHIVE_ENTRANT = os.path.join(BASE_DIR, "archives", "Courrier_Entrant")
 os.makedirs(PROFILES_DIR, exist_ok=True)
 
 APP_ROOT = os.path.dirname(os.path.abspath(__file__))
-APP_VERSION = "2.8.8"
+APP_VERSION = "2.8.9"
 GITHUB_REPO = "Aladdinweb/TASHIL-ES"  # used by the in-app OTA update checker
 
 app = Flask(__name__,
@@ -347,42 +348,74 @@ WILAYAS = [
 # caused real institutions to be unfindable (e.g. "EPSP MISSERGHIN" or
 # "EPSP SEDDIKIA" simply didn't exist as onboarding choices).
 #
-# ⚠️ Only Oran (wilaya 31) has a real, user-confirmed hierarchy below —
-# every other wilaya still falls back to the single generic
-# "EPSP <Wilaya>" head-office option with no satellites, exactly as
-# before v2.8.7, until its own real EPSP breakdown is provided the same
-# way. Guessing a hierarchy for a wilaya without confirmed data would
-# risk misrouting real administrative/medical correspondence — worse
-# than temporarily offering only the generic head-office option, which
-# every "Autre (saisir manuellement)" fallback already covers today.
-_EPSP_HIERARCHY = {
-    31: {
-        "EPSP ES SENIA": [
-            "POLYCLINIQUE ES SENIA",
-            "POLYCLINIQUE AADL AIN BEIDA MABROUK LOUCIF",
-            "POLYCLINIQUE AIN BEIDA 1",
-            "POLYCLINIQUE AIN BEIDA 2",
-            "POLYCLINIQUE SIDI MAAROUF",
-            "POLYCLINIQUE SIDI CHAHMI",
-            "POLYCLINIQUE EL KERMA",
-            "SALLE DE SOIN TERMINUS",
-        ],
-        "EPSP SEDDIKIA": [  # also known locally as "Front de Mer"
-            "POLYCLINIQUE AKID LOTFI",
-            "POLYCLINIQUE SEDDIKIA",
-            "POLYCLINIQUE GAMBETTA",
-        ],
-        "EPSP ARZEW": [
-            "POLYCLINIQUE ARZEW",
-            "POLYCLINIQUE BETHIOUA",
-            "POLYCLINIQUE GDYEL",
-        ],
-        "EPSP BOUTLELIS": [
-            "POLYCLINIQUE MISSERGHIN",
-            "POLYCLINIQUE BOUTLELIS",
-        ],
-    }
-}
+# v2.8.9: this hierarchy now lives in an EXTERNAL JSON file rather than
+# a hardcoded Python dict — ~/TASHIL_DATA/epsp_hierarchy.json, editable
+# directly by an administrator (add a wilaya, a new EPSP, a new
+# polyclinic) with no code change and no app rebuild required. A new
+# entry's serial_key is generated automatically the moment
+# tools/generate_serial_registry.py is re-run (or that institution is
+# really onboarded) — generate_serial_key() is a pure function of
+# (wilaya, type, name, role), so a JSON-sourced entry is indistinguish-
+# able from a hardcoded one to the rest of the system. Editing the file
+# requires an app restart to take effect (loaded once at startup, same
+# as INSTITUTIONS_DIRECTORY below) — not hot-reloaded per request.
+#
+# ⚠️ Only Oran (wilaya 31) has a real, user-confirmed hierarchy in the
+# bundled default — every other wilaya still falls back to the single
+# generic "EPSP <Wilaya>" head-office option with no satellites, exactly
+# as before v2.8.7, until its own real EPSP breakdown is added to the
+# JSON file the same way. Guessing a hierarchy for a wilaya without
+# confirmed data would risk misrouting real administrative/medical
+# correspondence — worse than temporarily offering only the generic
+# head-office option, which every "Autre (saisir manuellement)"
+# fallback already covers today.
+EPSP_HIERARCHY_FILENAME = "epsp_hierarchy.json"
+_BUNDLED_EPSP_HIERARCHY_PATH = os.path.join(APP_ROOT, "data", EPSP_HIERARCHY_FILENAME)
+
+
+def _live_epsp_hierarchy_path() -> str:
+    return os.path.join(BASE_DIR, EPSP_HIERARCHY_FILENAME)
+
+
+def _ensure_live_epsp_hierarchy_file():
+    """
+    Copies the bundled default hierarchy to ~/TASHIL_DATA/ the FIRST
+    time the app ever runs on a given machine — from then on, the live
+    file there is authoritative and is never overwritten again, so an
+    administrator's manual edits always survive future app updates or
+    rebuilds (which only ever touch the bundled copy, never the live one).
+    """
+    os.makedirs(BASE_DIR, exist_ok=True)
+    live_path = _live_epsp_hierarchy_path()
+    if not os.path.exists(live_path):
+        try:
+            shutil.copy(_BUNDLED_EPSP_HIERARCHY_PATH, live_path)
+        except Exception:
+            pass  # bundled default missing/unreadable — load_epsp_hierarchy() falls back to {}
+
+
+def load_epsp_hierarchy() -> dict:
+    """
+    Loads the live JSON file into the {wilaya_code: {epsp_name: [satellites]}}
+    shape the rest of this file expects. Falls back to an EMPTY dict
+    (== the generic "EPSP <Wilaya>" placeholder for every wilaya) if the
+    file is missing, unreadable, or malformed — a bad manual edit
+    degrades gracefully instead of crashing the app on startup.
+    """
+    _ensure_live_epsp_hierarchy_file()
+    try:
+        with open(_live_epsp_hierarchy_path(), "r", encoding="utf-8") as f:
+            raw = json.load(f)
+        # JSON object keys are always strings — wilaya codes must be
+        # ints to match how every other lookup in this file works
+        # (WILAYAS, get_onboarding_institutions, etc.).
+        return {int(k): v for k, v in raw.items()}
+    except Exception:
+        return {}
+
+
+_EPSP_HIERARCHY = load_epsp_hierarchy()
+
 _CHU_WILAYAS = {"Alger", "Oran", "Constantine", "Annaba", "Tlemcen", "Sétif",
                 "Batna", "Blida", "Béjaïa", "Sidi Bel Abbès", "Tizi Ouzou"}
 
@@ -786,6 +819,22 @@ def get_profile_db(institution_key: str) -> sqlite3.Connection:
             created_at TEXT NOT NULL
         )
     """)
+    # v2.8.9: queues an outgoing Cloud Bridge push (a message send, or a
+    # read-receipt) that failed — including "Erreur GitHub (0)" network
+    # blips — so it's automatically retried on the next poll cycle
+    # (every ~20s, see the frontend's background timer) instead of being
+    # silently lost. 'kind' is 'message' or 'receipt'; 'payload' is a
+    # JSON blob with everything needed to reconstruct that specific push
+    # (see _queue_pending_push / _flush_pending_pushes).
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS bridge_pending_push (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            kind TEXT NOT NULL,
+            payload TEXT NOT NULL,
+            attempts INTEGER DEFAULT 0,
+            created_at TEXT NOT NULL
+        )
+    """)
     conn.commit()
     return conn
 
@@ -909,7 +958,7 @@ def find_local_profile_by_recipient(recipient_text: str, recipient_role: str = N
 GITHUB_API_BASE = "https://api.github.com"
 
 
-def _github_request(method: str, url_or_path: str, token: str, json_body: dict = None):
+def _github_request(method: str, url_or_path: str, token: str, json_body: dict = None, _max_retries: int = 2):
     """
     Minimal GitHub REST API client using urllib only. Accepts either a
     path (starting with '/') or a full URL (as returned in listing
@@ -924,6 +973,20 @@ def _github_request(method: str, url_or_path: str, token: str, json_body: dict =
     issuer certificate" even when the network connection itself is fine.
     Bundling and pointing at certifi's own cacert.pem sidesteps that
     entirely — confirmed as the cause via a real error report.
+
+    v2.8.9: status 0 ("Erreur GitHub (0)" on screen) means the request
+    never got a real HTTP response at all — a network-level exception
+    (brief connectivity drop, DNS hiccup, a timed-out read on a slow
+    link) caught by the bare `except Exception` below, NOT an
+    authentication or permissions problem (those come back as real HTTP
+    codes — 401, 403, 404 — from the `except HTTPError` branch instead,
+    which is deliberately NOT retried here since retrying a real "your
+    token is wrong" response can't ever succeed). A brief network drop
+    very often DOES succeed on an immediate retry, so this now retries
+    up to `_max_retries` times with a short backoff before giving up and
+    returning status 0 to the caller — which itself now also queues the
+    attempted operation for automatic retry a few seconds later (see
+    bridge_pending_push) rather than losing it outright.
     """
     import urllib.request
     import urllib.error
@@ -937,22 +1000,30 @@ def _github_request(method: str, url_or_path: str, token: str, json_body: dict =
         "X-GitHub-Api-Version": "2022-11-28",
     }
     body = json.dumps(json_body).encode("utf-8") if json_body is not None else None
-    req = urllib.request.Request(url, data=body, headers=headers, method=method)
-
     ssl_context = ssl.create_default_context(cafile=certifi.where()) if _CERTIFI_AVAILABLE else None
 
-    try:
-        with urllib.request.urlopen(req, timeout=15, context=ssl_context) as resp:
-            raw = resp.read()
-            return resp.status, (json.loads(raw.decode("utf-8")) if raw else {})
-    except urllib.error.HTTPError as e:
+    last_exc = None
+    for attempt in range(_max_retries + 1):
+        req = urllib.request.Request(url, data=body, headers=headers, method=method)
         try:
-            payload = json.loads(e.read().decode("utf-8"))
-        except Exception:
-            payload = {}
-        return e.code, payload
-    except Exception as exc:
-        return 0, {"message": str(exc)}
+            with urllib.request.urlopen(req, timeout=20, context=ssl_context) as resp:
+                raw = resp.read()
+                return resp.status, (json.loads(raw.decode("utf-8")) if raw else {})
+        except urllib.error.HTTPError as e:
+            # A real response from GitHub (even an error one) — retrying
+            # immediately can't change an auth/permissions/not-found
+            # answer, so return it as-is rather than burning retries.
+            try:
+                payload = json.loads(e.read().decode("utf-8"))
+            except Exception:
+                payload = {}
+            return e.code, payload
+        except Exception as exc:
+            last_exc = exc
+            if attempt < _max_retries:
+                time.sleep(1.5 * (attempt + 1))  # 1.5s, then 3s
+                continue
+    return 0, {"message": str(last_exc)}
 
 
 def get_bridge_config():
@@ -1857,6 +1928,27 @@ def api_send_message():
             except Exception:
                 delivered_via_bridge = False
 
+            if not delivered_via_bridge:
+                # v2.8.9: "Erreur GitHub (0)" and other transient network
+                # failures no longer leave this document permanently
+                # stuck "En attente" with no further attempt — it's
+                # queued for automatic retry on the next poll cycle
+                # (~20s later), reading the archived file fresh from
+                # disk at retry time rather than duplicating its bytes
+                # into the queue now.
+                with profile_db(_active_key) as queue_conn:
+                    _queue_pending_push(queue_conn, "message", {
+                        "recipient": recipient,
+                        "recipient_role": recipient_role,
+                        "sender": sender,
+                        "sender_institution_key": _active_key,
+                        "subject": subject,
+                        "body": body,
+                        "tracking": tracking,
+                        "file_path": archived_path,
+                        "file_original_name": original_filename,
+                    })
+
     delivery_method = "local" if delivered_locally else ("bridge" if delivered_via_bridge else None)
     if delivery_method:
         with profile_db(_active_key) as method_conn:
@@ -1971,7 +2063,20 @@ def route_read_receipt(message_row):
             if cfg and cfg["enabled"]:
                 acknowledger = get_profile_row(_active_key)
                 acknowledger_name = acknowledger["institution_name"] if acknowledger else "?"
-                push_receipt_to_bridge(cfg, sender_name, sender_key, tracking, acknowledger_name)
+                receipt_sent = push_receipt_to_bridge(cfg, sender_name, sender_key, tracking, acknowledger_name)
+                if not receipt_sent:
+                    # v2.8.9: same auto-retry treatment as a failed
+                    # message send — a transient "Erreur GitHub (0)"
+                    # here previously meant the accusé silently never
+                    # made it back to the sender, with no further
+                    # attempt ever made.
+                    with profile_db(_active_key) as queue_conn:
+                        _queue_pending_push(queue_conn, "receipt", {
+                            "sender_name": sender_name,
+                            "sender_key": sender_key,
+                            "tracking": tracking,
+                            "acknowledger_name": acknowledger_name,
+                        })
     except Exception:
         pass  # see docstring — a failed receipt never blocks the accusé itself
 
@@ -2327,6 +2432,90 @@ def _retry_pending_bridge_cleanup(conn, owner: str, repo: str, token: str):
 
 
 # --------------------------------------------------------------------------- #
+# Auto-retry queue for FAILED OUTGOING pushes (v2.8.9) — a message send or
+# a read-receipt whose Cloud Bridge push failed (typically "Erreur GitHub
+# (0)", a transient network blip that outlasted _github_request's own
+# retries). Rather than leaving the document stuck "En attente" (orange)
+# forever with no further attempt, it's queued here and retried
+# automatically on the next poll cycle (~20s later, see the frontend's
+# background timer) — no user action needed. Once a retry succeeds, the
+# existing cleanup-after-consumption logic (_delete_bridge_entry_or_queue,
+# already used by the normal poll path) takes over exactly as it would
+# for a first-try success — no separate cleanup mechanism needed here.
+# --------------------------------------------------------------------------- #
+def _queue_pending_push(conn, kind: str, payload: dict):
+    conn.execute(
+        "INSERT INTO bridge_pending_push (kind, payload, created_at) VALUES (?, ?, ?)",
+        (kind, json.dumps(payload), datetime.now().isoformat())
+    )
+
+
+def _flush_pending_pushes(conn, owner: str, repo: str, token: str):
+    """
+    Retries every queued push, oldest first. A push that keeps failing
+    stays queued (attempts incremented) rather than being dropped — the
+    document stays visibly "En attente" on the dashboard for as long as
+    it genuinely hasn't gone anywhere, which is the honest state to show.
+    """
+    pending = conn.execute("SELECT * FROM bridge_pending_push ORDER BY id ASC").fetchall()
+    for row in pending:
+        try:
+            payload = json.loads(row["payload"])
+        except Exception:
+            conn.execute("DELETE FROM bridge_pending_push WHERE id = ?", (row["id"],))
+            continue  # corrupt queue entry — nothing useful to retry, drop it
+
+        success = False
+        if row["kind"] == "message":
+            success = _retry_pending_message_push(payload, owner, repo, token)
+        elif row["kind"] == "receipt":
+            success = push_receipt_to_bridge(
+                {"github_owner": owner, "github_repo": repo, "github_token": token},
+                payload["sender_name"], payload.get("sender_key"),
+                payload["tracking"], payload["acknowledger_name"]
+            )
+
+        if success:
+            conn.execute("DELETE FROM bridge_pending_push WHERE id = ?", (row["id"],))
+        else:
+            conn.execute("UPDATE bridge_pending_push SET attempts = attempts + 1 WHERE id = ?", (row["id"],))
+
+
+def _retry_pending_message_push(payload: dict, owner: str, repo: str, token: str) -> bool:
+    """
+    Rebuilds and retries a queued message send. Reads the archived file
+    fresh from disk rather than storing its bytes in the queue table —
+    the file is already sitting in this profile's own Courrier_Sortant,
+    so there's no reason to duplicate potentially large attachments into
+    SQLite. Decrypts with the CURRENTLY active profile's key: this only
+    ever runs while that same profile is unlocked (api_bridge_poll
+    requires _active_key), so it's the same key the file was encrypted
+    with in the first place.
+    """
+    try:
+        with open(payload["file_path"], "rb") as f:
+            raw = f.read()
+        file_bytes = decrypt_file_bytes(raw)
+    except OSError:
+        return False  # archived file missing/moved — nothing to retry with
+
+    cfg = {"github_owner": owner, "github_repo": repo, "github_token": token}
+    success = push_to_bridge(
+        cfg, payload["recipient"], payload["recipient_role"], payload["sender"],
+        payload.get("sender_institution_key"), payload["subject"], payload["body"],
+        payload["tracking"], file_bytes, payload["file_original_name"]
+    )
+    if success:
+        # The message's own sortant record still shows delivery_method
+        # NULL from the original failed attempt — bring it up to date so
+        # the dashboard's colored status dot (🔴 -> 🟠) reflects reality.
+        with profile_db(_active_key) as conn:
+            conn.execute("UPDATE messages SET delivery_method = 'bridge' WHERE tracking_number = ?",
+                         (payload["tracking"],))
+    return success
+
+
+# --------------------------------------------------------------------------- #
 # "Établissements connectés" (v2.8.0) — presence directory.
 #
 # ⚠️ Real design constraint, worth understanding: the bridge repo has no
@@ -2446,6 +2635,13 @@ def api_bridge_poll():
     paths = profile_paths(_active_key)
 
     with profile_db(_active_key) as conn:
+        # v2.8.9: retry any outgoing message/receipt pushes that failed
+        # earlier (typically "Erreur GitHub (0)" — a transient network
+        # blip) BEFORE anything else this cycle — a document stuck "En
+        # attente" gets a fresh attempt roughly every ~20s (the
+        # frontend's background poll interval) with no user action needed.
+        _flush_pending_pushes(conn, owner, repo, token)
+
         # Retry any deletions that failed on a previous poll BEFORE
         # processing new entries (see queue_bridge_cleanup / feature note).
         _retry_pending_bridge_cleanup(conn, owner, repo, token)

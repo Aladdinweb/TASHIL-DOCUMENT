@@ -70,6 +70,7 @@ a = Analysis(
     datas=[
         ('templates', 'templates'),
         ('static', 'static'),
+        ('data', 'data'),  # v2.8.9: bundled default epsp_hierarchy.json
         ('app.py', '.'),
         ('tray.py', '.'),
     ] + webview_datas + qrcode_datas + pil_datas + crypto_datas + certifi_datas + pyzbar_datas
