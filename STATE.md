@@ -2253,3 +2253,207 @@ resserré à 20s, `manualRefresh` non-bloquant). **Fichier ajouté :**
 `data/epsp_hierarchy.json`. Aucun changement à
 `tools/generate_serial_registry.py` (récupère déjà la hiérarchie depuis
 `app.py`). Aucune fonctionnalité antérieure retirée.
+
+---
+
+## 28. v2.9.0 — Temps réel local (Flask-SocketIO), transactions `BEGIN IMMEDIATE`, ETag Cloud Bridge (2026-09-28)
+
+### 28.1 🎯 Périmètre exact du "temps réel"
+
+⚠️ **Clarification technique nécessaire avant tout, actée avec l'utilisateur** :
+le serveur Flask de chaque poste reste **local**. Un WebSocket relie
+seulement le navigateur/la fenêtre pywebview d'**un** poste à **son
+propre** serveur — il ne relie jamais deux postes entre eux. La latence
+entre deux établissements différents reste donc gouvernée par le cycle de
+sondage du Cloud Bridge (GitHub), pas par le WebSocket.
+
+Ce qui change réellement :
+- Le sondage Cloud Bridge, auparavant déclenché par le navigateur toutes
+  les 20 s (`setInterval` côté JS), tourne désormais **côté serveur**,
+  dans un thread dédié (`_bridge_loop`), à un intervalle par défaut de
+  **10 s** (`TASHIL_BRIDGE_POLL_SECONDS`), indépendamment de l'onglet
+  ouvert ou non.
+- Dès qu'un message ou un accusé est importé, le serveur **pousse**
+  l'information à l'interface (`new_document`, `receipt_update`) au lieu
+  que l'interface ait à revérifier périodiquement — pour le rafraîchissement
+  visible, c'est cette dernière étape (0 latence supplémentaire côté
+  navigateur) qui change le plus concrètement l'expérience.
+- Décision explicite : garder l'option "local-first" (pas de serveur relais
+  central payant/externe) — le WebSocket local + sondage GitHub resserré
+  et poussé côté serveur en est la traduction directe.
+
+### 28.2 🐛 Cause exacte de `database is locked`
+
+**Reproduite avant correction, dans un test automatisé dédié** (scénario :
+un envoi HTTP concurrent pendant qu'un sondage Bridge, ralenti
+artificiellement, maintenait une transaction ouverte) : confirmé
+`sqlite3.OperationalError: database is locked` avec le code v2.8.9,
+malgré le mode WAL et `busy_timeout=5000` déjà en place depuis la v2.8.1.
+
+**Deux causes cumulées, toutes deux corrigées :**
+1. Le sondage Bridge (`api_bridge_poll`) tenait **une seule connexion
+   SQLite ouverte** (avec une transaction d'écriture entamée dès la
+   première insertion) pendant des dizaines d'appels réseau GitHub
+   successifs — tout envoi ou accusé côté interface attendait donc
+   potentiellement la durée complète d'un cycle de sondage.
+2. En mode WAL, une transaction qui **lit puis écrit** (upgrade de verrou)
+   échoue immédiatement avec `SQLITE_BUSY`, quelle que soit la valeur de
+   `busy_timeout` — ce dernier ne protège que l'attente d'un verrou déjà
+   demandé en écriture dès le départ, pas une bascule lecture→écriture en
+   cours de transaction.
+
+**Correctifs appliqués :**
+- `busy_timeout` et le `timeout` Python portés de 5 s à **30 s**
+  (`DB_TIMEOUT_SECONDS`), plus `PRAGMA synchronous=NORMAL` (sûr en WAL,
+  réduit les `fsync`) — filet de sécurité, pas le correctif principal.
+- Toute la logique réseau du sondage Bridge (import GitHub, téléchargement
+  de pièce jointe, suppression/nettoyage) tourne désormais **sans aucune
+  connexion SQLite ouverte** ; chaque écriture (import d'un message,
+  application d'un accusé, mise à jour de `delivery_method`) est une
+  transaction **courte et isolée**, ouverte avec `BEGIN IMMEDIATE` pour
+  prendre le verrou d'écriture immédiatement plutôt que de le découvrir en
+  cours de route.
+- `BEGIN IMMEDIATE` ajouté également aux trois routes HTTP qui lisaient
+  puis écrivaient dans le même bloc : envoi de message (tracking number),
+  changement de statut (`/status`), suppression de message.
+- `_flush_pending_pushes` et `_retry_pending_bridge_cleanup` réécrits pour
+  ne plus jamais tenir une connexion ouverte pendant un appel réseau —
+  l'ancienne version pouvait, avec plusieurs entrées en attente, se
+  verrouiller elle-même.
+
+**Testé réellement** : le scénario exact de collision (envoi concurrent
+pendant un sondage Bridge ralenti) rejoué après correction → `200 OK`,
+plus aucune `OperationalError`, sur le code patché.
+
+### 28.3 🔌 Flask-SocketIO — intégration
+
+- Nouvel objet `socketio = SocketIO(app, async_mode="threading", ...)`,
+  **optionnel** : si `flask_socketio` n'est pas installé dans un build
+  donné, l'application démarre et fonctionne exactement comme en v2.8.9
+  (repli automatique sur `app.run()` et sur le sondage de secours à 5 min
+  côté frontend) — même schéma défensif que `qrcode`/`cryptography`/
+  `pyzbar`/`pystray` dans ce projet.
+- La **room** Socket.IO n'est jamais choisie par le client : le serveur la
+  déduit du profil actuellement déverrouillé (`_active_key`) lors de
+  l'événement `join_room`. Un appareil verrouillé qui tente de rejoindre
+  une room reçoit `{"ok": false, "locked": true}` — aucun événement ne
+  peut donc fuiter vers un appareil du réseau local qui n'a pas
+  déverrouillé ce profil précis.
+- Aucun événement `send_document` : l'envoi de fichier reste en HTTP
+  multipart classique (chiffrement, archivage, tracking number) — le
+  socket ne sert **qu'à notifier**, jamais à transporter un fichier.
+- Nouveaux événements émis par le serveur : `new_document` (import Bridge
+  ou livraison locale), `receipt_update` (accusé appliqué),
+  `sync_update` (une entrée en attente vient d'être re-livrée avec
+  succès), `session_locked` (verrouillage/suppression du profil — ferme
+  la room côté serveur via `close_room`).
+- ⚠️ `desktop_launcher.py` devait être adapté même si non fourni
+  initialement dans les fichiers transmis : Flask-SocketIO en mode
+  `threading` **exige** `socketio.run(app)` au lieu de `app.run(app)` — la
+  documentation officielle est explicite sur ce point, `app.run()` ne
+  supporte pas la mise à niveau WebSocket et retomberait silencieusement
+  sur du long-polling HTTP uniquement. Corrigé avec repli automatique sur
+  `app.run()` si `tashil_app.socketio` est `None`.
+- `tashil_web.spec` étendu (`collect_all` sur `flask_socketio`,
+  `engineio`, `socketio`, `simple_websocket`, `wsproto`, `h11`, `bidict` +
+  hidden import explicite `engineio.async_drivers.threading`) — même
+  traitement que pywebview/pyzbar/pystray pour les mêmes raisons
+  documentées dans ce fichier depuis la v2.5.0.
+
+**Testé réellement, bout en bout, sans mock** : un vrai serveur
+Flask-SocketIO a été démarré (`socketio.run`, mode threading), un faux
+serveur GitHub Contents API a simulé un message entrant, et un **vrai
+client JavaScript Socket.IO** (le fichier `static/js/vendor/socket.io.min.js`
+exact destiné au paquet Windows, chargé et exécuté dans Node.js — pas une
+simulation Python du protocole) s'est connecté, a rejoint sa room
+(`join_room` → `{"ok": true}`), puis a reçu l'événement `new_document`
+avec les bonnes données (`tracking_number`, `sender`) dans le cycle de
+sondage suivant (~2 s avec un intervalle de test raccourci). Le message
+est retrouvé correctement inséré et chiffré dans la base du profil
+correspondant.
+
+### 28.4 🌐 Frontend (`static/js/app.js`)
+
+- Les deux `setInterval` (8 s tableau de bord, 20 s Cloud Bridge) sont
+  remplacés par `initRealtime()`, appelé une seule fois dans le bloc
+  `state.appInitialized` (même précaution qu'en v2.3.0/v2.8.6contre les
+  listeners empilés).
+- `state.meta.realtime` (renvoyé par `/api/meta`) indique si le serveur a
+  réellement chargé Flask-SocketIO — si absent ou si le script vendor ne
+  s'est pas chargé (`typeof io === "undefined"`), repli automatique sur un
+  sondage de secours toutes les **5 minutes** (`startFallbackPolling`),
+  jamais un silence total.
+- À chaque déconnexion du socket (`disconnect`), le sondage de secours
+  s'active ; à la reconnexion (`connect`), il s'arrête et un
+  `manualRefresh()` rattrape ce qui aurait pu être manqué pendant la
+  coupure.
+- `lockSession()` et l'événement `session_locked` reçu depuis le serveur
+  renvoient tous deux vers l'écran de verrouillage, sans jamais laisser
+  l'interface affichée avec des données devenues inaccessibles.
+- Aucun changement structurel à `manualRefresh()` (toujours local d'abord,
+  Cloud Bridge ensuite en arrière-plan, v2.8.9) ni à `pollBridge` (conservé
+  comme fonction de secours, appelée par le bouton 🔄 et par le sondage de
+  secours).
+
+### 28.5 📄 ETag conditionnel sur le sondage Cloud Bridge
+
+Le jeton GitHub étant **partagé par tout le réseau national** (5000
+requêtes/h au total), resserrer le sondage à 10 s ne serait pas soutenable
+sans requêtes conditionnelles. `_github_request` accepte désormais
+`use_etag=True` pour les listings de dossiers (`bridge/`,
+`bridge/<adresse>/`, `.../receipts/`) : l'en-tête `If-None-Match` est
+envoyé si un ETag est déjà connu pour cette URL, et une réponse `304`
+réutilise directement le dernier corps mis en cache **sans consommer de
+requête sur le quota principal** (documenté ainsi par GitHub). Le cache
+est en mémoire par processus, vidé au verrouillage du profil
+(`_ui_session_closed`).
+
+Un fichier `bridge/.keep` est créé (une fois par dépôt) pour que le
+dossier `bridge/` ne disparaisse jamais complètement quand il est vide —
+un dossier absent produit un `404`, qui ne peut jamais être mis en cache
+et coûte donc systématiquement une requête pleine au quota.
+
+### 28.6 ⚠️ Limites honnêtes, non résolues dans cette version
+
+- Le temps réel reste **local à chaque poste** — voir 28.1. Un vrai temps
+  réel entre deux postes distants nécessiterait un serveur relais central
+  (option déjà écartée en v2.5.0 §13.1, réaffirmée ici).
+- Non testé sur un vrai build Windows : le comportement de
+  `simple-websocket`/`engineio.async_drivers.threading` une fois figé par
+  PyInstaller, et le comportement du WebSocket à l'intérieur d'une fenêtre
+  pywebview/WebView2 — même limite méthodologique que pour pywebview,
+  pyzbar, pystray et plyer par le passé dans ce projet. **Le test le plus
+  important restant : ouvrir l'application sur un vrai poste Windows et
+  confirmer que l'onglet réseau du navigateur (ou un test manuel avec deux
+  fenêtres) montre bien une connexion WebSocket active plutôt qu'un repli
+  silencieux sur le sondage de secours à 5 minutes.**
+- La limite déjà documentée en v2.8.5 §22.9 / corrigée en v2.8.7 concernant
+  le routage des accusés reste résolue et n'est pas affectée par ce
+  changement.
+
+### 28.7 Régression
+
+- Scénario exact de collision SQLite (v2.8.1 → v2.9.0) : reproduit avant
+  correctif, confirmé résolu après.
+- Cycle complet réel Flask-SocketIO + faux serveur GitHub + vrai client JS
+  vendor : `new_document` reçu, message correctement chiffré et inséré en
+  base.
+- `py_compile` sur `app.py` et `desktop_launcher.py`, `node --check` sur
+  `app.js` : aucune erreur de syntaxe.
+- Non vérifié dans cette session (à faire avant tag de production) : suite
+  de régression complète v2.8.1 → v2.8.9 (WAL, `tracking_number`, HEIC,
+  suivi des non-lus, appairage matériel, accusés DRH, hiérarchie EPSP JSON,
+  file d'attente de réessai) rejouée sur ce code précis — le patch ne
+  touche à aucune de ces fonctions autrement que par le déplacement décrit
+  en 28.2, mais seul un rejeu complet, comme documenté à chaque version
+  précédente, permettrait de l'affirmer avec la même certitude.
+
+**Fichiers modifiés :** `app.py` (SQLite 30 s + `BEGIN IMMEDIATE`,
+intégration Flask-SocketIO, boucle Bridge serveur, ETag), `desktop_launcher.py`
+(`socketio.run` au lieu de `app.run`), `templates/index.html` (script
+vendor Socket.IO), `static/js/app.js` (remplacement du polling par le
+temps réel + repli 5 min), `requirements.txt` (+ `Flask-SocketIO`,
+`simple-websocket`), `tashil_web.spec` (+ `collect_all` pour la pile
+Socket.IO). **Fichier ajouté :** `static/js/vendor/socket.io.min.js`
+(client Socket.IO 4.7.5, embarqué — aucun CDN, cohérent avec la politique
+déjà en place pour ce projet). Aucune fonctionnalité antérieure retirée.

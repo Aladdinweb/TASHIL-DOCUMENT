@@ -8,4 +8,6 @@ certifi==2024.8.30
 pyzbar==0.1.9
 pystray==0.19.5
 plyer==2.1.0
+Flask-SocketIO==5.3.6
+simple-websocket==1.0.0
 pyinstaller==6.10.0

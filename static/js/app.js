@@ -32,6 +32,8 @@ const state = {
   appInitialized: false,    // event listeners wired only once (see showApp)
   selectedFile: null,       // currently attached file in the Envoi form
   bridgeEnabled: false,
+  socket: null,              // v2.9.0: local realtime channel (this device <-> its own server)
+  fallbackTimer: null,       // only runs while the socket is disconnected/unavailable
 };
 
 // ------------------------------------------------------------------ //
@@ -504,7 +506,7 @@ function showApp() {
     setupRefreshButton();
     setupCopyLanUrl();
     setupCloudBridge();
-    startBackgroundPolling();
+    initRealtime();   // v2.9.0: sets up the local socket + its 5 min fallback once
     state.appInitialized = true;
   }
 
@@ -518,6 +520,7 @@ function showApp() {
   loadDashboard();
   loadInstitutions();
   requestNotificationPermission();
+  joinRealtimeRoom();   // v2.9.0: (re)join every unlock — including switching profiles
   switchView("dashboard");
 
   document.getElementById("lan-url").textContent = state.meta.lan_url;
@@ -598,6 +601,7 @@ async function lockSession() {
     // Even if the request fails, still send the user to the lock screen —
     // never leave archives visible on an uncertain network error.
   }
+  leaveRealtimeRoom();   // v2.9.0: stop receiving this profile's socket events
   state.profile = null;
   document.getElementById("app").classList.add("hidden");
   await showLockScreen();
@@ -667,42 +671,107 @@ function playNotificationSound() {
 }
 
 // ------------------------------------------------------------------ //
-// Background polling — surfaces new received messages as notifications
-// without requiring the user to be on the Messagerie tab.
+// v2.9.0 — Local realtime (Flask-SocketIO) replacing the 8 s / 20 s
+// polling loops. The socket connects THIS browser/window to ITS OWN
+// local server only — delivery between two different PCs still travels
+// through the Cloud Bridge poll, which now runs server-side (see
+// app.py's _bridge_loop) and pushes a "new_document" / "receipt_update"
+// event over this same socket the instant something is imported, instead
+// of the UI having to ask every 20 s.
+//
+// The room is chosen by the SERVER from the unlocked profile — the
+// client only ever asks to "join_room" with no argument, so a device on
+// the LAN can never subscribe to another service's notifications.
+//
+// Fallback: while the socket is down (feature disabled in this build,
+// or a real disconnect), a slow 5-minute safety-net poll takes over so
+// nothing is ever silently stuck — the same manualRefresh() the 🔄
+// button already uses.
 // ------------------------------------------------------------------ //
-function startBackgroundPolling() {
-  setInterval(async () => {
-    try {
-      const data = await fetch("/api/dashboard").then(r => r.json());
-      if (state.lastKnownReceived === null) {
-        state.lastKnownReceived = data.total_received;
-      } else if (data.total_received > state.lastKnownReceived) {
-        const diff = data.total_received - state.lastKnownReceived;
-        state.lastKnownReceived = data.total_received;
-        showToast(`📥 ${diff} nouveau(x) message(s) reçu(s)`, "success");
-        showSystemNotification("TASHIL DOCUMENT HUB", `${diff} nouveau(x) message(s) reçu(s)`);
-        playNotificationSound();
-        if (state.currentView === "dashboard") loadDashboard();
-        if (state.currentView === "messagerie") loadInbox();
-      }
-      if (state.currentView === "dashboard") {
-        document.getElementById("stat-sent").textContent = data.total_sent;
-        document.getElementById("stat-received").textContent = data.total_received;
-        document.getElementById("stat-pending").textContent = data.pending;
-      }
-    } catch (err) {
-      // Silent — this is a background convenience poll, not a critical path
-    }
-  }, 8000);
+const REALTIME_FALLBACK_MS = 5 * 60 * 1000;
 
-  // Separate, slower interval for the Cloud Bridge — GitHub API calls,
-  // spaced further apart than the local dashboard poll to stay well
-  // within rate limits. Only does anything once bridge is configured.
-  // v2.8.9: tightened from 45s to 20s — within the 15-30s window
-  // requested, so a document stuck "En attente" after a transient
-  // network failure (see _flush_pending_pushes) gets retried well
-  // within a minute, automatically, with no user action needed.
-  setInterval(() => pollBridge(false), 20000);
+function startFallbackPolling() {
+  if (state.fallbackTimer) return;
+  state.fallbackTimer = setInterval(() => { manualRefresh(); }, REALTIME_FALLBACK_MS);
+}
+
+function stopFallbackPolling() {
+  if (state.fallbackTimer) {
+    clearInterval(state.fallbackTimer);
+    state.fallbackTimer = null;
+  }
+}
+
+function initRealtime() {
+  // meta.realtime reflects whether Flask-SocketIO actually loaded on the
+  // server side (see app.py: _SOCKETIO_AVAILABLE) — if a packaged build
+  // is somehow missing the dependency, this degrades to the fallback
+  // poll instead of trying to connect to a socket that isn't there.
+  if (typeof io === "undefined" || !(state.meta && state.meta.realtime)) {
+    startFallbackPolling();
+    return;
+  }
+  if (state.socket) return;  // never re-run — this function is only called once (see showApp)
+
+  state.socket = io({ transports: ["websocket", "polling"], reconnectionDelayMax: 10000 });
+
+  state.socket.on("connect", () => {
+    stopFallbackPolling();
+    joinRealtimeRoom();
+    // Catches up on anything missed while disconnected (a message that
+    // arrived during a brief network blip, for instance).
+    if (state.profile) manualRefresh();
+  });
+
+  state.socket.on("disconnect", startFallbackPolling);
+
+  state.socket.on("new_document", (data) => {
+    const label = data && data.sender ? ` de ${data.sender}` : "";
+    showToast(`📥 Nouveau document reçu${label}`, "success");
+    showSystemNotification("TASHIL DOCUMENT HUB", `Nouveau document reçu${label}`);
+    playNotificationSound();
+    if (state.currentView === "dashboard") loadDashboard();
+    if (state.currentView === "messagerie") loadInbox();
+  });
+
+  state.socket.on("receipt_update", (data) => {
+    const who = data && data.acknowledged_by ? ` par ${data.acknowledged_by}` : "";
+    const tracking = data && data.tracking_number ? data.tracking_number : "";
+    showToast(`📄 Document ${tracking} consulté${who}`, "success");
+    showSystemNotification("TASHIL DOCUMENT HUB", `Document ${tracking} consulté${who}`);
+    playNotificationSound();
+    if (state.currentView === "dashboard") loadDashboard();
+    if (state.currentView === "messagerie") loadInbox();
+  });
+
+  // A queued send/receipt that had failed (see _flush_pending_pushes)
+  // just went through — refresh so "En attente" doesn't look stuck.
+  state.socket.on("sync_update", () => {
+    if (state.currentView === "dashboard") loadDashboard();
+  });
+
+  // The server locked/deleted the profile we're subscribed to (e.g. the
+  // "Zone dangereuse" delete action) — go straight to the lock screen
+  // rather than let the UI keep showing now-inaccessible data.
+  state.socket.on("session_locked", () => {
+    leaveRealtimeRoom();
+    state.profile = null;
+    document.getElementById("app").classList.add("hidden");
+    showLockScreen();
+  });
+}
+
+function joinRealtimeRoom() {
+  if (state.socket && state.socket.connected) {
+    state.socket.emit("join_room");
+  }
+}
+
+function leaveRealtimeRoom() {
+  // No explicit "leave" call needed: the server clears the room on its
+  // side (socketio.close_room) as soon as the profile is locked/deleted
+  // — see _ui_session_closed in app.py. Kept as a named function so the
+  // intent is clear at each call site above.
 }
 
 async function loadInstitutions() {

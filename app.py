@@ -146,11 +146,21 @@ import time
 from io import BytesIO
 from datetime import datetime
 from contextlib import contextmanager
+import threading
 
 from flask import (Flask, request, jsonify, send_from_directory,
                     send_file, render_template, abort)
 from werkzeug.utils import secure_filename
 from werkzeug.security import generate_password_hash, check_password_hash
+
+# v2.9.0: Flask-SocketIO is OPTIONAL, same defensive pattern as qrcode/
+# cryptography/certifi: if it is missing from a build, the app still starts
+# and works exactly as before (the frontend falls back to its slow check).
+try:
+    from flask_socketio import SocketIO, join_room, leave_room, rooms
+    _SOCKETIO_AVAILABLE = True
+except ImportError:
+    _SOCKETIO_AVAILABLE = False
 
 try:
     import qrcode
@@ -202,13 +212,24 @@ _LEGACY_ARCHIVE_ENTRANT = os.path.join(BASE_DIR, "archives", "Courrier_Entrant")
 os.makedirs(PROFILES_DIR, exist_ok=True)
 
 APP_ROOT = os.path.dirname(os.path.abspath(__file__))
-APP_VERSION = "2.8.9"
+APP_VERSION = "2.9.0"
 GITHUB_REPO = "Aladdinweb/TASHIL-ES"  # used by the in-app OTA update checker
 
 app = Flask(__name__,
             template_folder=os.path.join(APP_ROOT, "templates"),
             static_folder=os.path.join(APP_ROOT, "static"))
 app.config["MAX_CONTENT_LENGTH"] = 64 * 1024 * 1024  # 64MB upload cap
+
+# v2.9.0: LOCAL real-time channel between this process and its own UI
+# (desktop window, or a phone on the same LAN). threading mode on purpose —
+# no eventlet/gevent, which are heavy to freeze with PyInstaller. Files
+# still travel over plain HTTP multipart; the socket only carries small
+# notifications. No CORS override: same-origin only.
+if _SOCKETIO_AVAILABLE:
+    socketio = SocketIO(app, async_mode="threading", ping_interval=20,
+                        ping_timeout=40, max_http_buffer_size=1_000_000)
+else:
+    socketio = None
 
 
 # --------------------------------------------------------------------------- #
@@ -511,11 +532,22 @@ def get_onboarding_institutions(wilaya_code: int, institution_type: str):
 # commit=False for read-only blocks where a commit would be a no-op
 # anyway (harmless either way, but explicit is clearer).
 # --------------------------------------------------------------------------- #
+# v2.9.0: 5 s -> 30 s. This is only a safety margin: the REAL fix for
+# "database is locked" is that no connection is held open across a network
+# call anymore (see run_bridge_poll) and that read-then-write blocks take
+# the write lock up-front with BEGIN IMMEDIATE (see _db_write and the
+# three routes below). In WAL mode a deferred transaction that reads and
+# then tries to write can fail IMMEDIATELY with SQLITE_BUSY whatever the
+# timeout is — busy_timeout cannot help that case.
+DB_TIMEOUT_SECONDS = 30
+
+
 def _open_sqlite_connection(db_path: str) -> sqlite3.Connection:
-    conn = sqlite3.connect(db_path, timeout=5)
+    conn = sqlite3.connect(db_path, timeout=DB_TIMEOUT_SECONDS)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL;")
-    conn.execute("PRAGMA busy_timeout=5000;")
+    conn.execute(f"PRAGMA busy_timeout={DB_TIMEOUT_SECONDS * 1000};")
+    conn.execute("PRAGMA synchronous=NORMAL;")  # safe in WAL, far fewer fsyncs
     return conn
 
 
@@ -850,6 +882,16 @@ def profile_db(institution_key: str, commit: bool = True):
         conn.close()
 
 
+def _db_write(institution_key: str, sql: str, params=()):
+    """One short, isolated write transaction on a profile database (v2.9.0).
+    BEGIN IMMEDIATE takes the write lock right away (waiting up to
+    DB_TIMEOUT_SECONDS) instead of upgrading a read lock later."""
+    with profile_db(institution_key) as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        cur = conn.execute(sql, params)
+        return cur.rowcount
+
+
 def next_tracking_number(conn, direction: str, institution_key: str) -> str:
     """
     Tracking numbers embed a short institution code (derived from the
@@ -958,7 +1000,14 @@ def find_local_profile_by_recipient(recipient_text: str, recipient_role: str = N
 GITHUB_API_BASE = "https://api.github.com"
 
 
-def _github_request(method: str, url_or_path: str, token: str, json_body: dict = None, _max_retries: int = 2):
+# v2.9.0: conditional GETs. A 304 answer does not count against GitHub's primary
+# rate limit (the token is SHARED by every institution, 5000 req/h in total),
+# which is what makes a 10 s poll affordable. Only used for directory listings.
+_ETAG_CACHE = {}  # url -> (etag, parsed_payload)
+
+
+def _github_request(method: str, url_or_path: str, token: str, json_body: dict = None,
+                    _max_retries: int = 2, use_etag: bool = False):
     """
     Minimal GitHub REST API client using urllib only. Accepts either a
     path (starting with '/') or a full URL (as returned in listing
@@ -1001,6 +1050,10 @@ def _github_request(method: str, url_or_path: str, token: str, json_body: dict =
     }
     body = json.dumps(json_body).encode("utf-8") if json_body is not None else None
     ssl_context = ssl.create_default_context(cafile=certifi.where()) if _CERTIFI_AVAILABLE else None
+    etag_on = use_etag and method == "GET"
+    cached = _ETAG_CACHE.get(url) if etag_on else None
+    if cached:
+        headers["If-None-Match"] = cached[0]
 
     last_exc = None
     for attempt in range(_max_retries + 1):
@@ -1008,8 +1061,16 @@ def _github_request(method: str, url_or_path: str, token: str, json_body: dict =
         try:
             with urllib.request.urlopen(req, timeout=20, context=ssl_context) as resp:
                 raw = resp.read()
-                return resp.status, (json.loads(raw.decode("utf-8")) if raw else {})
+                parsed = json.loads(raw.decode("utf-8")) if raw else {}
+                if etag_on and resp.headers.get("ETag"):
+                    _ETAG_CACHE[url] = (resp.headers.get("ETag"), parsed)
+                return resp.status, parsed
         except urllib.error.HTTPError as e:
+            if etag_on and e.code == 304 and cached:
+                # Nothing changed since last time: reuse the previous body.
+                return 200, list(cached[1]) if isinstance(cached[1], list) else cached[1]
+            if etag_on and e.code == 404:
+                _ETAG_CACHE.pop(url, None)
             # A real response from GitHub (even an error one) — retrying
             # immediately can't change an auth/permissions/not-found
             # answer, so return it as-is rather than burning retries.
@@ -1324,6 +1385,7 @@ def api_meta():
         "lan_url": f"http://{get_lan_ip()}:5000/",
         "app_version": APP_VERSION,
         "github_repo": GITHUB_REPO,
+        "realtime": socketio is not None,   # v2.9.0: lets the UI pick socket mode vs legacy polling
     })
 
 
@@ -1553,7 +1615,9 @@ def api_session_lock():
     """Locks the workspace (the 'logout' action) WITHOUT deleting any data —
     switching institutions must never show a previous institution's
     archives, but it also must never destroy them."""
+    closing_key = _active_key
     clear_active_session()
+    _ui_session_closed(closing_key)
     return jsonify({"ok": True})
 
 
@@ -1586,6 +1650,7 @@ def api_delete_profile():
     # Lock immediately — no further access to this profile from this point
     # on, regardless of whether file cleanup below fully succeeds.
     clear_active_session()
+    _ui_session_closed(key_to_delete)
 
     with registry_db() as conn:
         conn.execute("DELETE FROM profiles WHERE institution_key = ?", (key_to_delete,))
@@ -1833,6 +1898,7 @@ def api_send_message():
     # because that's exactly the window where the background Cloud
     # Bridge poll (or heartbeat) can collide with it.
     with profile_db(_active_key) as conn:
+        conn.execute("BEGIN IMMEDIATE")  # v2.9.0: SELECT (tracking) then INSERT -> take the write lock first
         # v2.8.2: defense in depth on top of next_tracking_number()'s own
         # existence check — if two sends somehow land on the exact same
         # microsecond-scale race and still produce the same candidate
@@ -1998,6 +2064,7 @@ def api_update_message_status(message_id):
         return jsonify({"error": "Statut invalide."}), 400
 
     with profile_db(_active_key) as conn:
+        conn.execute("BEGIN IMMEDIATE")  # v2.9.0: SELECT then UPDATE
         row = conn.execute("SELECT * FROM messages WHERE id = ?", (message_id,)).fetchone()
         if row is None:
             return jsonify({"error": "Message introuvable."}), 404
@@ -2112,6 +2179,7 @@ def api_delete_message(message_id):
     if _active_key is None:
         return locked_response()
     with profile_db(_active_key) as conn:
+        conn.execute("BEGIN IMMEDIATE")  # v2.9.0: SELECT then DELETE
         row = conn.execute("SELECT * FROM messages WHERE id = ?", (message_id,)).fetchone()
         if row is None:
             return jsonify({"error": "Message introuvable."}), 404
@@ -2406,29 +2474,25 @@ def _queue_bridge_cleanup(conn, url_or_path: str, sha: str):
     )
 
 
-def _delete_bridge_entry_or_queue(conn, owner: str, repo: str, token: str, url_or_path: str, sha: str):
-    """
-    Note: the GitHub DELETE call below happens WHILE `conn` (passed in by
-    the caller) may still be open for the current poll cycle — this
-    mirrors the original design and is fine under WAL: readers elsewhere
-    are not blocked by it, and a same-process write from the same
-    connection is not the kind of cross-connection contention WAL/
-    busy_timeout are guarding against. The queuing INSERT itself, right
-    below, is a fast local write with no network in between.
-    """
+def _delete_bridge_entry_or_queue(key: str, owner: str, repo: str, token: str, url_or_path: str, sha: str):
+    """v2.9.0: takes the profile KEY, not a connection. The GitHub DELETE runs
+    with no SQLite connection open; only the (rare) queuing INSERT is a short
+    write of its own. 404 = already gone = nothing left to clean."""
     status, _ = _github_request("DELETE", url_or_path, token,
                                  {"message": "TASHIL bridge: consumed", "sha": sha})
-    if status not in (200, 204):
-        _queue_bridge_cleanup(conn, url_or_path, sha)
+    if status not in (200, 204, 404):
+        _db_write(key, "INSERT INTO bridge_pending_cleanup (repo_path, sha, created_at) VALUES (?, ?, ?)",
+                  (url_or_path, sha, datetime.now().isoformat()))
 
 
-def _retry_pending_bridge_cleanup(conn, owner: str, repo: str, token: str):
-    pending = conn.execute("SELECT * FROM bridge_pending_cleanup").fetchall()
+def _retry_pending_bridge_cleanup(key: str, owner: str, repo: str, token: str):
+    with profile_db(key, commit=False) as conn:
+        pending = [dict(r) for r in conn.execute("SELECT * FROM bridge_pending_cleanup").fetchall()]
     for row in pending:
         status, _ = _github_request("DELETE", row["repo_path"], token,
                                      {"message": "TASHIL bridge: retried cleanup", "sha": row["sha"]})
-        if status in (200, 204):
-            conn.execute("DELETE FROM bridge_pending_cleanup WHERE id = ?", (row["id"],))
+        if status in (200, 204, 404):
+            _db_write(key, "DELETE FROM bridge_pending_cleanup WHERE id = ?", (row["id"],))
 
 
 # --------------------------------------------------------------------------- #
@@ -2450,24 +2514,31 @@ def _queue_pending_push(conn, kind: str, payload: dict):
     )
 
 
-def _flush_pending_pushes(conn, owner: str, repo: str, token: str):
+def _flush_pending_pushes(key: str, owner: str, repo: str, token: str) -> int:
     """
-    Retries every queued push, oldest first. A push that keeps failing
-    stays queued (attempts incremented) rather than being dropped — the
-    document stays visibly "En attente" on the dashboard for as long as
-    it genuinely hasn't gone anywhere, which is the honest state to show.
+    Retries every queued push, oldest first (returns how many succeeded).
+    v2.9.0: the queue is READ in one short connection, each retry then runs
+    its GitHub call with NO connection open, and each outcome is written in
+    its own short transaction. The previous version kept one connection
+    open across all retries while _retry_pending_message_push opened a
+    SECOND write connection on the same file — the poll could lock itself
+    out (and everyone else) as soon as two items were queued.
     """
-    pending = conn.execute("SELECT * FROM bridge_pending_push ORDER BY id ASC").fetchall()
+    with profile_db(key, commit=False) as conn:
+        pending = [dict(r) for r in conn.execute("SELECT * FROM bridge_pending_push ORDER BY id ASC").fetchall()]
+    flushed = 0
     for row in pending:
+        if _active_key != key:      # session locked/switched meanwhile: stop, retry next time
+            break
         try:
             payload = json.loads(row["payload"])
         except Exception:
-            conn.execute("DELETE FROM bridge_pending_push WHERE id = ?", (row["id"],))
+            _db_write(key, "DELETE FROM bridge_pending_push WHERE id = ?", (row["id"],))
             continue  # corrupt queue entry — nothing useful to retry, drop it
 
         success = False
         if row["kind"] == "message":
-            success = _retry_pending_message_push(payload, owner, repo, token)
+            success = _retry_pending_message_push(payload, owner, repo, token, key)
         elif row["kind"] == "receipt":
             success = push_receipt_to_bridge(
                 {"github_owner": owner, "github_repo": repo, "github_token": token},
@@ -2476,21 +2547,20 @@ def _flush_pending_pushes(conn, owner: str, repo: str, token: str):
             )
 
         if success:
-            conn.execute("DELETE FROM bridge_pending_push WHERE id = ?", (row["id"],))
+            _db_write(key, "DELETE FROM bridge_pending_push WHERE id = ?", (row["id"],))
+            flushed += 1
         else:
-            conn.execute("UPDATE bridge_pending_push SET attempts = attempts + 1 WHERE id = ?", (row["id"],))
+            _db_write(key, "UPDATE bridge_pending_push SET attempts = attempts + 1 WHERE id = ?", (row["id"],))
+    return flushed
 
 
-def _retry_pending_message_push(payload: dict, owner: str, repo: str, token: str) -> bool:
+def _retry_pending_message_push(payload: dict, owner: str, repo: str, token: str, key: str) -> bool:
     """
     Rebuilds and retries a queued message send. Reads the archived file
-    fresh from disk rather than storing its bytes in the queue table —
-    the file is already sitting in this profile's own Courrier_Sortant,
-    so there's no reason to duplicate potentially large attachments into
-    SQLite. Decrypts with the CURRENTLY active profile's key: this only
-    ever runs while that same profile is unlocked (api_bridge_poll
-    requires _active_key), so it's the same key the file was encrypted
-    with in the first place.
+    fresh from disk (no duplicated bytes in the queue) and decrypts it with
+    the active session key — this only ever runs while that same profile is
+    unlocked. v2.9.0: the delivery_method update goes through _db_write on
+    the profile `key` (no second connection racing the caller's).
     """
     try:
         with open(payload["file_path"], "rb") as f:
@@ -2506,12 +2576,8 @@ def _retry_pending_message_push(payload: dict, owner: str, repo: str, token: str
         payload["tracking"], file_bytes, payload["file_original_name"]
     )
     if success:
-        # The message's own sortant record still shows delivery_method
-        # NULL from the original failed attempt — bring it up to date so
-        # the dashboard's colored status dot (🔴 -> 🟠) reflects reality.
-        with profile_db(_active_key) as conn:
-            conn.execute("UPDATE messages SET delivery_method = 'bridge' WHERE tracking_number = ?",
-                         (payload["tracking"],))
+        _db_write(key, "UPDATE messages SET delivery_method = 'bridge' WHERE tracking_number = ?",
+                  (payload["tracking"],))
     return success
 
 
@@ -2530,7 +2596,7 @@ def _retry_pending_message_push(payload: dict, owner: str, repo: str, token: str
 # correctly show as offline once its last heartbeat goes stale, not
 # because anything failed, simply because it stopped announcing itself.
 # --------------------------------------------------------------------------- #
-_HEARTBEAT_STALE_AFTER_SECONDS = 180  # ~4 missed 45s poll cycles
+_HEARTBEAT_STALE_AFTER_SECONDS = 240  # v2.9.0: heartbeat every 60 s -> 4 missed beats
 
 
 def _send_heartbeat(owner: str, repo: str, token: str, profile: dict):
@@ -2599,193 +2665,337 @@ def api_bridge_directory():
     return jsonify({"bridge_enabled": True, "institutions": institutions})
 
 
-@app.route("/api/bridge/poll", methods=["POST"])
-def api_bridge_poll():
-    """
-    Checks the Cloud Bridge repo for new messages AND read-receipts
-    addressed to the CURRENTLY ACTIVE profile. Downloads/imports anything
-    found into that profile's own isolated database + archive, applies
-    any receipts to the matching sent items, then removes consumed
-    entries from the bridge repo — retrying any cleanup that failed on a
-    previous poll first. Safe to call repeatedly — already-seen tracking
-    numbers are skipped.
+# --------------------------------------------------------------------------- #
+# v2.9.0 — Cloud Bridge poll, now run by a SERVER-SIDE loop + local realtime.
+#
+# What changed and why:
+#  * The poll used to be triggered by the browser every 20 s and held ONE
+#    SQLite connection (with an open write transaction after the first
+#    INSERT) across dozens of GitHub calls. Any foreground write (send,
+#    accusé, delete) then waited on it -> "database is locked".
+#    Now: network phases run with NO connection open; every DB step is a
+#    short, isolated transaction (BEGIN IMMEDIATE).
+#  * The loop runs in a background thread (10 s by default), so it does not
+#    depend on the UI being open/visible, and pushes an event to the UI
+#    through Flask-SocketIO as soon as something is imported.
+#  * Directory listings use ETag (304 = free) and heartbeats are sent every
+#    60 s, not on every cycle, to protect the shared GitHub quota.
+# ⚠️ Local-first limit, unchanged: the socket only connects this process to
+# ITS OWN UI. Delivery between two different PCs still travels through the
+# GitHub bridge, so the latency floor is BRIDGE_POLL_SECONDS.
+# --------------------------------------------------------------------------- #
+BRIDGE_POLL_SECONDS = max(5, int(os.environ.get("TASHIL_BRIDGE_POLL_SECONDS", "10")))
+HEARTBEAT_EVERY_SECONDS = 60
+_POLL_LOCK = threading.Lock()
+_last_heartbeat = {}          # institution_key -> time.monotonic() of last beat
+_bridge_keep_ensured = set()  # (owner, repo) for which bridge/.keep was attempted
+_bridge_loop_started = False
 
-    This function's SQLite connection (via profile_db()) is held open for
-    the whole poll, interleaved with many GitHub network calls — that
-    part of the original design is unchanged here. What changes with
-    v2.8.1 is that this connection now runs in WAL mode with a 5s
-    busy_timeout, same as every other connection in the app: a
-    foreground request (e.g. a send, or opening the Registre) that needs
-    the SAME profile's database while a poll is mid-flight now waits up
-    to 5 seconds and proceeds, instead of failing immediately with
-    "database is locked". The context manager also guarantees this
-    connection is always closed — even if a GitHub call raises or a
-    network timeout occurs partway through — so a failed poll can never
-    leak a held-open connection into the next request.
-    """
-    if _active_key is None:
-        return locked_response()
+
+def _emit_ui(key, event: str, payload: dict = None):
+    """Notify the UI(s) connected to this profile's room. Never raises."""
+    if socketio is None or key is None:
+        return
+    try:
+        socketio.emit(event, payload or {}, to=key)
+    except Exception:
+        app.logger.exception("socket emit failed (%s)", event)
+
+
+def _ui_session_closed(key):
+    """Called when a profile is locked/deleted: tell its UI, empty its room,
+    and drop per-session caches so nothing leaks into the next profile."""
+    _ETAG_CACHE.clear()
+    _last_heartbeat.pop(key, None)
+    if socketio is not None and key:
+        _emit_ui(key, "session_locked")
+        try:
+            socketio.close_room(key)
+        except Exception:
+            pass
+
+
+if socketio is not None:
+    @socketio.on("connect")
+    def _on_socket_connect():
+        # Always accept: the lock screen must be able to connect. Nothing is
+        # delivered until the client joins a room (see below).
+        return True
+
+    @socketio.on("join_room")
+    def _on_join_room(_data=None):
+        # The client NEVER chooses its room: the server derives it from the
+        # unlocked profile, otherwise any device on the LAN could subscribe
+        # to another service's notifications.
+        key = _active_key
+        if key is None:
+            return {"ok": False, "locked": True}
+        for r in list(rooms()):
+            if r != request.sid and r != key:
+                leave_room(r)
+        join_room(key)
+        return {"ok": True}
+
+
+def _session_is(key, fernet) -> bool:
+    return _active_key == key and _active_fernet is fernet
+
+
+def _ensure_bridge_keep(owner: str, repo: str, token: str):
+    """GitHub removes a folder when its last file is deleted, and a 404
+    listing can never be cached (it always counts against the quota). A
+    permanent bridge/.keep keeps the folder alive so the idle poll is a
+    free 304. Attempted once per process; harmless if it already exists."""
+    marker = (owner, repo)
+    if marker in _bridge_keep_ensured:
+        return
+    _bridge_keep_ensured.add(marker)
+    _github_request(
+        "PUT", f"/repos/{owner}/{repo}/contents/bridge/.keep", token,
+        {"message": "TASHIL bridge: keep folder",
+         "content": base64.b64encode(b"TASHIL bridge queue\n").decode("ascii")}
+    )
+
+
+def _list_bridge_entries(owner: str, repo: str, token: str, slugs):
+    """Returns (json_entries, receipt_entries, error_status). One cached
+    listing of bridge/ tells us which of OUR folders exist; we only list
+    those (and receipts/ only if it is really there)."""
+    st, top = _github_request("GET", f"/repos/{owner}/{repo}/contents/bridge", token, use_etag=True)
+    if st == 404:
+        _ensure_bridge_keep(owner, repo, token)
+        return [], [], None
+    if st != 200:
+        return [], [], st
+    existing_dirs = {e.get("name") for e in top if e.get("type") == "dir"}
+
+    json_entries, receipt_entries = [], []
+    for slug in slugs:
+        if slug not in existing_dirs:
+            continue
+        s, listing = _github_request("GET", f"/repos/{owner}/{repo}/contents/bridge/{slug}", token, use_etag=True)
+        if s == 200:
+            json_entries.extend(f for f in listing if f.get("name", "").endswith(".json"))
+            if any(f.get("name") == "receipts" and f.get("type") == "dir" for f in listing):
+                r_s, r_listing = _github_request(
+                    "GET", f"/repos/{owner}/{repo}/contents/bridge/{slug}/receipts", token, use_etag=True)
+                if r_s == 200:
+                    receipt_entries.extend(f for f in r_listing if f.get("name", "").endswith(".json"))
+                elif r_s != 404:
+                    return [], [], r_s
+        elif s != 404:
+            return [], [], s
+    return json_entries, receipt_entries, None
+
+
+def run_bridge_poll(notify: bool = False) -> dict:
+    """One poll cycle for the CURRENTLY ACTIVE profile. Safe to call
+    repeatedly; a second concurrent call returns {"busy": True}.
+    notify=True (background loop) also pushes socket events; the manual
+    route passes False because its HTTP response already carries the result."""
+    if not _POLL_LOCK.acquire(blocking=False):
+        return {"ok": True, "busy": True, "bridge_enabled": True, "new_messages": 0, "receipts": []}
+    try:
+        return _run_bridge_poll_locked(notify)
+    finally:
+        _POLL_LOCK.release()
+
+
+def _run_bridge_poll_locked(notify: bool) -> dict:
+    key, fernet = _active_key, _active_fernet   # snapshot: the session can change under us
+    if key is None:
+        return {"ok": True, "locked": True, "bridge_enabled": False, "new_messages": 0, "receipts": []}
 
     cfg = get_bridge_config()
     if not cfg or not cfg["enabled"]:
-        return jsonify({"ok": True, "bridge_enabled": False, "new_messages": 0, "receipts": []})
+        return {"ok": True, "bridge_enabled": False, "new_messages": 0, "receipts": []}
 
-    profile = get_profile_row(_active_key)
+    profile = get_profile_row(key)
+    if profile is None:
+        return {"ok": True, "bridge_enabled": False, "new_messages": 0, "receipts": []}
     owner, repo, token = cfg["github_owner"], cfg["github_repo"], cfg["github_token"]
-    paths = profile_paths(_active_key)
+    paths = profile_paths(key)
 
-    with profile_db(_active_key) as conn:
-        # v2.8.9: retry any outgoing message/receipt pushes that failed
-        # earlier (typically "Erreur GitHub (0)" — a transient network
-        # blip) BEFORE anything else this cycle — a document stuck "En
-        # attente" gets a fresh attempt roughly every ~20s (the
-        # frontend's background poll interval) with no user action needed.
-        _flush_pending_pushes(conn, owner, repo, token)
+    # 1) Retry failed outgoing pushes and failed cleanups (no connection held).
+    flushed = _flush_pending_pushes(key, owner, repo, token)
+    _retry_pending_bridge_cleanup(key, owner, repo, token)
 
-        # Retry any deletions that failed on a previous poll BEFORE
-        # processing new entries (see queue_bridge_cleanup / feature note).
-        _retry_pending_bridge_cleanup(conn, owner, repo, token)
-
-        # Announce presence for "Établissements connectés" — piggybacked
-        # here rather than a separate timer, so it costs no extra GitHub
-        # API budget beyond what polling already uses.
+    # 2) Presence heartbeat — every HEARTBEAT_EVERY_SECONDS, not every cycle.
+    now_m = time.monotonic()
+    last = _last_heartbeat.get(key)
+    if last is None or now_m - last >= HEARTBEAT_EVERY_SECONDS:
         try:
             _send_heartbeat(owner, repo, token, profile)
         except Exception:
-            pass  # a missed heartbeat just means this device looks offline a bit longer, not a real failure
+            pass
+        _last_heartbeat[key] = now_m
 
-        # A sender may have addressed this institution by its plain name
-        # (v2.8.5: now role-aware for non-SECRETARIAT roles), or by its
-        # exact routing ID (institution_key, always role-specific by
-        # construction) — check every form so no addressing style
-        # silently gets lost. Deduplicated by set() since some of these
-        # can normalize to the same slug (e.g. a SECRETARIAT profile's
-        # plain-name slug is unchanged from pre-v2.8.5).
-        profile_role = profile.get("role") or DEFAULT_ROLE
-        keys_to_check = {
-            bridge_slug(profile["institution_name"], profile_role),
-            bridge_slug(profile["institution_key"]),
-        }
+    # 3) List what is addressed to us (name form AND exact routing-ID form).
+    profile_role = profile.get("role") or DEFAULT_ROLE
+    slugs = sorted({bridge_slug(profile["institution_name"], profile_role),
+                    bridge_slug(profile["institution_key"])})
+    json_entries, receipt_entries, err = _list_bridge_entries(owner, repo, token, slugs)
+    if err is not None:
+        return {"error": f"Erreur GitHub ({err}).", "error_status": err}
 
-        json_entries = []
-        receipt_entries = []
-        for key in keys_to_check:
-            status, listing = _github_request("GET", f"/repos/{owner}/{repo}/contents/bridge/{key}", token)
-            if status == 200:
-                json_entries.extend(f for f in listing if f["name"].endswith(".json"))
-            elif status != 404:
-                return jsonify({"error": f"Erreur GitHub ({status})."}), 502
+    # 4) Import new messages: network first, then ONE short write each.
+    imported = []
+    for entry in json_entries:
+        if not _session_is(key, fernet):
+            break
+        meta_status, meta_content = _github_request("GET", entry["url"], token)
+        if meta_status != 200 or "content" not in meta_content:
+            continue
+        try:
+            meta = json.loads(base64.b64decode(meta_content["content"]).decode("utf-8"))
+            tracking = meta["tracking_number"]
+        except (ValueError, KeyError):
+            continue
 
-            r_status, r_listing = _github_request(
-                "GET", f"/repos/{owner}/{repo}/contents/bridge/{key}/receipts", token
-            )
-            if r_status == 200:
-                receipt_entries.extend(f for f in r_listing if f["name"].endswith(".json"))
-            elif r_status != 404:
-                return jsonify({"error": f"Erreur GitHub ({r_status})."}), 502
+        with profile_db(key, commit=False) as rconn:
+            already_have = rconn.execute(
+                "SELECT 1 FROM messages WHERE tracking_number = ?", (tracking,)).fetchone()
+        if already_have:
+            continue  # imported earlier; leftover cleanup is handled by the pending-cleanup queue
 
-        new_count = 0
-        for entry in json_entries:
-            meta_status, meta_content = _github_request("GET", entry["url"], token)
-            if meta_status != 200 or "content" not in meta_content:
-                continue
+        attach_status, attach_content = _github_request(
+            "GET", f"/repos/{owner}/{repo}/contents/{meta['attachment_path_in_repo']}", token)
+        if attach_status != 200 or "content" not in attach_content:
+            continue
+        file_bytes = base64.b64decode(attach_content["content"])
+
+        if not _session_is(key, fernet):   # locked/switched while downloading: do NOT write with the wrong key
+            break
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        tag = sanitize(meta.get("sender_institution", "DISTANT")).replace(" ", "")[:30]
+        safe_name = sanitize(meta.get("file_original_name", "document"))
+        local_path = os.path.join(paths["entrant"], f"{ts}_{tag}_{safe_name}")
+        try:
+            with open(local_path, "wb") as f:
+                f.write(encrypt_file_bytes(file_bytes))
+        except OSError:
+            continue
+
+        try:
+            with profile_db(key) as wconn:
+                wconn.execute("BEGIN IMMEDIATE")
+                wconn.execute("""
+                    INSERT INTO messages (direction, tracking_number, sender_institution,
+                                           recipient_institution, subject, body, file_path,
+                                           file_original_name, status, delivery_method, is_read,
+                                           sender_institution_key, created_at)
+                    VALUES ('entrant', ?, ?, ?, ?, ?, ?, ?, 'envoye', 'bridge', 0, ?, ?)
+                """, (tracking, meta.get("sender_institution", "?"),
+                      meta.get("recipient_institution", profile["institution_name"]),
+                      encrypt_text(meta.get("subject", "")), encrypt_text(meta.get("body", "")),
+                      local_path, meta.get("file_original_name", "document"),
+                      meta.get("sender_institution_key"),
+                      meta.get("created_at", datetime.now().isoformat())))
+        except sqlite3.IntegrityError:
             try:
-                meta = json.loads(base64.b64decode(meta_content["content"]).decode("utf-8"))
-            except (ValueError, KeyError):
-                continue
-
-            already_have = conn.execute(
-                "SELECT 1 FROM messages WHERE tracking_number = ?", (meta["tracking_number"],)
-            ).fetchone()
-            if already_have:
-                # Already imported on a previous poll — if cleanup failed
-                # that time, _retry_pending_bridge_cleanup above already
-                # handles it.
-                continue
-
-            attach_status, attach_content = _github_request(
-                "GET", f"/repos/{owner}/{repo}/contents/{meta['attachment_path_in_repo']}", token
-            )
-            if attach_status != 200 or "content" not in attach_content:
-                continue
-            file_bytes = base64.b64decode(attach_content["content"])
-
-            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-            tag = sanitize(meta.get("sender_institution", "DISTANT")).replace(" ", "")[:30]
-            safe_name = sanitize(meta.get("file_original_name", "document"))
-            local_path = os.path.join(paths["entrant"], f"{ts}_{tag}_{safe_name}")
-            try:
-                # Encrypts with THIS profile's own active key, if it has
-                # encryption enabled — safe no-op otherwise. We're the
-                # recipient and unlocked right now, so (unlike local
-                # delivery) applying our own encryption here is correct.
-                with open(local_path, "wb") as f:
-                    f.write(encrypt_file_bytes(file_bytes))
+                os.remove(local_path)
             except OSError:
-                continue
+                pass
+            continue
 
-            conn.execute("""
-                INSERT INTO messages (direction, tracking_number, sender_institution,
-                                       recipient_institution, subject, body, file_path,
-                                       file_original_name, status, delivery_method, is_read,
-                                       sender_institution_key, created_at)
-                VALUES ('entrant', ?, ?, ?, ?, ?, ?, ?, 'envoye', 'bridge', 0, ?, ?)
-            """, (meta["tracking_number"], meta.get("sender_institution", "?"),
-                  meta.get("recipient_institution", profile["institution_name"]),
-                  encrypt_text(meta.get("subject", "")), encrypt_text(meta.get("body", "")),
-                  local_path, meta.get("file_original_name", "document"),
-                  meta.get("sender_institution_key"),
-                  meta.get("created_at", datetime.now().isoformat())))
-            new_count += 1
+        imported.append({"tracking_number": tracking, "sender": meta.get("sender_institution", "?")})
+        if notify:
+            _emit_ui(key, "new_document", imported[-1])
 
-            # Clean up consumed entries so the bridge queue doesn't grow
-            # forever — queue for retry instead of silently dropping if
-            # the delete itself fails (see _retry_pending_bridge_cleanup).
-            _delete_bridge_entry_or_queue(conn, owner, repo, token, entry["url"], entry["sha"])
-            _delete_bridge_entry_or_queue(
-                conn, owner, repo, token,
-                f"/repos/{owner}/{repo}/contents/{meta['attachment_path_in_repo']}",
-                attach_content["sha"]
-            )
+        # Consume the entries (queued for retry if the DELETE fails).
+        _delete_bridge_entry_or_queue(key, owner, repo, token, entry["url"], entry["sha"])
+        _delete_bridge_entry_or_queue(
+            key, owner, repo, token,
+            f"/repos/{owner}/{repo}/contents/{meta['attachment_path_in_repo']}", attach_content["sha"])
 
-        receipts_applied = []
-        for entry in receipt_entries:
-            r_status, r_content = _github_request("GET", entry["url"], token)
-            if r_status != 200 or "content" not in r_content:
-                continue
-            try:
-                receipt = json.loads(base64.b64decode(r_content["content"]).decode("utf-8"))
-            except (ValueError, KeyError):
-                continue
+    # 5) Apply read receipts.
+    receipts_applied = []
+    for entry in receipt_entries:
+        if _active_key != key:
+            break
+        r_status, r_content = _github_request("GET", entry["url"], token)
+        if r_status != 200 or "content" not in r_content:
+            continue
+        try:
+            receipt = json.loads(base64.b64decode(r_content["content"]).decode("utf-8"))
+        except (ValueError, KeyError):
+            continue
 
-            tracking = receipt.get("tracking_number")
-            if tracking:
-                sent_row = conn.execute(
-                    "SELECT * FROM messages WHERE tracking_number = ? AND direction = 'sortant'", (tracking,)
-                ).fetchone()
+        tracking = receipt.get("tracking_number")
+        if tracking:
+            applied = False
+            with profile_db(key) as wconn:
+                wconn.execute("BEGIN IMMEDIATE")
+                sent_row = wconn.execute(
+                    "SELECT status FROM messages WHERE tracking_number = ? AND direction = 'sortant'",
+                    (tracking,)).fetchone()
                 if sent_row is not None and sent_row["status"] != "accuse":
-                    conn.execute(
+                    wconn.execute(
                         "UPDATE messages SET status = 'accuse' WHERE tracking_number = ? AND direction = 'sortant'",
-                        (tracking,)
-                    )
-                    receipts_applied.append({
-                        "tracking_number": tracking,
-                        "acknowledged_by": receipt.get("acknowledged_by", "?"),
-                    })
+                        (tracking,))
+                    applied = True
+            if applied:
+                item = {"tracking_number": tracking, "acknowledged_by": receipt.get("acknowledged_by", "?")}
+                receipts_applied.append(item)
+                if notify:
+                    _emit_ui(key, "receipt_update", item)
 
-            # Consume the receipt regardless, so it never sits in the queue forever.
-            _delete_bridge_entry_or_queue(conn, owner, repo, token, entry["url"], entry["sha"])
+        _delete_bridge_entry_or_queue(key, owner, repo, token, entry["url"], entry["sha"])
 
-    return jsonify({
-        "ok": True,
-        "bridge_enabled": True,
-        "new_messages": new_count,
-        "receipts": receipts_applied,
-    })
+    if notify and flushed:
+        _emit_ui(key, "sync_update", {"flushed": flushed})   # a stuck "En attente" document just left
+
+    return {"ok": True, "bridge_enabled": True, "new_messages": len(imported),
+            "receipts": receipts_applied, "flushed": flushed}
+
+
+@app.route("/api/bridge/poll", methods=["POST"])
+def api_bridge_poll():
+    """Manual / fallback poll (🔄 button). The background loop does the
+    regular work; this returns the same summary shape as before."""
+    if _active_key is None:
+        return locked_response()
+    result = run_bridge_poll(notify=False)
+    if result.get("error"):
+        return jsonify({"error": result["error"]}), 502
+    return jsonify(result)
+
+
+def _bridge_loop():
+    failures = 0
+    while True:
+        delay = BRIDGE_POLL_SECONDS
+        try:
+            if _active_key is not None:
+                result = run_bridge_poll(notify=True)
+                failures = failures + 1 if result.get("error") else 0
+        except Exception:
+            app.logger.exception("bridge loop")
+            failures += 1
+        if failures:   # exponential back-off while GitHub/network is failing
+            delay = min(120, BRIDGE_POLL_SECONDS * (2 ** min(failures, 4)))
+        time.sleep(delay)
+
+
+def start_bridge_loop():
+    global _bridge_loop_started
+    if _bridge_loop_started or os.environ.get("TASHIL_DISABLE_BRIDGE_LOOP") == "1":
+        return
+    _bridge_loop_started = True
+    threading.Thread(target=_bridge_loop, name="tashil-bridge-loop", daemon=True).start()
+
+
+# Started at import time so it also runs when the app is imported by the
+# desktop launcher (desktop_launcher.py) and not only via `python app.py`.
+start_bridge_loop()
 
 
 if __name__ == "__main__":
     print(f"TASHIL DOCUMENT HUB — Web Edition v{APP_VERSION}")
     print(f"Local  : http://127.0.0.1:5000/")
     print(f"Réseau : http://{get_lan_ip()}:5000/  (accessible depuis un téléphone sur le même Wi-Fi)")
-    app.run(host="0.0.0.0", port=5000, debug=False)
+    if socketio is not None:
+        socketio.run(app, host="0.0.0.0", port=5000, debug=False,
+                     use_reloader=False, allow_unsafe_werkzeug=True)
+    else:
+        app.run(host="0.0.0.0", port=5000, debug=False)

@@ -178,11 +178,24 @@ def main():
 
         import app as tashil_app  # the Flask app defined in app.py
 
-        server_thread = threading.Thread(
-            target=lambda: tashil_app.app.run(host="0.0.0.0", port=5000, debug=False,
-                                               use_reloader=False),
-            daemon=True,
-        )
+        # v2.9.0: Flask-SocketIO requires socketio.run(app), NOT app.run() —
+        # app.run() would silently give up real-time WebSocket delivery
+        # (falls back to slow HTTP long-polling only), because the plain
+        # Werkzeug dev server it starts is never wrapped with the
+        # WebSocket-upgrade handling that socketio.run() sets up. tashil_app
+        # already falls back to app.run() itself if Flask-SocketIO couldn't
+        # be imported at all (see the same ImportError guard in app.py), so
+        # this launcher just needs to prefer socketio.run() when available.
+        def _run_server():
+            if getattr(tashil_app, "socketio", None) is not None:
+                tashil_app.socketio.run(tashil_app.app, host="0.0.0.0", port=5000,
+                                         debug=False, use_reloader=False,
+                                         allow_unsafe_werkzeug=True)
+            else:
+                tashil_app.app.run(host="0.0.0.0", port=5000, debug=False,
+                                    use_reloader=False)
+
+        server_thread = threading.Thread(target=_run_server, daemon=True)
         server_thread.start()
 
         if not _wait_for_server(5000):

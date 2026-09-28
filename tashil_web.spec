@@ -62,23 +62,50 @@ pyzbar_datas, pyzbar_binaries, pyzbar_hiddenimports = collect_all('pyzbar')
 pystray_datas, pystray_binaries, pystray_hiddenimports = collect_all('pystray')
 plyer_datas, plyer_binaries, plyer_hiddenimports = collect_all('plyer')
 
+# Flask-SocketIO + its transport stack (v2.9.0 — local realtime channel
+# replacing the 8s/20s polling loops). threading async_mode on purpose,
+# same reasoning as everywhere else in this project: no eventlet/gevent,
+# which are heavier and riskier to freeze correctly with PyInstaller than
+# a pure-stdlib-threading dependency chain. simple-websocket is what
+# actually answers WebSocket upgrade requests in threading mode — without
+# it (and without collect_all picking up its full import graph:
+# engineio/socketio/simple_websocket/wsproto/h11/bidict), the exe would
+# silently fall back to slow HTTP long-polling with no visible error.
+socketio_datas, socketio_binaries, socketio_hiddenimports = collect_all('flask_socketio')
+engineio_datas, engineio_binaries, engineio_hiddenimports = collect_all('engineio')
+pysocketio_datas, pysocketio_binaries, pysocketio_hiddenimports = collect_all('socketio')
+simplews_datas, simplews_binaries, simplews_hiddenimports = collect_all('simple_websocket')
+wsproto_datas, wsproto_binaries, wsproto_hiddenimports = collect_all('wsproto')
+h11_datas, h11_binaries, h11_hiddenimports = collect_all('h11')
+bidict_datas, bidict_binaries, bidict_hiddenimports = collect_all('bidict')
+
 a = Analysis(
     ['desktop_launcher.py'],
     pathex=[],
     binaries=webview_binaries + qrcode_binaries + pil_binaries + crypto_binaries
-             + certifi_binaries + pyzbar_binaries + pystray_binaries + plyer_binaries,
+             + certifi_binaries + pyzbar_binaries + pystray_binaries + plyer_binaries
+             + socketio_binaries + engineio_binaries + pysocketio_binaries
+             + simplews_binaries + wsproto_binaries + h11_binaries + bidict_binaries,
     datas=[
         ('templates', 'templates'),
-        ('static', 'static'),
+        ('static', 'static'),   # includes static/js/vendor/socket.io.min.js (v2.9.0)
         ('data', 'data'),  # v2.8.9: bundled default epsp_hierarchy.json
         ('app.py', '.'),
         ('tray.py', '.'),
     ] + webview_datas + qrcode_datas + pil_datas + crypto_datas + certifi_datas + pyzbar_datas
-      + pystray_datas + plyer_datas,
+      + pystray_datas + plyer_datas
+      + socketio_datas + engineio_datas + pysocketio_datas + simplews_datas + wsproto_datas
+      + h11_datas + bidict_datas,
     hiddenimports=['flask', 'werkzeug', 'jinja2'] + webview_hiddenimports
                   + qrcode_hiddenimports + pil_hiddenimports + crypto_hiddenimports
                   + certifi_hiddenimports + pyzbar_hiddenimports
-                  + pystray_hiddenimports + plyer_hiddenimports,
+                  + pystray_hiddenimports + plyer_hiddenimports
+                  + socketio_hiddenimports + engineio_hiddenimports + pysocketio_hiddenimports
+                  + simplews_hiddenimports + wsproto_hiddenimports + h11_hiddenimports
+                  + bidict_hiddenimports
+                  # threading async_mode's engine.io transport picks this driver by name
+                  # at runtime — collect_all() on engineio doesn't always catch it.
+                  + ['engineio.async_drivers.threading'],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
