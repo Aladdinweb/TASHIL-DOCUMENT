@@ -2481,3 +2481,154 @@ ajoutés :** `static/js/vendor/pdfjs/pdf.min.js`,
 aucun CDN). Aucune fonctionnalité antérieure retirée — Flask-SocketIO,
 `BEGIN IMMEDIATE`, sondage Bridge côté serveur et ETag (v2.9.0) confirmés
 intacts par la régression ci-dessus.
+
+---
+
+## 30. v2.9.2 — Version finale officielle : raffinements d'interface, suppression de compte depuis l'écran verrouillé, touche Entrée (2026-09-30)
+
+⚠️ Cette version conserve intégralement le code et les fonctionnalités des
+v2.9.0 et v2.9.1 — rien n'a été retiré, uniquement ajusté.
+
+### 30.1 🎨 Barre supérieure & Sidebar
+
+**Constat, capture d'écran à l'appui** : sur desktop, "TASHIL" apparaissait
+en double — une fois en haut de la barre latérale (généré par
+`.tabbar::before { content: "TASHIL"; }`, ajouté silencieusement lors du
+correctif CSS Grid de la v2.8.2), et une seconde fois dans l'en-tête
+principal à droite ("TASHIL — POLYCLINIQUE ES SENIA"), ce dernier restant
+petit et peu visible comme titre de page.
+
+**Correctifs :**
+- `.tabbar::before` retiré — la sidebar n'affiche plus que les onglets de
+  navigation, sans répéter la marque.
+- En-tête principal agrandi pour devenir le titre visuel de l'application :
+  logo 34px → 52px, titre 16px → 26px (graisse 700 → 800), sous-titre
+  (nom de l'établissement) 12px → 16px, rembourrage 12/20px → 20/28px.
+- Sur mobile (≤640px), ces tailles sont explicitement ramenées à leurs
+  valeurs d'origine (nouvelle règle dédiée) — l'agrandissement ne
+  concerne que l'écran desktop où le "double TASHIL" était visible ;
+  sans ce garde-fou, l'en-tête aurait mangé l'espace vertical sur
+  téléphone.
+
+**Testé** : `tinycss2` confirme 0 erreur de syntaxe après modification ;
+inspection directe des règles confirmant l'absence de toute référence
+résiduelle à `.tabbar::before`.
+
+### 30.2 📄 Message "Aperçu non disponible" — mention de l'extension réelle
+
+`openDocumentViewer()` calcule désormais l'extension réelle du fichier
+et adapte le message :
+- Formats bureautiques (`.doc`, `.docx`, `.xls`, `.xlsx`, `.ppt`,
+  `.pptx`) : *"Aperçu non disponible pour ce type de fichier (.docx) —
+  veuillez convertir votre document en PDF pour une prévisualisation
+  directe, ou utilisez le bouton Télécharger."*
+- Tout autre type non pris en charge : mention de l'extension suivie de
+  l'invitation à télécharger.
+- Extension absente (nom de fichier sans point) : repli sur le message
+  générique d'origine.
+
+### 30.3 🔐 Suppression de compte depuis l'écran de verrouillage
+
+**Nouvelle route backend** `POST /api/profile/delete-locked` — supprime
+un profil **sans jamais le déverrouiller au préalable** : le code PIN
+soumis est vérifié directement contre le hash stocké de ce profil précis,
+sans jamais activer sa session ni sa clé de chiffrement. Volontairement
+accessible même quand **tous** les profils de l'appareil sont verrouillés
+(un appareil sans session active doit pouvoir atteindre cet écran).
+
+Pour éviter toute divergence de comportement entre les deux chemins de
+suppression, la logique de suppression elle-même (vérification PIN,
+verrouillage préventif si le profil visé était par coïncidence déjà actif,
+suppression du registre, suppression du dossier isolé) a été extraite
+dans une fonction partagée `_perform_profile_deletion(key, pin)`, utilisée
+à la fois par la route historique `/api/profile/delete` (profil actif,
+Zone dangereuse) et par cette nouvelle route.
+
+**Interface** : un bouton 🗑️ apparaît sur chaque ligne de l'écran de
+sélection d'établissement (verrouillage), à côté du badge 🔒/⚙️. Il
+réutilise le **même modal de confirmation** que la Zone dangereuse
+(rappel d'irréversibilité + ré-saisie du PIN), généralisé pour cibler
+soit le profil actif (Paramètres), soit un profil verrouillé choisi
+depuis cette liste (`state.deleteProfileTarget`). Un clic sur 🗑️
+n'ouvre jamais le déverrouillage du profil (propagation du clic bloquée
+explicitement).
+
+**🐛 Risque identifié et corrigé pendant l'écriture, avant livraison** :
+brancher le bouton "Zone dangereuse" en `.onclick = openDeleteProfileModal`
+(sans l'envelopper) aurait transmis l'objet `Event` du clic comme premier
+argument de la fonction — désormais généralisée pour accepter une clé
+cible en premier argument — ce qui aurait fait croire à tort que
+Chaque clic sur ce bouton visait un profil "verrouillé" nommé par
+l'événement lui-même. Corrigé en systématisant l'appel via une fonction
+fléchée sans argument (`() => openDeleteProfileModal()`), qui ne
+transmet donc jamais l'événement.
+
+**Testé réellement** : scénario complet — mauvais PIN sur un profil
+verrouillé → `401`, profil intact sur disque ; bon PIN → suppression
+réelle confirmée (dossier disparu, entrée de registre disparue), **et
+confirmation explicite qu'aucune session n'a été activée à aucun moment
+de l'opération** (`GET /api/session` → `active: None` après coup) ;
+établissement inconnu → `404`. Régression : la suppression du profil
+actif (Zone dangereuse, v2.6.0) toujours fonctionnelle après la
+factorisation.
+
+### 30.4 ⌨️ Touche Entrée sur les champs PIN / mot de passe
+
+Nouvel écouteur `keydown` générique (`wireEnterKeySubmit`), câblé une
+seule fois au démarrage de l'application sur les champs suivants, chacun
+déclenchant le bouton de validation associé via `.click()` (et non un
+appel direct à sa fonction, pour rester correct même quand ce bouton
+change de comportement en cours de route — ex. `lock-unlock-btn`, qui
+bascule entre "Déverrouiller" et "Définir le code PIN" selon
+`selectProfileForUnlock`) :
+
+| Champ | Bouton déclenché |
+|---|---|
+| `ob-pin`, `ob-pin-confirm` | `ob-submit` (Activer TASHIL) |
+| `lock-pin-input`, `lock-pin-confirm-input` | `lock-unlock-btn` |
+| `recover-serial`, `recover-new-pin` | `recover-submit-btn` |
+| `delete-profile-pin` | `delete-profile-confirm-btn` |
+
+Le champ `bridge-token` (Paramètres → Cloud Bridge) n'a délibérément pas
+été inclus : il ne relève ni du mot de passe de déverrouillage ni d'un
+formulaire à un seul champ, et un Entrée accidentel en cours de collage
+d'un jeton aurait pu déclencher une sauvegarde de configuration avec des
+champs propriétaire/dépôt encore incomplets.
+
+**Testé** : `node --check` confirme une syntaxe valide ; le câblage a été
+vérifié par inspection directe (chaque paire champ/bouton listée
+ci-dessus correspond à des identifiants réellement présents dans
+`index.html`).
+
+### 30.5 Régression
+
+- Scénario exact de collision SQLite (v2.8.1 → v2.9.2) : toujours `200
+  OK`, aucune régression.
+- Cycle complet réel Flask-SocketIO + faux serveur GitHub + vrai client JS
+  vendor : toujours `new_document` reçu et message correctement inséré.
+- Dédoublonnage/suppression/purge de l'annuaire des établissements
+  (v2.9.1) : rejoué sans modification, toujours conforme.
+- Diagnostic & Santé (`/api/health`, `PRAGMA quick_check`, `VACUUM`,
+  nettoyage cache, quota GitHub) : rejoué sans modification, toujours
+  conforme.
+- Suppression de profil verrouillé (nouveau) : testée dans les deux sens
+  (échec PIN, succès), voir 30.3.
+- `py_compile` sur `app.py`, `node --check` sur `app.js`, validation
+  `tinycss2` sur `style.css` : aucune erreur.
+- **Non rejoué dans cette session** (comme à chaque version, à faire
+  avant tag de production) : la suite de régression complète v2.8.1 →
+  v2.8.9 sur les fonctionnalités que ce patch ne touche pas (HEIC,
+  appairage matériel, hiérarchie EPSP JSON...).
+
+**Fichiers modifiés :** `app.py` (`_perform_profile_deletion` partagée,
+nouvelle route `/api/profile/delete-locked`), `static/js/app.js`
+(bouton 🗑️ par ligne sur l'écran de verrouillage, modal de suppression
+généralisé, message d'aperçu avec extension, écouteurs Entrée),
+`templates/index.html` (aucun changement structurel — le bouton de
+suppression par ligne est généré par `renderProfileList()`),
+`static/css/style.css` (suppression de `.tabbar::before`, agrandissement
+de l'en-tête principal avec repli mobile, style `.profile-item-delete`).
+Aucune fonctionnalité antérieure retirée — Flask-SocketIO, `BEGIN
+IMMEDIATE`, sondage Bridge avec ETag (v2.9.0), dédoublonnage/suppression
+de l'annuaire, visualiseur de documents, module Diagnostic (v2.9.1) tous
+confirmés intacts par la régression ci-dessus.

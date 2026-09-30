@@ -214,7 +214,7 @@ _LEGACY_ARCHIVE_ENTRANT = os.path.join(BASE_DIR, "archives", "Courrier_Entrant")
 os.makedirs(PROFILES_DIR, exist_ok=True)
 
 APP_ROOT = os.path.dirname(os.path.abspath(__file__))
-APP_VERSION = "2.9.1"
+APP_VERSION = "2.9.2"
 GITHUB_REPO = "Aladdinweb/TASHIL-ES"  # used by the in-app OTA update checker
 
 app = Flask(__name__,
@@ -1623,36 +1623,31 @@ def api_session_lock():
     return jsonify({"ok": True})
 
 
-@app.route("/api/profile/delete", methods=["POST"])
-def api_delete_profile():
+def _perform_profile_deletion(key_to_delete: str, pin: str):
     """
-    Permanently deletes the CURRENTLY ACTIVE profile: its isolated database,
-    its entire archive folder (Courrier_Sortant + Courrier_Entrant), and its
-    entry in the device's registry. Irreversible — requires the profile's
-    own PIN to be re-entered as the actual authorization (a dismissible
-    confirm() dialog alone is not enough protection for a destructive
-    action against real archived documents).
+    Shared by both delete routes below. Permanently deletes ONE profile:
+    its isolated database, its entire archive folder (Courrier_Sortant +
+    Courrier_Entrant), and its entry in the device's registry. Irreversible
+    — requires that profile's OWN PIN as the actual authorization (a
+    dismissible confirm() dialog alone is not enough protection for a
+    destructive action against real archived documents). Returns a
+    (response_dict, status_code) pair; never raises for an expected
+    failure (wrong PIN, missing profile).
     """
-    if _active_key is None:
-        return locked_response()
-
-    data = request.get_json(force=True)
-    pin = data.get("pin", "")
-
-    profile = get_profile_row(_active_key)
+    profile = get_profile_row(key_to_delete)
     if profile is None:
-        clear_active_session()
-        return jsonify({"error": "Profil introuvable."}), 404
+        return {"error": "Profil introuvable."}, 404
     if profile["pin_hash"] is None or not check_password_hash(profile["pin_hash"], pin):
-        return jsonify({"error": "Code PIN incorrect."}), 401
+        return {"error": "Code PIN incorrect."}, 401
 
-    key_to_delete = _active_key
     paths = profile_paths(key_to_delete)
 
-    # Lock immediately — no further access to this profile from this point
-    # on, regardless of whether file cleanup below fully succeeds.
-    clear_active_session()
-    _ui_session_closed(key_to_delete)
+    # Lock immediately if this happened to be the active session — no
+    # further access to this profile from this point on, regardless of
+    # whether file cleanup below fully succeeds.
+    if _active_key == key_to_delete:
+        clear_active_session()
+        _ui_session_closed(key_to_delete)
 
     with registry_db() as conn:
         conn.execute("DELETE FROM profiles WHERE institution_key = ?", (key_to_delete,))
@@ -1665,14 +1660,47 @@ def api_delete_profile():
         # entry removed above) — but tell the user plainly if some files
         # couldn't be removed (e.g. one was open in another program),
         # rather than silently leaving orphaned data on disk unmentioned.
-        return jsonify({
+        return {
             "ok": True,
             "warning": f"Le profil a été retiré, mais certains fichiers n'ont pas pu être "
                        f"supprimés automatiquement ({exc}). Vous pouvez les supprimer "
                        f"manuellement dans le dossier de l'application si besoin."
-        })
+        }, 200
 
-    return jsonify({"ok": True})
+    return {"ok": True}, 200
+
+
+@app.route("/api/profile/delete", methods=["POST"])
+def api_delete_profile():
+    """Deletes the CURRENTLY ACTIVE (unlocked) profile — the existing
+    "Zone dangereuse" flow in Paramètres. See _perform_profile_deletion."""
+    if _active_key is None:
+        return locked_response()
+    data = request.get_json(force=True)
+    body, status = _perform_profile_deletion(_active_key, data.get("pin", ""))
+    return jsonify(body), status
+
+
+@app.route("/api/profile/delete-locked", methods=["POST"])
+def api_delete_profile_locked():
+    """
+    v2.9.2: deletes a profile picked from the LOCK-SCREEN establishment
+    list, WITHOUT ever unlocking it into an active session first — the PIN
+    entered here is checked directly against that profile's own stored
+    hash and never activates its session or its encryption key. This is
+    the same irreversible deletion as /api/profile/delete, just reachable
+    one step earlier in the flow (the account picker, before a PIN would
+    normally grant access), for cleaning up a test or obsolete
+    establishment without first having to unlock it.
+    ⚠️ Deliberately available while every profile is locked — a device
+    with no active session must still be able to reach this screen.
+    """
+    data = request.get_json(force=True)
+    key_to_delete = data.get("institution_key", "").strip()
+    if not key_to_delete:
+        return jsonify({"error": "Établissement non spécifié."}), 400
+    body, status = _perform_profile_deletion(key_to_delete, data.get("pin", ""))
+    return jsonify(body), status
 
 
 # --------------------------------------------------------------------------- #

@@ -34,6 +34,7 @@ const state = {
   bridgeEnabled: false,
   socket: null,              // v2.9.0: local realtime channel (this device <-> its own server)
   fallbackTimer: null,       // only runs while the socket is disconnected/unavailable
+  deleteProfileTarget: null, // v2.9.2: {key, name} when deleting from the LOCK screen; null = active profile
 };
 
 // ------------------------------------------------------------------ //
@@ -299,11 +300,25 @@ function renderProfileList(profiles) {
         <div class="profile-item-sub">${escapeHtml(p.wilaya_name)} — ${escapeHtml(p.institution_type)}</div>
       </div>
       <span class="profile-item-badge">${p.pin_set ? "🔒" : "⚙️ à configurer"}</span>
+      <button class="row-btn danger profile-item-delete" data-delete-account="${escapeHtml(p.institution_key)}"
+              data-account-name="${escapeHtml(p.institution_name)}" title="Supprimer cet établissement">🗑️</button>
     </div>
   `).join("");
 
   container.querySelectorAll(".profile-item").forEach(el => {
-    el.addEventListener("click", () => selectProfileForUnlock(el.dataset.key, profiles));
+    el.addEventListener("click", (e) => {
+      // v2.9.2: the 🗑️ lives inside this same row — never let its click
+      // bubble up into "select this profile to unlock".
+      if (e.target.closest("[data-delete-account]")) return;
+      selectProfileForUnlock(el.dataset.key, profiles);
+    });
+  });
+
+  container.querySelectorAll("[data-delete-account]").forEach(btn => {
+    btn.addEventListener("click", (e) => {
+      e.stopPropagation();
+      openDeleteProfileModal(btn.dataset.deleteAccount, btn.dataset.accountName);
+    });
   });
 }
 
@@ -947,6 +962,17 @@ async function openDocumentViewer(messageId, fileName) {
 
   if (kind === "unsupported") {
     loading.classList.add("hidden");
+    // v2.9.2: names the actual extension and, for office formats people
+    // actually send through TASHIL (.doc/.docx/.xls/.xlsx), suggests the
+    // concrete fix (convert to PDF) instead of a generic dead end.
+    const ext = (fileName || "").split(".").pop().toLowerCase();
+    const officeFormats = ["doc", "docx", "xls", "xlsx", "ppt", "pptx"];
+    unsupported.textContent = ext && officeFormats.includes(ext)
+      ? `Aperçu non disponible pour ce type de fichier (.${ext}) — veuillez convertir ` +
+        `votre document en PDF pour une prévisualisation directe, ou utilisez le bouton Télécharger.`
+      : ext
+      ? `Aperçu non disponible pour ce type de fichier (.${ext}) — utilisez 📥 Télécharger.`
+      : `Aperçu non disponible pour ce type de fichier — utilisez 📥 Télécharger.`;
     unsupported.classList.remove("hidden");
     return;
   }
@@ -1970,17 +1996,30 @@ function setupLogout() {
 // dismissible dialog, since this permanently destroys archived documents)
 // ------------------------------------------------------------------ //
 function setupDeleteProfile() {
-  document.getElementById("delete-profile-btn").onclick = openDeleteProfileModal;
+  // v2.9.2: wrapped in arrow functions — .onclick = openDeleteProfileModal
+  // directly would pass the click Event as its first argument, which
+  // openDeleteProfileModal would then misread as a locked-profile target.
+  document.getElementById("delete-profile-btn").onclick = () => openDeleteProfileModal();
   document.getElementById("delete-profile-cancel-btn").onclick = closeDeleteProfileModal;
   document.getElementById("delete-profile-confirm-btn").onclick = confirmDeleteProfile;
 }
 
-function openDeleteProfileModal() {
+// v2.9.2: this modal now serves TWO entry points, both irreversible and
+// both requiring that profile's own PIN:
+//  - Paramètres → Zone dangereuse: deletes the CURRENTLY ACTIVE profile
+//    (openDeleteProfileModal() with no arguments, via /api/profile/delete)
+//  - Lock screen → 🗑️ on an establishment row: deletes a profile that was
+//    never unlocked at all (openDeleteProfileModal(key, name), via the
+//    new /api/profile/delete-locked — its PIN is checked directly against
+//    that profile's own stored hash without ever activating its session).
+function openDeleteProfileModal(targetKey, targetName) {
+  state.deleteProfileTarget = targetKey ? { key: targetKey, name: targetName } : null;
   document.getElementById("delete-profile-institution-name").textContent =
-    state.profile ? state.profile.institution_name : "";
+    targetKey ? targetName : (state.profile ? state.profile.institution_name : "");
   document.getElementById("delete-profile-pin").value = "";
   document.getElementById("delete-profile-error").classList.add("hidden");
   document.getElementById("delete-profile-overlay").classList.remove("hidden");
+  document.getElementById("delete-profile-pin").focus();
 }
 
 function closeDeleteProfileModal() {
@@ -1998,12 +2037,16 @@ async function confirmDeleteProfile() {
     return;
   }
 
+  const target = state.deleteProfileTarget;  // set by openDeleteProfileModal
+  const url = target ? "/api/profile/delete-locked" : "/api/profile/delete";
+  const body = target ? { institution_key: target.key, pin } : { pin };
+
   let deleteData;
   try {
-    const res = await fetch("/api/profile/delete", {
+    const res = await fetch(url, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ pin }),
+      body: JSON.stringify(body),
     });
     deleteData = await res.json();
     if (!res.ok) throw new Error(deleteData.error || "Échec de la suppression.");
@@ -2020,7 +2063,15 @@ async function confirmDeleteProfile() {
   if (deleteData.warning) {
     showToast(`⚠️ ${deleteData.warning}`, "error");
   } else {
-    showToast("🗑️ Profil supprimé définitivement", "success");
+    showToast(`🗑️ "${target ? target.name : "Profil"}" supprimé définitivement`, "success");
+  }
+
+  if (target) {
+    // Deleted straight from the lock screen — nothing was ever unlocked,
+    // so just refresh that same screen's establishment list in place.
+    state.deleteProfileTarget = null;
+    await showLockScreen();
+    return;
   }
 
   state.profile = null;
@@ -2043,6 +2094,35 @@ async function confirmDeleteProfile() {
 // v2.9.1: state.meta is populated a few lines above, before onboarding/
 // lock-screen branching — safe to wire immediately after boot() sets it.
 setupLockAndOnboardingUpdateCheck();
+
+// v2.9.2: pressing Enter in a PIN/unlock field submits the matching form,
+// the same as clicking its button — these fields exist in static HTML
+// from page load (unlike the dashboard/inbox rows), so this is wired once
+// here rather than inside showApp()'s appInitialized block. button.click()
+// is used (not calling the handler directly) so this keeps working even
+// if that button's own .onclick is reassigned later (e.g. lock-unlock-btn,
+// whose handler and label change between "unlock" and "set a new PIN" —
+// see selectProfileForUnlock).
+function wireEnterKeySubmit(inputId, buttonId) {
+  const input = document.getElementById(inputId);
+  if (!input) return;
+  input.addEventListener("keydown", (e) => {
+    if (e.key !== "Enter") return;
+    e.preventDefault();
+    const btn = document.getElementById(buttonId);
+    if (btn && !btn.disabled) btn.click();
+  });
+}
+
+[
+  ["ob-pin", "ob-submit"],
+  ["ob-pin-confirm", "ob-submit"],
+  ["lock-pin-input", "lock-unlock-btn"],
+  ["lock-pin-confirm-input", "lock-unlock-btn"],
+  ["recover-serial", "recover-submit-btn"],
+  ["recover-new-pin", "recover-submit-btn"],
+  ["delete-profile-pin", "delete-profile-confirm-btn"],
+].forEach(([inputId, buttonId]) => wireEnterKeySubmit(inputId, buttonId));
 
 // ------------------------------------------------------------------ //
 // Utils

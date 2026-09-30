@@ -106,20 +106,24 @@ textarea { resize: vertical; }
 .profile-item-name { font-weight: 600; font-size: 14px; }
 .profile-item-sub { font-size: 12px; color: var(--text-muted); }
 .profile-item-badge { font-size: 11px; color: var(--primary); }
+.profile-item-delete { flex-shrink: 0; }  /* v2.9.2: 🗑️ per row on the lock/account-picker screen */
 
 /* ---------------- App shell ---------------- */
 .app { display: flex; flex-direction: column; min-height: 100vh; }
 
 .topbar {
   display: flex; align-items: center; justify-content: space-between;
-  padding: 12px 20px; border-bottom: 1px solid var(--border);
+  /* v2.9.2: taller padding — this header is now the app's one main title
+     block (sidebar no longer repeats "TASHIL" on its own — see .tabbar
+     below), so it needs the visual weight of a real page title. */
+  padding: 20px 28px; border-bottom: 1px solid var(--border);
   background: var(--sidebar);
 }
-.brand { display: flex; align-items: center; gap: 10px; }
-.brand-logo { width: 34px; height: 34px; object-fit: contain; }
-.brand-text { display: flex; flex-direction: column; line-height: 1.2; }
-.brand-title { font-weight: 700; color: var(--primary); font-size: 16px; }
-.brand-subtitle { font-size: 12px; color: var(--text-muted); }
+.brand { display: flex; align-items: center; gap: 16px; }
+.brand-logo { width: 52px; height: 52px; object-fit: contain; }
+.brand-text { display: flex; flex-direction: column; line-height: 1.25; }
+.brand-title { font-weight: 800; color: var(--primary); font-size: 26px; }
+.brand-subtitle { font-size: 16px; color: var(--text-muted); font-weight: 500; }
 .icon-btn {
   background: transparent; border: 1px solid var(--border); border-radius: 8px;
   padding: 8px 10px; font-size: 16px; cursor: pointer; color: var(--text);
@@ -290,6 +294,14 @@ label:first-child { margin-top: 0; }
 
 /* ---------------- Responsive: mobile bottom nav ---------------- */
 @media (max-width: 640px) {
+  /* v2.9.2: the enlarged header (desktop title treatment) is scaled back
+     down on phones, where that much padding/font-size would crowd out
+     the establishment name and push content below the fold. */
+  .topbar { padding: 12px 16px; }
+  .brand { gap: 10px; }
+  .brand-logo { width: 34px; height: 34px; }
+  .brand-title { font-size: 16px; }
+  .brand-subtitle { font-size: 12px; }
   .tabbar {
     position: fixed; bottom: 0; left: 0; right: 0; z-index: 50;
     justify-content: space-around; padding: 6px 4px;
@@ -335,10 +347,11 @@ label:first-child { margin-top: 0; }
     border-right: 1px solid var(--border); border-bottom: none;
     padding: 20px 12px; align-items: stretch;
   }
-  .tabbar::before {
-    content: "TASHIL"; display: block; color: var(--primary);
-    font-weight: 700; font-size: 20px; padding: 0 10px 20px;
-  }
+  /* v2.9.2: removed — the sidebar no longer repeats a plain "TASHIL" label
+     above its nav items; the app's identity now lives in the single,
+     enlarged header block on the right (see .topbar / .brand-* below),
+     which already carries the logo, "TASHIL" and the establishment name
+     together as one clear page title instead of two separate labels. */
   .tab { justify-content: flex-start; padding: 12px 14px; }
   .content { grid-area: content; padding: 32px; max-width: 900px; }
 }
