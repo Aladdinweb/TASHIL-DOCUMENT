@@ -48,6 +48,17 @@
       <button class="btn btn-primary" id="ob-submit">Activer TASHIL</button>
       <button class="btn btn-secondary hidden" id="ob-cancel">← Annuler</button>
       <p id="ob-error" class="error hidden"></p>
+
+      <!-- v2.9.1: consulter GitHub est un simple appel public, sans session ni
+           Cloud Bridge — donc disponible même avant la création d'un profil. -->
+      <button class="btn-link" id="ob-check-update-btn">🔍 Vérifier les mises à jour</button>
+      <p id="ob-update-status" class="status-line"></p>
+      <div id="ob-update-banner" class="update-banner hidden">
+        <p id="ob-update-message"></p>
+        <a id="ob-update-download-link" class="btn btn-success" href="#" target="_blank" rel="noopener">
+          ⬇️ Télécharger la mise à jour
+        </a>
+      </div>
     </div>
   </div>
 </div>
@@ -86,6 +97,16 @@
     </div>
 
     <button class="btn btn-secondary" id="lock-add-profile-btn">➕ Ajouter un nouvel établissement</button>
+
+    <!-- v2.9.1: même logique que sur l'onboarding — fonctionne compte verrouillé -->
+    <button class="btn-link" id="lock-check-update-btn">🔍 Vérifier les mises à jour</button>
+    <p id="lock-update-status" class="status-line"></p>
+    <div id="lock-update-banner" class="update-banner hidden">
+      <p id="lock-update-message"></p>
+      <a id="lock-update-download-link" class="btn btn-success" href="#" target="_blank" rel="noopener">
+        ⬇️ Télécharger la mise à jour
+      </a>
+    </div>
   </div>
 </div>
 
@@ -242,6 +263,7 @@
           Paramètres pour l'activer.
         </p>
       </div>
+      <button class="btn btn-danger" id="etablissements-clear-btn">🗑️ Vider la liste</button>
       <div class="card list-card" id="etablissements-list">
         <p class="empty-state">Chargement...</p>
       </div>
@@ -362,6 +384,17 @@
         <button class="btn btn-danger" id="logout-btn">🔒 Verrouiller / Changer d'établissement</button>
       </div>
 
+      <div class="card" id="diagnostics-card">
+        <h3>🩺 Diagnostic &amp; Santé du système</h3>
+        <button class="btn btn-primary" id="diag-run-btn">▶️ Lancer le diagnostic</button>
+        <div id="diag-results" class="diag-results"></div>
+        <div class="diag-actions">
+          <button class="btn btn-secondary" id="diag-vacuum-btn">🧹 Optimiser la base de données</button>
+          <button class="btn btn-secondary" id="diag-clear-cache-btn">🗑️ Nettoyer le cache temporaire</button>
+        </div>
+        <p id="diag-action-status" class="status-line"></p>
+      </div>
+
       <div class="card danger-zone">
         <h3>⚠️ Zone dangereuse</h3>
         <p class="muted">
@@ -400,7 +433,39 @@
   </div>
 </div>
 
+<!-- v2.9.1: modal de prévisualisation intégrée (PDF via PDF.js, images via <img>) -->
+<div id="viewer-modal" class="overlay hidden">
+  <div class="viewer-card">
+    <div class="viewer-toolbar">
+      <span id="viewer-filename" class="viewer-filename">—</span>
+      <span id="viewer-page-controls" class="viewer-page-controls hidden">
+        <button class="icon-btn" id="viewer-prev-page" title="Page précédente">◀</button>
+        <span id="viewer-page-indicator">1 / 1</span>
+        <button class="icon-btn" id="viewer-next-page" title="Page suivante">▶</button>
+      </span>
+      <span class="viewer-spacer"></span>
+      <button class="icon-btn" id="viewer-zoom-out" title="Zoom arrière">➖</button>
+      <span id="viewer-zoom-indicator">100%</span>
+      <button class="icon-btn" id="viewer-zoom-in" title="Zoom avant">➕</button>
+      <button class="icon-btn" id="viewer-print-btn" title="Imprimer">🖨️</button>
+      <button class="icon-btn" id="viewer-close-btn" title="Fermer">✖</button>
+    </div>
+    <div id="viewer-body" class="viewer-body">
+      <p class="empty-state" id="viewer-loading">Chargement...</p>
+      <canvas id="viewer-pdf-canvas" class="hidden"></canvas>
+      <img id="viewer-image" class="hidden" alt="Aperçu du document">
+      <p class="empty-state hidden" id="viewer-unsupported">
+        Aperçu non disponible pour ce type de fichier — utilisez 📥 Télécharger.
+      </p>
+    </div>
+  </div>
+</div>
+
+<!-- Cadre caché utilisé uniquement pour déclencher l'impression -->
+<iframe id="print-frame" class="hidden" title="Impression"></iframe>
+
 <script src="/static/js/vendor/socket.io.min.js"></script>
+<script src="/static/js/vendor/pdfjs/pdf.min.js"></script>
 <script src="/static/js/app.js"></script>
 </body>
 </html>

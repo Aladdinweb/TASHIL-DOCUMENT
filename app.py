@@ -136,6 +136,8 @@ import json
 import socket
 import sqlite3
 import shutil
+import mimetypes
+import tempfile
 import hashlib
 import hmac
 import base64
@@ -212,7 +214,7 @@ _LEGACY_ARCHIVE_ENTRANT = os.path.join(BASE_DIR, "archives", "Courrier_Entrant")
 os.makedirs(PROFILES_DIR, exist_ok=True)
 
 APP_ROOT = os.path.dirname(os.path.abspath(__file__))
-APP_VERSION = "2.9.0"
+APP_VERSION = "2.9.1"
 GITHUB_REPO = "Aladdinweb/TASHIL-ES"  # used by the in-app OTA update checker
 
 app = Flask(__name__,
@@ -2050,8 +2052,15 @@ def api_download_message(message_id):
         raw = f.read()
     plaintext = decrypt_file_bytes(raw)
 
-    return send_file(BytesIO(plaintext), as_attachment=True,
-                      download_name=row["file_original_name"] or "document")
+    # v2.9.1: ?inline=1 serves the SAME bytes for the in-app preview modal
+    # (PDF.js / <img>) instead of forcing a download — same decryption,
+    # same access check, just a different Content-Disposition and a real
+    # mimetype guess so the browser renders it instead of saving it.
+    inline = request.args.get("inline") == "1"
+    guessed_type, _ = mimetypes.guess_type(row["file_original_name"] or "")
+    return send_file(BytesIO(plaintext), as_attachment=not inline,
+                      download_name=row["file_original_name"] or "document",
+                      mimetype=guessed_type if inline else None)
 
 
 @app.route("/api/messages/<int:message_id>/status", methods=["POST"])
@@ -2596,7 +2605,9 @@ def _retry_pending_message_push(payload: dict, owner: str, repo: str, token: str
 # correctly show as offline once its last heartbeat goes stale, not
 # because anything failed, simply because it stopped announcing itself.
 # --------------------------------------------------------------------------- #
-_HEARTBEAT_STALE_AFTER_SECONDS = 240  # v2.9.0: heartbeat every 60 s -> 4 missed beats
+_HEARTBEAT_STALE_AFTER_SECONDS = 180  # v2.9.1: matches the "3 minutes" already promised in the UI text
+                                      # (was 240s/4 missed beats since v2.9.0 — the UI copy always said
+                                      # 3 min, so this was a real mismatch, not just a tuning choice).
 
 
 def _send_heartbeat(owner: str, repo: str, token: str, profile: dict):
@@ -2622,6 +2633,33 @@ def _send_heartbeat(owner: str, repo: str, token: str, profile: dict):
     _github_request("PUT", f"/repos/{owner}/{repo}/contents/{path}", token, body)
 
 
+def _fetch_directory_records(owner: str, repo: str, token: str):
+    """Returns (records, error_status). Each record is the raw heartbeat
+    JSON plus its own GitHub path/sha (needed for individual deletion)."""
+    status, listing = _github_request("GET", f"/repos/{owner}/{repo}/contents/directory", token, use_etag=True)
+    if status == 404:
+        return [], None
+    if status != 200:
+        return [], status
+
+    records = []
+    for entry in listing:
+        if not entry["name"].endswith(".json"):
+            continue
+        file_status, content = _github_request("GET", entry["url"], token)
+        if file_status != 200 or "content" not in content:
+            continue
+        try:
+            record = json.loads(base64.b64decode(content["content"]).decode("utf-8"))
+            datetime.fromisoformat(record["last_seen"])  # validate shape early
+        except (ValueError, KeyError):
+            continue
+        record["_path"] = f"directory/{entry['name']}"
+        record["_sha"] = entry["sha"]
+        records.append(record)
+    return records, None
+
+
 @app.route("/api/bridge/directory", methods=["GET"])
 def api_bridge_directory():
     if _active_key is None:
@@ -2631,38 +2669,254 @@ def api_bridge_directory():
         return jsonify({"bridge_enabled": False, "institutions": []})
 
     owner, repo, token = cfg["github_owner"], cfg["github_repo"], cfg["github_token"]
-    status, listing = _github_request("GET", f"/repos/{owner}/{repo}/contents/directory", token)
-    if status == 404:
-        return jsonify({"bridge_enabled": True, "institutions": []})
-    if status != 200:
-        return jsonify({"error": f"Erreur GitHub ({status})."}), 502
+    records, err = _fetch_directory_records(owner, repo, token)
+    if err is not None:
+        return jsonify({"error": f"Erreur GitHub ({err})."}), 502
 
+    # v2.9.1: DEDUPLICATION. Before this version, every role/profile at the
+    # same institution (DIRECTEUR, DRH, DAS, SECRETARIAT_DIRECTION... each
+    # has its own institution_key since v2.8.5) wrote its own heartbeat
+    # file, so the SAME establishment name could appear several times in
+    # this list — which is what was reported as "duplicates". Grouped here
+    # by institution_name (not institution_key): one row per establishment,
+    # keeping only the MOST RECENT heartbeat (MAX(last_seen)) among its
+    # profiles/roles. The underlying per-role files are untouched — this
+    # is a display + deletion-target grouping, not a change to how
+    # heartbeats are written.
     now = datetime.now()
-    institutions = []
-    for entry in listing:
-        if not entry["name"].endswith(".json"):
-            continue
-        file_status, content = _github_request("GET", entry["url"], token)
-        if file_status != 200 or "content" not in content:
-            continue
-        try:
-            record = json.loads(base64.b64decode(content["content"]).decode("utf-8"))
-            last_seen = datetime.fromisoformat(record["last_seen"])
-        except (ValueError, KeyError):
-            continue
+    grouped = {}
+    for record in records:
+        name = record.get("institution_name", "?")
+        last_seen = datetime.fromisoformat(record["last_seen"])
+        if name not in grouped:
+            # Bug fixed during testing: an earlier version of this loop
+            # rebuilt a brand-new dict (with an empty _paths list) every
+            # time a NEWER record for the same name arrived, which threw
+            # away every path already accumulated for that name — a
+            # multi-role establishment (DIRECTEUR + DRH, say) would then
+            # report entry_count=1 and a DELETE would miss one of its
+            # files. Now the dict is created only ONCE per name and its
+            # display fields are updated in place; _paths always grows.
+            grouped[name] = {
+                "institution_name": name,
+                "institution_type": record.get("institution_type", ""),
+                "wilaya_name": record.get("wilaya_name", ""),
+                "last_seen": record["last_seen"],
+                "_last_seen_dt": last_seen,
+                "_paths": [],  # every file behind this display row — a delete removes them all
+            }
+        elif last_seen > grouped[name]["_last_seen_dt"]:
+            grouped[name]["institution_type"] = record.get("institution_type", "")
+            grouped[name]["wilaya_name"] = record.get("wilaya_name", "")
+            grouped[name]["last_seen"] = record["last_seen"]
+            grouped[name]["_last_seen_dt"] = last_seen
+        grouped[name]["_paths"].append({"path": record["_path"], "sha": record["_sha"]})
 
-        age_seconds = (now - last_seen).total_seconds()
+    institutions = []
+    for name, g in grouped.items():
+        age_seconds = (now - g["_last_seen_dt"]).total_seconds()
         institutions.append({
-            "institution_key": record.get("institution_key", ""),
-            "institution_name": record.get("institution_name", "?"),
-            "institution_type": record.get("institution_type", ""),
-            "wilaya_name": record.get("wilaya_name", ""),
-            "last_seen": record["last_seen"],
+            "institution_name": g["institution_name"],
+            "institution_type": g["institution_type"],
+            "wilaya_name": g["wilaya_name"],
+            "last_seen": g["last_seen"],
             "online": age_seconds <= _HEARTBEAT_STALE_AFTER_SECONDS,
+            "entry_count": len(g["_paths"]),  # >1 = several roles heartbeating under this name
         })
 
     institutions.sort(key=lambda i: (not i["online"], i["institution_name"]))
     return jsonify({"bridge_enabled": True, "institutions": institutions})
+
+
+@app.route("/api/bridge/directory/<path:institution_name>", methods=["DELETE"])
+def api_bridge_directory_delete(institution_name):
+    """v2.9.1: removes an establishment from the CONNECTED list only — this
+    deletes its directory/*.json heartbeat file(s), never its messages,
+    archives, or profile. It will simply reappear at its next heartbeat if
+    that device is still active; this is a display/history cleanup action,
+    not a way to disconnect or ban an institution."""
+    if _active_key is None:
+        return locked_response()
+    cfg = get_bridge_config()
+    if not cfg or not cfg["enabled"]:
+        return jsonify({"error": "Le Réseau TASHIL n'est pas configuré."}), 400
+
+    owner, repo, token = cfg["github_owner"], cfg["github_repo"], cfg["github_token"]
+    records, err = _fetch_directory_records(owner, repo, token)
+    if err is not None:
+        return jsonify({"error": f"Erreur GitHub ({err})."}), 502
+
+    matches = [r for r in records if r.get("institution_name") == institution_name]
+    if not matches:
+        return jsonify({"error": "Établissement introuvable dans l'annuaire."}), 404
+
+    deleted, failed = 0, 0
+    for r in matches:
+        status, _ = _github_request("DELETE", f"/repos/{owner}/{repo}/contents/{r['_path']}", token,
+                                     {"message": f"TASHIL: retrait annuaire ({institution_name})", "sha": r["_sha"]})
+        if status in (200, 204, 404):
+            deleted += 1
+        else:
+            failed += 1
+
+    return jsonify({"ok": failed == 0, "deleted": deleted, "failed": failed})
+
+
+@app.route("/api/bridge/directory", methods=["DELETE"])
+def api_bridge_directory_clear():
+    """v2.9.1: 'Vider la liste' — deletes every heartbeat file. Same scope
+    guarantee as the single-entry delete: history only, never messages."""
+    if _active_key is None:
+        return locked_response()
+    cfg = get_bridge_config()
+    if not cfg or not cfg["enabled"]:
+        return jsonify({"error": "Le Réseau TASHIL n'est pas configuré."}), 400
+
+    owner, repo, token = cfg["github_owner"], cfg["github_repo"], cfg["github_token"]
+    records, err = _fetch_directory_records(owner, repo, token)
+    if err is not None:
+        return jsonify({"error": f"Erreur GitHub ({err})."}), 502
+
+    deleted, failed = 0, 0
+    for r in records:
+        status, _ = _github_request("DELETE", f"/repos/{owner}/{repo}/contents/{r['_path']}", token,
+                                     {"message": "TASHIL: purge annuaire", "sha": r["_sha"]})
+        if status in (200, 204, 404):
+            deleted += 1
+        else:
+            failed += 1
+
+    return jsonify({"ok": failed == 0, "deleted": deleted, "failed": failed})
+
+
+# --------------------------------------------------------------------------- #
+# v2.9.1 — Diagnostic & Santé du système (Paramètres).
+#
+# Every check here is READ-ONLY and safe to run at any time, including
+# while the Cloud Bridge loop is polling in the background — none of them
+# hold a long-lived connection or interfere with an in-progress send.
+# --------------------------------------------------------------------------- #
+@app.route("/api/health", methods=["GET"])
+def api_health():
+    """Server & WebSocket status. Deliberately available even while LOCKED
+    (a diagnostic screen should work before you can even unlock a profile —
+    e.g. to check whether the server process itself is healthy)."""
+    return jsonify({
+        "ok": True,
+        "app_version": APP_VERSION,
+        "flask_ok": True,               # this route answering IS the Flask check
+        "socketio_available": socketio is not None,
+        "socketio_active": socketio is not None,  # threading mode has no separate "started" state to check
+        "active_profile": _active_key is not None,
+    })
+
+
+@app.route("/api/diagnostics/sqlite", methods=["GET"])
+def api_diagnostics_sqlite():
+    """PRAGMA quick_check + on-disk size of the CURRENTLY UNLOCKED profile's
+    own database. Deliberately does not touch registry.db or other
+    profiles' files — a diagnostic screen should never require exposing
+    which OTHER establishments exist on this device."""
+    if _active_key is None:
+        return locked_response()
+    paths = profile_paths(_active_key)
+    db_path = paths["db"]
+    try:
+        size_bytes = os.path.getsize(db_path)
+    except OSError:
+        size_bytes = 0
+
+    try:
+        with profile_db(_active_key, commit=False) as conn:
+            result = conn.execute("PRAGMA quick_check;").fetchone()
+        quick_check = result[0] if result else "erreur"
+        healthy = quick_check == "ok"
+    except sqlite3.Error as e:
+        quick_check, healthy = str(e), False
+
+    return jsonify({"ok": True, "quick_check": quick_check, "healthy": healthy,
+                    "db_size_bytes": size_bytes, "db_path": db_path})
+
+
+@app.route("/api/diagnostics/github-quota", methods=["GET"])
+def api_diagnostics_github_quota():
+    """GitHub's own /rate_limit endpoint — a plain authenticated GET that
+    costs nothing against the QUOTA it reports (GitHub explicitly excludes
+    it). Reused as-is rather than parsing rate-limit response HEADERS off
+    some other call, which would only reflect whatever endpoint happened
+    to be hit last."""
+    if _active_key is None:
+        return locked_response()
+    cfg = get_bridge_config()
+    if not cfg or not cfg["enabled"]:
+        return jsonify({"ok": True, "bridge_enabled": False})
+
+    status, body = _github_request("GET", "/rate_limit", cfg["github_token"])
+    if status != 200:
+        return jsonify({"error": f"Erreur GitHub ({status})."}), 502
+    core = body.get("resources", {}).get("core", {})
+    return jsonify({
+        "ok": True, "bridge_enabled": True,
+        "remaining": core.get("remaining"), "limit": core.get("limit"),
+        "reset_at": (datetime.fromtimestamp(core["reset"]).isoformat()
+                     if core.get("reset") else None),
+    })
+
+
+@app.route("/api/maintenance/vacuum", methods=["POST"])
+def api_maintenance_vacuum():
+    """VACUUM + ANALYZE on the active profile's database only.
+    ⚠️ VACUUM cannot run inside a transaction and rewrites the whole file —
+    it needs to be the only writer for its duration. It is run on its own
+    short-lived connection (not through the profile_db()/BEGIN IMMEDIATE
+    helpers used everywhere else in this file, which would conflict with
+    it) with the existing 30 s busy_timeout as the only concurrency guard:
+    if the background Bridge loop is mid-write, this WAITS up to 30 s
+    rather than fail immediately, and reports a clear error if it still
+    can't get in. Not fully lock-free by design — VACUUM never is."""
+    if _active_key is None:
+        return locked_response()
+    key = _active_key
+    paths = profile_paths(key)
+    try:
+        size_before = os.path.getsize(paths["db"])
+        conn = sqlite3.connect(paths["db"], timeout=DB_TIMEOUT_SECONDS)
+        try:
+            conn.execute("VACUUM;")
+            conn.execute("ANALYZE;")
+            conn.commit()
+        finally:
+            conn.close()
+        size_after = os.path.getsize(paths["db"])
+    except sqlite3.Error as e:
+        return jsonify({"error": f"Échec de l'optimisation : {e}"}), 500
+
+    return jsonify({"ok": True, "size_before_bytes": size_before, "size_after_bytes": size_after,
+                    "reclaimed_bytes": max(0, size_before - size_after)})
+
+
+@app.route("/api/maintenance/clear-cache", methods=["POST"])
+def api_maintenance_clear_cache():
+    """Purges TASHIL_DATA/tmp/ only — a scratch folder this app itself may
+    write incomplete/temporary files into (e.g. an interrupted HEIC->JPEG
+    normalization or QR decode temp file). Deliberately does NOT touch
+    archives/, registry.db, or any profile's tashil.db: those are real
+    documents and real data, never "cache". If the tmp folder does not
+    exist (nothing has ever needed it), this is a safe no-op."""
+    tmp_dir = os.path.join(os.path.expanduser("~"), "TASHIL_DATA", "tmp")
+    freed_bytes, removed = 0, 0
+    if os.path.isdir(tmp_dir):
+        cutoff = time.time() - 3600  # only files idle for over an hour — never touch a file mid-write
+        for name in os.listdir(tmp_dir):
+            fpath = os.path.join(tmp_dir, name)
+            try:
+                if os.path.isfile(fpath) and os.path.getmtime(fpath) < cutoff:
+                    freed_bytes += os.path.getsize(fpath)
+                    os.remove(fpath)
+                    removed += 1
+            except OSError:
+                continue  # a file that vanished or is locked mid-use — skip, not fatal
+    return jsonify({"ok": True, "files_removed": removed, "freed_bytes": freed_bytes})
 
 
 # --------------------------------------------------------------------------- #

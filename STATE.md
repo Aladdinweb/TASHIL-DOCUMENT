@@ -2256,204 +2256,228 @@ resserré à 20s, `manualRefresh` non-bloquant). **Fichier ajouté :**
 
 ---
 
-## 28. v2.9.0 — Temps réel local (Flask-SocketIO), transactions `BEGIN IMMEDIATE`, ETag Cloud Bridge (2026-09-28)
+## 29. v2.9.1 — Établissements Connectés (dédoublonnage), visualiseur de documents intégré, Diagnostic & Santé, vérification de mise à jour compte verrouillé (2026-09-30)
 
-### 28.1 🎯 Périmètre exact du "temps réel"
+⚠️ Cette version conserve intégralement le code et les fonctionnalités de
+la v2.9.0 (Flask-SocketIO, transactions `BEGIN IMMEDIATE`, sondage Bridge
+côté serveur avec ETag) — rien n'a été retiré, uniquement ajouté ou
+corrigé.
 
-⚠️ **Clarification technique nécessaire avant tout, actée avec l'utilisateur** :
-le serveur Flask de chaque poste reste **local**. Un WebSocket relie
-seulement le navigateur/la fenêtre pywebview d'**un** poste à **son
-propre** serveur — il ne relie jamais deux postes entre eux. La latence
-entre deux établissements différents reste donc gouvernée par le cycle de
-sondage du Cloud Bridge (GitHub), pas par le WebSocket.
+### 29.1 🐛 Établissements Connectés — dédoublonnage, seuil, suppression
 
-Ce qui change réellement :
-- Le sondage Cloud Bridge, auparavant déclenché par le navigateur toutes
-  les 20 s (`setInterval` côté JS), tourne désormais **côté serveur**,
-  dans un thread dédié (`_bridge_loop`), à un intervalle par défaut de
-  **10 s** (`TASHIL_BRIDGE_POLL_SECONDS`), indépendamment de l'onglet
-  ouvert ou non.
-- Dès qu'un message ou un accusé est importé, le serveur **pousse**
-  l'information à l'interface (`new_document`, `receipt_update`) au lieu
-  que l'interface ait à revérifier périodiquement — pour le rafraîchissement
-  visible, c'est cette dernière étape (0 latence supplémentaire côté
-  navigateur) qui change le plus concrètement l'expérience.
-- Décision explicite : garder l'option "local-first" (pas de serveur relais
-  central payant/externe) — le WebSocket local + sondage GitHub resserré
-  et poussé côté serveur en est la traduction directe.
+**Cause réelle des doublons signalés** : depuis la hiérarchie des rôles
+(v2.8.5), chaque rôle d'un même établissement (DIRECTEUR, DRH, DAS,
+SECRETARIAT_DIRECTION...) possède son propre `institution_key`, donc son
+propre fichier de présence (`directory/<institution_key>.json`). Un même
+établissement avec plusieurs rôles déverrouillés apparaissait donc
+plusieurs fois dans l'annuaire — ce n'était pas un doublon au sens
+technique (chaque fichier est unique), mais un doublon au sens **affiché
+à l'utilisateur**.
 
-### 28.2 🐛 Cause exacte de `database is locked`
+**Correctif** : `/api/bridge/directory` regroupe désormais les entrées par
+**nom d'établissement**, en conservant le battement de cœur le plus
+récent (`MAX(last_seen)`) parmi tous les rôles de ce nom, plus un compteur
+`entry_count` (nombre de rôles actifs sous ce nom). Les fichiers
+individuels par rôle ne sont pas modifiés — c'est une agrégation
+d'affichage et une cible de suppression, pas un changement au mécanisme
+d'écriture des battements de cœur.
 
-**Reproduite avant correction, dans un test automatisé dédié** (scénario :
-un envoi HTTP concurrent pendant qu'un sondage Bridge, ralenti
-artificiellement, maintenait une transaction ouverte) : confirmé
-`sqlite3.OperationalError: database is locked` avec le code v2.8.9,
-malgré le mode WAL et `busy_timeout=5000` déjà en place depuis la v2.8.1.
+**🐛 Bug réel trouvé et corrigé pendant les tests, avant livraison** : la
+première version de cette agrégation recréait un dictionnaire vide
+(`_paths: []`) à chaque fois qu'un battement de cœur plus récent était
+rencontré pour un nom déjà vu — ce qui **effaçait les chemins déjà
+comptabilisés** pour les rôles précédents de ce même établissement.
+Conséquence : `entry_count` retombait toujours à 1, et une suppression
+n'aurait supprimé qu'un seul des fichiers de rôle, laissant les autres
+orphelins et l'établissement réapparaissant aussitôt dans la liste.
+**Trouvé par un test explicite** simulant deux rôles (DIRECTEUR ancien,
+DRH récent) du même établissement : `entry_count` attendu à 2, obtenu à
+1. Corrigé en ne créant le dictionnaire qu'une seule fois par nom et en
+mettant à jour ses champs d'affichage en place, sans jamais réinitialiser
+`_paths`.
 
-**Deux causes cumulées, toutes deux corrigées :**
-1. Le sondage Bridge (`api_bridge_poll`) tenait **une seule connexion
-   SQLite ouverte** (avec une transaction d'écriture entamée dès la
-   première insertion) pendant des dizaines d'appels réseau GitHub
-   successifs — tout envoi ou accusé côté interface attendait donc
-   potentiellement la durée complète d'un cycle de sondage.
-2. En mode WAL, une transaction qui **lit puis écrit** (upgrade de verrou)
-   échoue immédiatement avec `SQLITE_BUSY`, quelle que soit la valeur de
-   `busy_timeout` — ce dernier ne protège que l'attente d'un verrou déjà
-   demandé en écriture dès le départ, pas une bascule lecture→écriture en
-   cours de transaction.
+**Seuil en ligne/hors ligne corrigé** : `_HEARTBEAT_STALE_AFTER_SECONDS`
+était à 240 s (4 min) depuis la v2.9.0, alors que le texte de l'interface
+annonçait déjà "3 minutes" (incohérence de longue date, pas introduite
+cette fois). Corrigé à 180 s (3 min), en cohérence avec le texte affiché
+et avec la demande explicite de ce correctif.
 
-**Correctifs appliqués :**
-- `busy_timeout` et le `timeout` Python portés de 5 s à **30 s**
-  (`DB_TIMEOUT_SECONDS`), plus `PRAGMA synchronous=NORMAL` (sûr en WAL,
-  réduit les `fsync`) — filet de sécurité, pas le correctif principal.
-- Toute la logique réseau du sondage Bridge (import GitHub, téléchargement
-  de pièce jointe, suppression/nettoyage) tourne désormais **sans aucune
-  connexion SQLite ouverte** ; chaque écriture (import d'un message,
-  application d'un accusé, mise à jour de `delivery_method`) est une
-  transaction **courte et isolée**, ouverte avec `BEGIN IMMEDIATE` pour
-  prendre le verrou d'écriture immédiatement plutôt que de le découvrir en
-  cours de route.
-- `BEGIN IMMEDIATE` ajouté également aux trois routes HTTP qui lisaient
-  puis écrivaient dans le même bloc : envoi de message (tracking number),
-  changement de statut (`/status`), suppression de message.
-- `_flush_pending_pushes` et `_retry_pending_bridge_cleanup` réécrits pour
-  ne plus jamais tenir une connexion ouverte pendant un appel réseau —
-  l'ancienne version pouvait, avec plusieurs entrées en attente, se
-  verrouiller elle-même.
+**Suppression intégrale, deux nouvelles routes** :
+- `DELETE /api/bridge/directory/<nom>` — retire l'établissement nommé de
+  la liste des connectés, en supprimant **tous** les fichiers de battement
+  de cœur qui portent ce nom (tous rôles confondus). ⚠️ Ceci ne touche
+  **jamais** aux messages, aux archives ni au profil de cet établissement
+  — uniquement à sa présence dans l'annuaire. S'il est encore actif, il
+  réapparaîtra automatiquement à son prochain battement de cœur (comme
+  documenté dans la confirmation affichée à l'utilisateur avant l'action).
+- `DELETE /api/bridge/directory` — "Vider la liste" : même principe,
+  appliqué à tous les établissements. Confirmation obligatoire côté
+  interface avant l'appel.
 
-**Testé réellement** : le scénario exact de collision (envoi concurrent
-pendant un sondage Bridge ralenti) rejoué après correction → `200 OK`,
-plus aucune `OperationalError`, sur le code patché.
+**Interface** : bouton 🗑️ par ligne, bouton "🗑️ Vider la liste" en haut de
+la vue Établissements (masqué si le Bridge n'est pas configuré ou si la
+liste est vide), boîte de dialogue de confirmation pour les deux actions.
 
-### 28.3 🔌 Flask-SocketIO — intégration
+**Testé réellement** : scénario reproduisant exactement le signalement
+(deux rôles d'un même établissement, horodatages différents) → dédup
+confirmée avant ET après le correctif du bug de regroupement (échec puis
+succès) ; suppression unique confirmée (2 fichiers supprimés sur
+GitHub, l'autre établissement intact) ; purge totale confirmée (liste
+vide après l'appel).
 
-- Nouvel objet `socketio = SocketIO(app, async_mode="threading", ...)`,
-  **optionnel** : si `flask_socketio` n'est pas installé dans un build
-  donné, l'application démarre et fonctionne exactement comme en v2.8.9
-  (repli automatique sur `app.run()` et sur le sondage de secours à 5 min
-  côté frontend) — même schéma défensif que `qrcode`/`cryptography`/
-  `pyzbar`/`pystray` dans ce projet.
-- La **room** Socket.IO n'est jamais choisie par le client : le serveur la
-  déduit du profil actuellement déverrouillé (`_active_key`) lors de
-  l'événement `join_room`. Un appareil verrouillé qui tente de rejoindre
-  une room reçoit `{"ok": false, "locked": true}` — aucun événement ne
-  peut donc fuiter vers un appareil du réseau local qui n'a pas
-  déverrouillé ce profil précis.
-- Aucun événement `send_document` : l'envoi de fichier reste en HTTP
-  multipart classique (chiffrement, archivage, tracking number) — le
-  socket ne sert **qu'à notifier**, jamais à transporter un fichier.
-- Nouveaux événements émis par le serveur : `new_document` (import Bridge
-  ou livraison locale), `receipt_update` (accusé appliqué),
-  `sync_update` (une entrée en attente vient d'être re-livrée avec
-  succès), `session_locked` (verrouillage/suppression du profil — ferme
-  la room côté serveur via `close_room`).
-- ⚠️ `desktop_launcher.py` devait être adapté même si non fourni
-  initialement dans les fichiers transmis : Flask-SocketIO en mode
-  `threading` **exige** `socketio.run(app)` au lieu de `app.run(app)` — la
-  documentation officielle est explicite sur ce point, `app.run()` ne
-  supporte pas la mise à niveau WebSocket et retomberait silencieusement
-  sur du long-polling HTTP uniquement. Corrigé avec repli automatique sur
-  `app.run()` si `tashil_app.socketio` est `None`.
-- `tashil_web.spec` étendu (`collect_all` sur `flask_socketio`,
-  `engineio`, `socketio`, `simple_websocket`, `wsproto`, `h11`, `bidict` +
-  hidden import explicite `engineio.async_drivers.threading`) — même
-  traitement que pywebview/pyzbar/pystray pour les mêmes raisons
-  documentées dans ce fichier depuis la v2.5.0.
+### 29.2 📄 Visualiseur de documents intégré
 
-**Testé réellement, bout en bout, sans mock** : un vrai serveur
-Flask-SocketIO a été démarré (`socketio.run`, mode threading), un faux
-serveur GitHub Contents API a simulé un message entrant, et un **vrai
-client JavaScript Socket.IO** (le fichier `static/js/vendor/socket.io.min.js`
-exact destiné au paquet Windows, chargé et exécuté dans Node.js — pas une
-simulation Python du protocole) s'est connecté, a rejoint sa room
-(`join_room` → `{"ok": true}`), puis a reçu l'événement `new_document`
-avec les bonnes données (`tracking_number`, `sender`) dans le cycle de
-sondage suivant (~2 s avec un intervalle de test raccourci). Le message
-est retrouvé correctement inséré et chiffré dans la base du profil
-correspondant.
+Nouveau modal de prévisualisation, accessible via un bouton "👁️ Aperçu"
+ajouté à côté de "📥 Télécharger" sur les **trois** vues qui listent des
+messages (Tableau de Bord, Boîte de réception, Registre) — aucune
+application externe n'est lancée, aucun fichier temporaire n'est écrit
+sur disque.
 
-### 28.4 🌐 Frontend (`static/js/app.js`)
+- **PDF** : rendu via **PDF.js 3.11.174** (build "legacy", scripts
+  classiques — pas de modules ES, pour rester compatible avec une fenêtre
+  pywebview/WebView2 plus ancienne), **embarqué localement** dans
+  `static/js/vendor/pdfjs/` (aucun CDN — cohérent avec la politique déjà
+  en place pour Socket.IO en v2.9.0, fonctionnement 100 % hors-ligne
+  garanti). Zoom avant/arrière (25 % à 300 %) et navigation page par page.
+- **Images** (PNG, JPG/JPEG, GIF, WEBP, BMP) : affichage direct via
+  `<img>`, sans dépendance supplémentaire.
+- **Bouton "🖨️ Imprimer"** : envoie le document dans un `<iframe>` caché
+  (visualiseur PDF natif du navigateur pour un PDF ; page minimale avec
+  `<img>` pour une image) et déclenche `window.print()` sur ce cadre —
+  fonctionne à l'intérieur d'une fenêtre pywebview, qui n'a pas de menu
+  d'impression natif propre.
+- Les octets proviennent de la **même route de téléchargement existante**
+  (`/api/messages/<id>/download`), désormais acceptée avec `?inline=1` :
+  même déchiffrement, même contrôle d'accès, seule la disposition change
+  (`Content-Disposition` non forcée en pièce jointe + type MIME deviné) —
+  aucune nouvelle surface de sécurité.
+- Type non pris en charge (docx, xlsx...) : message clair invitant à
+  utiliser "📥 Télécharger", pas d'erreur silencieuse.
 
-- Les deux `setInterval` (8 s tableau de bord, 20 s Cloud Bridge) sont
-  remplacés par `initRealtime()`, appelé une seule fois dans le bloc
-  `state.appInitialized` (même précaution qu'en v2.3.0/v2.8.6contre les
-  listeners empilés).
-- `state.meta.realtime` (renvoyé par `/api/meta`) indique si le serveur a
-  réellement chargé Flask-SocketIO — si absent ou si le script vendor ne
-  s'est pas chargé (`typeof io === "undefined"`), repli automatique sur un
-  sondage de secours toutes les **5 minutes** (`startFallbackPolling`),
-  jamais un silence total.
-- À chaque déconnexion du socket (`disconnect`), le sondage de secours
-  s'active ; à la reconnexion (`connect`), il s'arrête et un
-  `manualRefresh()` rattrape ce qui aurait pu être manqué pendant la
-  coupure.
-- `lockSession()` et l'événement `session_locked` reçu depuis le serveur
-  renvoient tous deux vers l'écran de verrouillage, sans jamais laisser
-  l'interface affichée avec des données devenues inaccessibles.
-- Aucun changement structurel à `manualRefresh()` (toujours local d'abord,
-  Cloud Bridge ensuite en arrière-plan, v2.8.9) ni à `pollBridge` (conservé
-  comme fonction de secours, appelée par le bouton 🔄 et par le sondage de
-  secours).
+**Testé réellement** : le fichier `pdf.min.js` exact destiné au paquet a
+été chargé et exécuté (Node.js) — `pdfjsLib` et `GlobalWorkerOptions`
+confirmés présents et fonctionnels (les avertissements `DOMMatrix`/
+`Path2D` observés sont attendus hors navigateur, qui n'a pas de module
+`canvas` natif ; un vrai navigateur/pywebview les fournit nativement).
+⚠️ **Non testé dans ce bac à sable** : le rendu visuel réel d'un PDF page
+par page et le déclenchement effectif de l'impression système depuis une
+fenêtre pywebview — aucun environnement graphique n'est disponible ici.
+**Le test le plus important restant : ouvrir un vrai PDF et une vraie
+image depuis l'application, vérifier le zoom/la pagination, et confirmer
+que le bouton Imprimer ouvre bien la boîte de dialogue d'impression
+Windows.**
 
-### 28.5 📄 ETag conditionnel sur le sondage Cloud Bridge
+### 29.3 🩺 Diagnostic & Santé du système
 
-Le jeton GitHub étant **partagé par tout le réseau national** (5000
-requêtes/h au total), resserrer le sondage à 10 s ne serait pas soutenable
-sans requêtes conditionnelles. `_github_request` accepte désormais
-`use_etag=True` pour les listings de dossiers (`bridge/`,
-`bridge/<adresse>/`, `.../receipts/`) : l'en-tête `If-None-Match` est
-envoyé si un ETag est déjà connu pour cette URL, et une réponse `304`
-réutilise directement le dernier corps mis en cache **sans consommer de
-requête sur le quota principal** (documenté ainsi par GitHub). Le cache
-est en mémoire par processus, vidé au verrouillage du profil
-(`_ui_session_closed`).
+Nouvelle carte "🩺 Diagnostic & Santé du système" dans Paramètres, avec un
+bouton "▶️ Lancer le diagnostic" qui exécute trois vérifications :
 
-Un fichier `bridge/.keep` est créé (une fois par dépôt) pour que le
-dossier `bridge/` ne disparaisse jamais complètement quand il est vide —
-un dossier absent produit un `404`, qui ne peut jamais être mis en cache
-et coûte donc systématiquement une requête pleine au quota.
+1. **Serveur local & WebSocket** — nouvelle route `GET /api/health`,
+   volontairement accessible même **verrouillé** (un diagnostic doit
+   pouvoir confirmer que le serveur tourne avant même de déverrouiller un
+   profil) : confirme Flask actif et indique si Flask-SocketIO a bien pu
+   se charger dans ce build.
+2. **Intégrité SQLite** — nouvelle route `GET /api/diagnostics/sqlite` :
+   exécute `PRAGMA quick_check;` et rapporte la taille sur disque de la
+   base du profil **actuellement déverrouillé** uniquement (jamais celle
+   d'un autre établissement présent sur l'appareil).
+3. **Quota GitHub Bridge** — nouvelle route
+   `GET /api/diagnostics/github-quota` : interroge l'endpoint public
+   `/rate_limit` de GitHub, qui a la particularité documentée de **ne pas
+   décompter sur le quota principal qu'il rapporte** — donc consultable
+   librement sans jamais aggraver la pression sur le jeton partagé par
+   tout le réseau national.
 
-### 28.6 ⚠️ Limites honnêtes, non résolues dans cette version
+Deux boutons d'action séparés :
+- **"🧹 Optimiser la base de données"** (`POST /api/maintenance/vacuum`) —
+  exécute `VACUUM;` puis `ANALYZE;` sur la base du profil actif
+  uniquement. ⚠️ `VACUUM` ne peut pas s'exécuter dans une transaction et
+  réécrit le fichier entier : il tourne sur sa propre connexion courte,
+  hors des aides `profile_db()`/`BEGIN IMMEDIATE` utilisées partout
+  ailleurs, avec le même `busy_timeout` de 30 s comme seule garantie de
+  concurrence — s'il tombe pendant que la boucle Bridge écrit, il attend
+  jusqu'à 30 s plutôt que d'échouer immédiatement.
+- **"🗑️ Nettoyer le cache temporaire"** (`POST /api/maintenance/clear-cache`)
+  — purge uniquement un dossier `TASHIL_DATA/tmp/` (fichiers de plus d'une
+  heure), s'il existe. Ne touche **jamais** aux archives, à `registry.db`
+  ni à aucun `tashil.db` — ce ne sont pas du cache.
 
-- Le temps réel reste **local à chaque poste** — voir 28.1. Un vrai temps
-  réel entre deux postes distants nécessiterait un serveur relais central
-  (option déjà écartée en v2.5.0 §13.1, réaffirmée ici).
-- Non testé sur un vrai build Windows : le comportement de
-  `simple-websocket`/`engineio.async_drivers.threading` une fois figé par
-  PyInstaller, et le comportement du WebSocket à l'intérieur d'une fenêtre
-  pywebview/WebView2 — même limite méthodologique que pour pywebview,
-  pyzbar, pystray et plyer par le passé dans ce projet. **Le test le plus
-  important restant : ouvrir l'application sur un vrai poste Windows et
-  confirmer que l'onglet réseau du navigateur (ou un test manuel avec deux
-  fenêtres) montre bien une connexion WebSocket active plutôt qu'un repli
-  silencieux sur le sondage de secours à 5 minutes.**
-- La limite déjà documentée en v2.8.5 §22.9 / corrigée en v2.8.7 concernant
-  le routage des accusés reste résolue et n'est pas affectée par ce
-  changement.
+**Testé réellement** : `/api/health` répond `200` verrouillé et
+déverrouillé ; `PRAGMA quick_check` confirmé `ok` sur une vraie base
+fraîchement créée, taille réelle rapportée ; `VACUUM`/`ANALYZE` exécutés
+sans erreur sur cette base ; nettoyage de cache confirmé sans effet sur un
+dossier `tmp/` absent (repli sûr) ; quota GitHub testé à la fois sans
+Bridge configuré (`bridge_enabled: false`) et avec un faux serveur
+GitHub simulant `/rate_limit` (`remaining: 4321` correctement rapporté),
+ainsi que le chemin d'erreur propre quand l'endpoint échoue.
 
-### 28.7 Régression
+### 29.4 🔄 Vérification des mises à jour — écran de verrouillage & onboarding
 
-- Scénario exact de collision SQLite (v2.8.1 → v2.9.0) : reproduit avant
-  correctif, confirmé résolu après.
+Le vérificateur de mise à jour existant (Paramètres, depuis la v2.1.0)
+appelle l'API publique de GitHub **directement depuis le navigateur**,
+sans authentification ni session — il n'a donc jamais eu besoin d'un
+profil déverrouillé pour fonctionner. La fonction a été généralisée pour
+accepter les identifiants d'éléments HTML en paramètre, et un même bouton
+"🔍 Vérifier les mises à jour" a été ajouté :
+- sur l'**écran de verrouillage** (visible avant tout déverrouillage),
+- sur l'**écran d'onboarding** (visible avant la création du tout premier
+  profil).
+
+Câblés une seule fois au démarrage de l'application (affectation directe
+`.onclick =`, pas `addEventListener`, même précaution qu'en v2.8.6 pour
+`showOnboarding()` — ces deux écrans peuvent être (ré)affichés plusieurs
+fois dans une même session, et l'empilement d'écouteurs aurait déclenché
+plusieurs vérifications par clic).
+
+⚠️ **Limite honnête, non résolue** : le bouton **vérifie** la présence
+d'une mise à jour et propose le lien de téléchargement de la Release
+GitHub — il ne lance pas lui-même le processus d'installation. Un
+lancement automatique de l'exécutable téléchargé depuis l'application
+elle-même (auto-update en un clic) est une fonctionnalité différente,
+plus invasive (remplacement de l'exécutable en cours d'exécution), non
+demandée explicitement dans ces termes et non construite ici.
+
+**Testé réellement** : la fonction généralisée `checkForUpdate(ids)`
+compile et s'exécute sans erreur de syntaxe ; le câblage des deux
+nouveaux boutons a été vérifié par inspection directe du DOM généré
+(présence des identifiants `lock-check-update-btn`,
+`ob-check-update-btn`, et de leurs zones de statut/bannière associées).
+⚠️ **Non testé dans ce bac à sable** : l'appel réseau réel vers
+`api.github.com/repos/.../releases/latest` depuis l'écran de verrouillage
+(nécessite une fenêtre pywebview/navigateur réelle) — mécaniquement
+identique à l'appel déjà en production depuis la v2.1.0 côté Paramètres.
+
+### 29.5 Régression
+
+- Scénario exact de collision SQLite (v2.8.1 → v2.9.1) : rejoué sur le
+  code v2.9.1, toujours `200 OK` sans `database is locked`.
 - Cycle complet réel Flask-SocketIO + faux serveur GitHub + vrai client JS
-  vendor : `new_document` reçu, message correctement chiffré et inséré en
-  base.
-- `py_compile` sur `app.py` et `desktop_launcher.py`, `node --check` sur
-  `app.js` : aucune erreur de syntaxe.
-- Non vérifié dans cette session (à faire avant tag de production) : suite
-  de régression complète v2.8.1 → v2.8.9 (WAL, `tracking_number`, HEIC,
-  suivi des non-lus, appairage matériel, accusés DRH, hiérarchie EPSP JSON,
-  file d'attente de réessai) rejouée sur ce code précis — le patch ne
-  touche à aucune de ces fonctions autrement que par le déplacement décrit
-  en 28.2, mais seul un rejeu complet, comme documenté à chaque version
-  précédente, permettrait de l'affirmer avec la même certitude.
+  vendor : rejoué sur le code v2.9.1, `new_document` toujours reçu et
+  message toujours correctement inséré/chiffré.
+- `/api/health` verrouillé et déverrouillé, `PRAGMA quick_check`,
+  `VACUUM`/`ANALYZE`, nettoyage de cache, quota GitHub (avec et sans
+  Bridge, avec et sans erreur) : tous testés directement sur ce code.
+- Dédoublonnage de l'annuaire, conservation de `MAX(last_seen)`,
+  suppression unique, purge totale : testés directement sur ce code,
+  bug de regroupement inclus (reproduit puis corrigé).
+- `py_compile` sur `app.py`/`desktop_launcher.py`, `node --check` sur
+  `app.js`, `ast.parse` sur `tashil_web.spec`, validation `tinycss2` sur
+  `style.css` : aucune erreur.
+- **Non rejoué dans cette session** (à faire avant tag de production,
+  comme pour chaque version précédente) : la suite de régression complète
+  v2.8.1 → v2.8.9 sur les fonctionnalités que ce patch ne touche pas
+  directement (HEIC, appairage matériel, hiérarchie EPSP JSON...).
 
-**Fichiers modifiés :** `app.py` (SQLite 30 s + `BEGIN IMMEDIATE`,
-intégration Flask-SocketIO, boucle Bridge serveur, ETag), `desktop_launcher.py`
-(`socketio.run` au lieu de `app.run`), `templates/index.html` (script
-vendor Socket.IO), `static/js/app.js` (remplacement du polling par le
-temps réel + repli 5 min), `requirements.txt` (+ `Flask-SocketIO`,
-`simple-websocket`), `tashil_web.spec` (+ `collect_all` pour la pile
-Socket.IO). **Fichier ajouté :** `static/js/vendor/socket.io.min.js`
-(client Socket.IO 4.7.5, embarqué — aucun CDN, cohérent avec la politique
-déjà en place pour ce projet). Aucune fonctionnalité antérieure retirée.
+**Fichiers modifiés :** `app.py` (dédoublonnage/suppression annuaire,
+seuil 3 min, route `?inline=1`, module Diagnostic complet),
+`static/js/app.js` (boutons Aperçu sur les 3 vues, module visualiseur
+PDF/image + impression, module Diagnostic, câblage des boutons de mise à
+jour verrouillé/onboarding, suppression/purge annuaire),
+`templates/index.html` (modal visualiseur, carte Diagnostic, boutons de
+mise à jour verrouillé/onboarding, bouton Vider la liste), `static/css/style.css`
+(styles du modal visualiseur et de la carte Diagnostic). **Fichiers
+ajoutés :** `static/js/vendor/pdfjs/pdf.min.js`,
+`static/js/vendor/pdfjs/pdf.worker.min.js` (PDF.js 3.11.174, embarqués —
+aucun CDN). Aucune fonctionnalité antérieure retirée — Flask-SocketIO,
+`BEGIN IMMEDIATE`, sondage Bridge côté serveur et ETag (v2.9.0) confirmés
+intacts par la régression ci-dessus.

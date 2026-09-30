@@ -507,6 +507,9 @@ function showApp() {
     setupCopyLanUrl();
     setupCloudBridge();
     initRealtime();   // v2.9.0: sets up the local socket + its 5 min fallback once
+    setupDocumentViewer();          // v2.9.1
+    setupDiagnostics();             // v2.9.1
+    setupEtablissementsActions();   // v2.9.1
     state.appInitialized = true;
   }
 
@@ -807,22 +810,33 @@ function switchView(viewName) {
 async function loadEtablissements() {
   const container = document.getElementById("etablissements-list");
   const offCard = document.getElementById("etablissements-bridge-off");
+  const clearBtn = document.getElementById("etablissements-clear-btn");
 
   try {
     const data = await fetch("/api/bridge/directory").then(r => parseJsonResponse(r));
     if (!data.bridge_enabled) {
       offCard.classList.remove("hidden");
+      clearBtn.classList.add("hidden");
       container.innerHTML = "";
       return;
     }
     offCard.classList.add("hidden");
 
     if (!data.institutions.length) {
+      clearBtn.classList.add("hidden");
       container.innerHTML = `<p class="empty-state">Aucun établissement détecté pour le moment. ` +
         `Ils apparaîtront ici après leur première synchronisation avec le Réseau TASHIL.</p>`;
       return;
     }
+    clearBtn.classList.remove("hidden");
 
+    // v2.9.1: one row per establishment NAME (the backend already merges
+    // every role/profile sharing that name and keeps only the most recent
+    // heartbeat — see api_bridge_directory). A 🗑️ here removes this
+    // establishment from the CONNECTED list only (its heartbeat file(s)):
+    // it never touches messages, archives, or the profile itself, and it
+    // will simply reappear at its next heartbeat if that device is still
+    // active.
     container.innerHTML = data.institutions.map(inst => `
       <div class="list-row">
         <div class="list-row-main">
@@ -833,11 +847,232 @@ async function loadEtablissements() {
           <span class="list-row-sub">${escapeHtml(inst.wilaya_name)} — ${escapeHtml(inst.institution_type)}</span>
         </div>
         <span class="list-row-badge">${inst.online ? "En ligne" : "Vu " + timeAgo(inst.last_seen)}</span>
+        <div class="list-row-actions">
+          <button class="row-btn danger" data-remove-establishment="${escapeHtml(inst.institution_name)}"
+                  title="Retirer de la liste">🗑️</button>
+        </div>
       </div>
     `).join("");
+
+    container.querySelectorAll("[data-remove-establishment]").forEach(btn => {
+      btn.addEventListener("click", async () => {
+        const name = btn.dataset.removeEstablishment;
+        if (!confirm(`Retirer "${name}" de la liste des établissements connectés ?\n\n` +
+                     `(Ceci n'affecte ni ses messages ni son profil — il réapparaîtra ` +
+                     `automatiquement s'il est encore actif.)`)) return;
+        try {
+          const res = await fetch(`/api/bridge/directory/${encodeURIComponent(name)}`, { method: "DELETE" });
+          const d = await parseJsonResponse(res);
+          if (!res.ok) throw new Error(d.error || "Échec de la suppression.");
+          showToast(`🗑️ "${name}" retiré de la liste`, "success");
+          loadEtablissements();
+        } catch (err) {
+          showToast(`⛔ ${err.message}`, "error");
+        }
+      });
+    });
   } catch (err) {
+    clearBtn.classList.add("hidden");
     container.innerHTML = `<p class="empty-state">⛔ Impossible de charger la liste des établissements.</p>`;
   }
+}
+
+function setupEtablissementsActions() {
+  document.getElementById("etablissements-clear-btn").addEventListener("click", async () => {
+    if (!confirm("Vider entièrement la liste des établissements connectés ?\n\n" +
+                 "Ceci n'affecte ni les messages ni les profils — un établissement encore " +
+                 "actif réapparaîtra automatiquement à son prochain signal.")) return;
+    try {
+      const res = await fetch("/api/bridge/directory", { method: "DELETE" });
+      const d = await parseJsonResponse(res);
+      if (!res.ok) throw new Error(d.error || "Échec de l'opération.");
+      showToast("🗑️ Liste des établissements vidée", "success");
+      loadEtablissements();
+    } catch (err) {
+      showToast(`⛔ ${err.message}`, "error");
+    }
+  });
+}
+
+// ------------------------------------------------------------------ //
+// v2.9.1 — In-app document viewer (PDF.js for PDFs, <img> for images).
+// Fetches the SAME decrypted bytes as the 📥 download button, via
+// ?inline=1 (see app.py), as a Blob — nothing is written to disk, and no
+// external application is ever launched. PDF.js is loaded from
+// static/js/vendor/pdfjs/ (bundled — no CDN, no internet dependency,
+// works fully offline like the rest of this app).
+// ------------------------------------------------------------------ //
+const viewerState = {
+  pdfDoc: null,        // pdfjsLib document, when previewing a PDF
+  pageNum: 1,
+  scale: 1.0,
+  kind: null,          // "pdf" | "image" | "unsupported"
+  objectUrl: null,      // for <img> — revoked on close to free memory
+};
+
+if (typeof pdfjsLib !== "undefined") {
+  pdfjsLib.GlobalWorkerOptions.workerSrc = "/static/js/vendor/pdfjs/pdf.worker.min.js";
+}
+
+function guessKindFromName(name) {
+  const ext = (name.split(".").pop() || "").toLowerCase();
+  if (ext === "pdf") return "pdf";
+  if (["png", "jpg", "jpeg", "gif", "webp", "bmp"].includes(ext)) return "image";
+  return "unsupported";
+}
+
+async function openDocumentViewer(messageId, fileName) {
+  const modal = document.getElementById("viewer-modal");
+  const loading = document.getElementById("viewer-loading");
+  const canvas = document.getElementById("viewer-pdf-canvas");
+  const img = document.getElementById("viewer-image");
+  const unsupported = document.getElementById("viewer-unsupported");
+  const pageControls = document.getElementById("viewer-page-controls");
+
+  document.getElementById("viewer-filename").textContent = fileName || "Document";
+  document.getElementById("viewer-modal").dataset.messageId = messageId;
+  loading.classList.remove("hidden");
+  canvas.classList.add("hidden");
+  img.classList.add("hidden");
+  unsupported.classList.add("hidden");
+  pageControls.classList.add("hidden");
+  viewerState.pdfDoc = null;
+  viewerState.pageNum = 1;
+  viewerState.scale = 1.0;
+  document.getElementById("viewer-zoom-indicator").textContent = "100%";
+  modal.classList.remove("hidden");
+
+  const kind = guessKindFromName(fileName);
+  viewerState.kind = kind;
+
+  if (kind === "unsupported") {
+    loading.classList.add("hidden");
+    unsupported.classList.remove("hidden");
+    return;
+  }
+
+  try {
+    const res = await fetch(`/api/messages/${messageId}/download?inline=1`);
+    if (!res.ok) throw new Error(`Le serveur a répondu ${res.status}`);
+    const blob = await res.blob();
+
+    if (kind === "image") {
+      if (viewerState.objectUrl) URL.revokeObjectURL(viewerState.objectUrl);
+      viewerState.objectUrl = URL.createObjectURL(blob);
+      img.src = viewerState.objectUrl;
+      img.onload = () => {
+        loading.classList.add("hidden");
+        img.classList.remove("hidden");
+      };
+      img.onerror = () => {
+        loading.classList.add("hidden");
+        unsupported.classList.remove("hidden");
+      };
+      return;
+    }
+
+    // kind === "pdf"
+    if (typeof pdfjsLib === "undefined") {
+      loading.classList.add("hidden");
+      unsupported.classList.remove("hidden");
+      showToast("⛔ Le visualiseur PDF n'a pas pu se charger.", "error");
+      return;
+    }
+    const arrayBuffer = await blob.arrayBuffer();
+    viewerState.pdfDoc = await pdfjsLib.getDocument({ data: arrayBuffer }).promise;
+    pageControls.classList.remove("hidden");
+    loading.classList.add("hidden");
+    canvas.classList.remove("hidden");
+    await renderPdfPage();
+  } catch (err) {
+    loading.classList.add("hidden");
+    unsupported.classList.remove("hidden");
+    showToast(`⛔ Aperçu impossible : ${err.message}`, "error");
+  }
+}
+
+async function renderPdfPage() {
+  if (!viewerState.pdfDoc) return;
+  const page = await viewerState.pdfDoc.getPage(viewerState.pageNum);
+  const viewport = page.getViewport({ scale: viewerState.scale });
+  const canvas = document.getElementById("viewer-pdf-canvas");
+  const ctx = canvas.getContext("2d");
+  canvas.width = viewport.width;
+  canvas.height = viewport.height;
+  await page.render({ canvasContext: ctx, viewport }).promise;
+  document.getElementById("viewer-page-indicator").textContent =
+    `${viewerState.pageNum} / ${viewerState.pdfDoc.numPages}`;
+}
+
+function closeDocumentViewer() {
+  document.getElementById("viewer-modal").classList.add("hidden");
+  viewerState.pdfDoc = null;
+  if (viewerState.objectUrl) {
+    URL.revokeObjectURL(viewerState.objectUrl);
+    viewerState.objectUrl = null;
+  }
+}
+
+// Printing: pdf.js draws to a <canvas>, and a canvas alone doesn't survive
+// a straightforward print (browsers often skip its pixels). Simplest
+// reliable approach here — including inside a pywebview window, which
+// has no native print dialog of its own — is to hand the ORIGINAL file
+// bytes to a hidden <iframe> and print that frame's own rendering:
+// native for a PDF (the browser's built-in PDF viewer), and a plain
+// <img> wrapper for a picture.
+async function printCurrentDocument(messageId) {
+  const frame = document.getElementById("print-frame");
+  try {
+    if (viewerState.kind === "pdf") {
+      frame.src = `/api/messages/${messageId}/download?inline=1`;
+    } else if (viewerState.kind === "image" && viewerState.objectUrl) {
+      frame.srcdoc = `<html><body style="margin:0"><img src="${viewerState.objectUrl}" ` +
+                      `style="max-width:100%" onload="window.print()"></body></html>`;
+    } else {
+      return;
+    }
+    frame.onload = () => {
+      try { frame.contentWindow.focus(); frame.contentWindow.print(); }
+      catch (e) { showToast("⛔ Impression indisponible pour ce document.", "error"); }
+    };
+  } catch (err) {
+    showToast(`⛔ Impression impossible : ${err.message}`, "error");
+  }
+}
+
+function setupDocumentViewer() {
+  document.getElementById("viewer-close-btn").onclick = closeDocumentViewer;
+  document.getElementById("viewer-modal").addEventListener("click", (e) => {
+    if (e.target.id === "viewer-modal") closeDocumentViewer();  // click on the dim backdrop
+  });
+  document.getElementById("viewer-zoom-in").onclick = async () => {
+    if (viewerState.kind !== "pdf") return;
+    viewerState.scale = Math.min(3.0, viewerState.scale + 0.25);
+    document.getElementById("viewer-zoom-indicator").textContent = `${Math.round(viewerState.scale * 100)}%`;
+    await renderPdfPage();
+  };
+  document.getElementById("viewer-zoom-out").onclick = async () => {
+    if (viewerState.kind !== "pdf") return;
+    viewerState.scale = Math.max(0.25, viewerState.scale - 0.25);
+    document.getElementById("viewer-zoom-indicator").textContent = `${Math.round(viewerState.scale * 100)}%`;
+    await renderPdfPage();
+  };
+  document.getElementById("viewer-prev-page").onclick = async () => {
+    if (!viewerState.pdfDoc || viewerState.pageNum <= 1) return;
+    viewerState.pageNum -= 1;
+    await renderPdfPage();
+  };
+  document.getElementById("viewer-next-page").onclick = async () => {
+    if (!viewerState.pdfDoc || viewerState.pageNum >= viewerState.pdfDoc.numPages) return;
+    viewerState.pageNum += 1;
+    await renderPdfPage();
+  };
+  document.getElementById("viewer-print-btn").onclick = () => {
+    // The currently open message id is stashed on the modal itself by
+    // openDocumentViewer (avoids a second global just for this).
+    const id = document.getElementById("viewer-modal").dataset.messageId;
+    if (id) printCurrentDocument(id);
+  };
 }
 
 function timeAgo(isoString) {
@@ -917,6 +1152,7 @@ async function loadDashboard() {
       </div>
       <span class="list-row-badge">${escapeHtml(row.status)}</span>
       <div class="list-row-actions">
+        ${row.file_path ? `<button class="row-btn" data-preview="${row.id}" data-name="${escapeHtml(row.file_original_name || "")}" title="Aperçu">👁️</button>` : ""}
         ${row.file_path ? `<button class="row-btn" data-download="${row.id}" title="Télécharger">📥</button>` : ""}
         <button class="row-btn danger" data-delete="${row.id}" data-scope="dashboard" title="Supprimer">🗑️</button>
       </div>
@@ -930,6 +1166,12 @@ async function loadDashboard() {
 // Shared row actions — download, delete, accusé de réception
 // ------------------------------------------------------------------ //
 function wireRowActions(container, onChanged) {
+  container.querySelectorAll("[data-preview]").forEach(btn => {
+    btn.addEventListener("click", () => {
+      openDocumentViewer(btn.dataset.preview, btn.dataset.name || "document");
+    });
+  });
+
   container.querySelectorAll("[data-download]").forEach(btn => {
     btn.addEventListener("click", () => {
       window.open(`/api/messages/${btn.dataset.download}/download`, "_blank");
@@ -1274,6 +1516,7 @@ async function loadInbox() {
         ${row.status === "accuse"
           ? `<span class="list-row-badge">✅ accusé</span>`
           : `<button class="row-btn ack" data-ack="${row.id}" title="Confirmer réception">✅ Accusé</button>`}
+        ${row.file_path ? `<button class="row-btn" data-preview="${row.id}" data-name="${escapeHtml(row.file_original_name || "")}" title="Aperçu">👁️</button>` : ""}
         ${row.file_path ? `<button class="row-btn" data-download="${row.id}" title="Télécharger">📥</button>` : ""}
         <button class="row-btn danger" data-delete="${row.id}" title="Supprimer">🗑️</button>
       </div>
@@ -1303,6 +1546,7 @@ async function loadRegistre(filter) {
       </div>
       <span class="list-row-badge">${row.created_at.slice(0, 16).replace("T", " ")}</span>
       <div class="list-row-actions">
+        ${row.file_path ? `<button class="row-btn" data-preview="${row.id}" data-name="${escapeHtml(row.file_original_name || "")}" title="Aperçu">👁️</button>` : ""}
         ${row.file_path ? `<button class="row-btn" data-download="${row.id}" title="Télécharger">📥</button>` : ""}
         <button class="row-btn danger" data-delete="${row.id}" title="Supprimer">🗑️</button>
       </div>
@@ -1310,6 +1554,95 @@ async function loadRegistre(filter) {
   `;
   }).join("");
   wireRowActions(container, () => loadRegistre(filter));
+}
+
+// ------------------------------------------------------------------ //
+// v2.9.1 — Diagnostic & Santé du système (Paramètres)
+// ------------------------------------------------------------------ //
+function diagRow(label, value, ok) {
+  const cls = ok === undefined ? "" : (ok ? "diag-ok" : "diag-bad");
+  return `<div class="diag-row ${cls}"><span>${escapeHtml(label)}</span><span class="diag-value">${escapeHtml(String(value))}</span></div>`;
+}
+
+function formatBytes(n) {
+  if (n < 1024) return `${n} o`;
+  if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} Ko`;
+  return `${(n / (1024 * 1024)).toFixed(2)} Mo`;
+}
+
+async function runDiagnostics() {
+  const out = document.getElementById("diag-results");
+  out.innerHTML = `<p class="empty-state">Diagnostic en cours...</p>`;
+  const rows = [];
+
+  // 1) Serveur local & WebSocket
+  try {
+    const h = await fetch("/api/health").then(r => r.json());
+    rows.push(diagRow("Serveur Flask", "en ligne", true));
+    rows.push(diagRow("WebSocket (Flask-SocketIO)",
+      h.socketio_available ? "disponible" : "indisponible (repli sur sondage 5 min)",
+      h.socketio_available));
+  } catch (err) {
+    rows.push(diagRow("Serveur Flask", `injoignable (${err.message})`, false));
+  }
+
+  // 2) Intégrité SQLite
+  try {
+    const d = await fetch("/api/diagnostics/sqlite").then(r => parseJsonResponse(r));
+    if (d.error) throw new Error(d.error);
+    rows.push(diagRow("Intégrité SQLite (quick_check)", d.quick_check, d.healthy));
+    rows.push(diagRow("Taille de la base", formatBytes(d.db_size_bytes)));
+  } catch (err) {
+    rows.push(diagRow("Intégrité SQLite", `⛔ ${err.message}`, false));
+  }
+
+  // 3) Quota GitHub Bridge
+  try {
+    const q = await fetch("/api/diagnostics/github-quota").then(r => parseJsonResponse(r));
+    if (!q.bridge_enabled) {
+      rows.push(diagRow("Quota Réseau TASHIL (GitHub)", "non configuré"));
+    } else if (q.error) {
+      rows.push(diagRow("Quota Réseau TASHIL (GitHub)", `⛔ ${q.error}`, false));
+    } else {
+      rows.push(diagRow("Quota Réseau TASHIL (GitHub)",
+        `${q.remaining} / ${q.limit} requêtes restantes`, q.remaining > 100));
+    }
+  } catch (err) {
+    rows.push(diagRow("Quota Réseau TASHIL (GitHub)", `⛔ ${err.message}`, false));
+  }
+
+  out.innerHTML = rows.join("");
+}
+
+function setupDiagnostics() {
+  document.getElementById("diag-run-btn").onclick = runDiagnostics;
+
+  document.getElementById("diag-vacuum-btn").onclick = async () => {
+    const statusEl = document.getElementById("diag-action-status");
+    statusEl.textContent = "Optimisation en cours (peut prendre quelques secondes)...";
+    try {
+      const d = await fetch("/api/maintenance/vacuum", { method: "POST" }).then(r => parseJsonResponse(r));
+      if (d.error) throw new Error(d.error);
+      statusEl.textContent = `✅ Base optimisée — ${formatBytes(d.reclaimed_bytes)} récupéré(s) ` +
+        `(${formatBytes(d.size_before_bytes)} → ${formatBytes(d.size_after_bytes)}).`;
+    } catch (err) {
+      statusEl.textContent = `⛔ ${err.message}`;
+    }
+  };
+
+  document.getElementById("diag-clear-cache-btn").onclick = async () => {
+    const statusEl = document.getElementById("diag-action-status");
+    statusEl.textContent = "Nettoyage en cours...";
+    try {
+      const d = await fetch("/api/maintenance/clear-cache", { method: "POST" }).then(r => parseJsonResponse(r));
+      if (d.error) throw new Error(d.error);
+      statusEl.textContent = d.files_removed > 0
+        ? `✅ ${d.files_removed} fichier(s) temporaire(s) supprimé(s) (${formatBytes(d.freed_bytes)} libérés).`
+        : "✅ Aucun fichier temporaire obsolète à nettoyer.";
+    } catch (err) {
+      statusEl.textContent = `⛔ ${err.message}`;
+    }
+  };
 }
 
 // ------------------------------------------------------------------ //
@@ -1328,9 +1661,17 @@ function renderParametres() {
 // OTA update checker (GitHub Releases API)
 // ------------------------------------------------------------------ //
 function setupUpdateChecker() {
-  document.getElementById("check-update-btn").addEventListener("click", checkForUpdate);
+  document.getElementById("check-update-btn").addEventListener("click",
+    () => checkForUpdate({ status: "update-status", banner: "update-banner",
+                            message: "update-message", link: "update-download-link" }));
 }
 
+// v2.9.1: the same check is now also offered from the lock screen and the
+// onboarding screen (see setupLockAndOnboardingUpdateCheck below) — wired
+// once at boot, since those screens exist before any profile is ever
+// unlocked. checkForUpdate() itself takes no session/profile: it is a
+// plain public GET to GitHub's release API (client-side, same call as
+// before), so it works identically whether the app is locked or not.
 function parseVersion(tag) {
   // Accepts "v2.1.0" or "2.1.0"; returns [2,1,0] for comparison
   const clean = tag.replace(/^v/i, "");
@@ -1347,9 +1688,9 @@ function isNewer(remote, current) {
   return false;
 }
 
-async function checkForUpdate() {
-  const statusEl = document.getElementById("update-status");
-  const banner = document.getElementById("update-banner");
+async function checkForUpdate(ids) {
+  const statusEl = document.getElementById(ids.status);
+  const banner = document.getElementById(ids.banner);
   statusEl.className = "status-line";
   statusEl.textContent = "Recherche en cours...";
   banner.classList.add("hidden");
@@ -1367,9 +1708,9 @@ async function checkForUpdate() {
 
     if (isNewer(remoteVersion, currentVersion)) {
       const asset = (release.assets || []).find(a => a.name.endsWith(".exe"));
-      document.getElementById("update-message").textContent =
+      document.getElementById(ids.message).textContent =
         `Nouvelle version disponible : ${release.tag_name} (actuelle : v${state.meta.app_version})`;
-      document.getElementById("update-download-link").href =
+      document.getElementById(ids.link).href =
         asset ? asset.browser_download_url : release.html_url;
       banner.classList.remove("hidden");
       statusEl.textContent = "";
@@ -1379,6 +1720,19 @@ async function checkForUpdate() {
   } catch (err) {
     statusEl.textContent = `⛔ Impossible de vérifier les mises à jour : ${err.message}`;
   }
+}
+
+// v2.9.1: wired ONCE at boot (.onclick= assignment, not addEventListener —
+// same v2.8.6 lesson as showOnboarding()'s <select> handlers: these two
+// screens can each be (re)shown many times in one session, and stacking
+// listeners on every show would fire the check N times per click).
+function setupLockAndOnboardingUpdateCheck() {
+  document.getElementById("lock-check-update-btn").onclick = () =>
+    checkForUpdate({ status: "lock-update-status", banner: "lock-update-banner",
+                      message: "lock-update-message", link: "lock-update-download-link" });
+  document.getElementById("ob-check-update-btn").onclick = () =>
+    checkForUpdate({ status: "ob-update-status", banner: "ob-update-banner",
+                      message: "ob-update-message", link: "ob-update-download-link" });
 }
 
 // ------------------------------------------------------------------ //
@@ -1685,6 +2039,10 @@ async function confirmDeleteProfile() {
   }
   await showLockScreen();
 }
+
+// v2.9.1: state.meta is populated a few lines above, before onboarding/
+// lock-screen branching — safe to wire immediately after boot() sets it.
+setupLockAndOnboardingUpdateCheck();
 
 // ------------------------------------------------------------------ //
 // Utils
