@@ -233,6 +233,13 @@ async function submitOnboarding() {
     pin,
   };
 
+  // v2.9.3: only sent once the field has been revealed (see below) and filled —
+  // absent otherwise, so a first, ordinary onboarding attempt never carries it.
+  const originalPinBlock = document.getElementById("ob-original-pin-block");
+  if (!originalPinBlock.classList.contains("hidden")) {
+    payload.original_pin = document.getElementById("ob-original-pin").value.trim();
+  }
+
   try {
     const res = await fetch("/api/profile", {
       method: "POST",
@@ -240,7 +247,17 @@ async function submitOnboarding() {
       body: JSON.stringify(payload),
     });
     const data = await res.json();
-    if (!res.ok) throw new Error(data.error || "Erreur inconnue.");
+    if (!res.ok) {
+      // v2.9.3: the server found this establishment already claimed by
+      // another device on the network — reveal the extra field (if not
+      // already visible) instead of just showing a dead-end error, and
+      // let the person try again with the original PIN.
+      if (data.requires_original_pin) {
+        originalPinBlock.classList.remove("hidden");
+        document.getElementById("ob-original-pin").focus();
+      }
+      throw new Error(data.error || "Erreur inconnue.");
+    }
 
     state.profile = data.profile;
     document.getElementById("onboarding-overlay").classList.add("hidden");
@@ -820,6 +837,30 @@ function switchView(viewName) {
   if (viewName === "messagerie") loadInbox();
   if (viewName === "registre") loadRegistre("tous");
   if (viewName === "etablissements") loadEtablissements();
+  if (viewName === "scanner") loadScanner();
+}
+
+async function loadScanner() {
+  const availableBlock = document.getElementById("scanner-available-block");
+  const unavailableBlock = document.getElementById("scanner-unavailable-block");
+  try {
+    const data = await fetch("/api/scanner/status").then(r => parseJsonResponse(r));
+    if (!data.available) {
+      availableBlock.classList.add("hidden");
+      unavailableBlock.classList.remove("hidden");
+      return;
+    }
+    unavailableBlock.classList.add("hidden");
+    availableBlock.classList.remove("hidden");
+    // Cache-busted so a NEWER .apk later dropped in the same place doesn't
+    // show a QR code the browser kept from an earlier, stale response.
+    document.getElementById("scanner-qr-image").src = `/api/scanner/qr.png?t=${Date.now()}`;
+    document.getElementById("scanner-size-note").textContent =
+      `Taille : ${formatBytes(data.size_bytes)}`;
+  } catch (err) {
+    availableBlock.classList.add("hidden");
+    unavailableBlock.classList.remove("hidden");
+  }
 }
 
 async function loadEtablissements() {
@@ -921,7 +962,7 @@ const viewerState = {
   pdfDoc: null,        // pdfjsLib document, when previewing a PDF
   pageNum: 1,
   scale: 1.0,
-  kind: null,          // "pdf" | "image" | "unsupported"
+  kind: null,          // "pdf" | "image" | "docx" | "unsupported"
   objectUrl: null,      // for <img> — revoked on close to free memory
 };
 
@@ -933,6 +974,11 @@ function guessKindFromName(name) {
   const ext = (name.split(".").pop() || "").toLowerCase();
   if (ext === "pdf") return "pdf";
   if (["png", "jpg", "jpeg", "gif", "webp", "bmp"].includes(ext)) return "image";
+  // v2.9.3: only .docx (the modern, ZIP-based Word format) — mammoth.js
+  // reads the OOXML format inside a .docx; it cannot parse the legacy
+  // binary .doc format at all, so .doc is intentionally left unsupported
+  // below rather than silently failing on a format mammoth can't read.
+  if (ext === "docx") return "docx";
   return "unsupported";
 }
 
@@ -941,6 +987,7 @@ async function openDocumentViewer(messageId, fileName) {
   const loading = document.getElementById("viewer-loading");
   const canvas = document.getElementById("viewer-pdf-canvas");
   const img = document.getElementById("viewer-image");
+  const docxContainer = document.getElementById("viewer-docx-container");
   const unsupported = document.getElementById("viewer-unsupported");
   const pageControls = document.getElementById("viewer-page-controls");
 
@@ -949,6 +996,8 @@ async function openDocumentViewer(messageId, fileName) {
   loading.classList.remove("hidden");
   canvas.classList.add("hidden");
   img.classList.add("hidden");
+  docxContainer.classList.add("hidden");
+  docxContainer.innerHTML = "";  // never let a previous document's content flash before the new one loads
   unsupported.classList.add("hidden");
   pageControls.classList.add("hidden");
   viewerState.pdfDoc = null;
@@ -966,7 +1015,9 @@ async function openDocumentViewer(messageId, fileName) {
     // actually send through TASHIL (.doc/.docx/.xls/.xlsx), suggests the
     // concrete fix (convert to PDF) instead of a generic dead end.
     const ext = (fileName || "").split(".").pop().toLowerCase();
-    const officeFormats = ["doc", "docx", "xls", "xlsx", "ppt", "pptx"];
+    // .docx is NOT in this list on purpose — it now has its own real
+    // preview path below (mammoth.js) and never reaches this branch.
+    const officeFormats = ["doc", "xls", "xlsx", "ppt", "pptx"];
     unsupported.textContent = ext && officeFormats.includes(ext)
       ? `Aperçu non disponible pour ce type de fichier (.${ext}) — veuillez convertir ` +
         `votre document en PDF pour une prévisualisation directe, ou utilisez le bouton Télécharger.`
@@ -994,6 +1045,34 @@ async function openDocumentViewer(messageId, fileName) {
         loading.classList.add("hidden");
         unsupported.classList.remove("hidden");
       };
+      return;
+    }
+
+    if (kind === "docx") {
+      // v2.9.3: mammoth.js reads the .docx (a ZIP of OOXML) directly from
+      // an ArrayBuffer — no server-side conversion, no temp file, fully
+      // local/offline like the rest of this viewer. It renders a
+      // best-effort semantic HTML approximation of the document (text,
+      // headings, lists, tables, basic formatting) — it does not aim for
+      // pixel-perfect fidelity to Word's own layout.
+      if (typeof mammoth === "undefined") {
+        loading.classList.add("hidden");
+        unsupported.textContent = "Le visualiseur de documents Word n'a pas pu se charger.";
+        unsupported.classList.remove("hidden");
+        showToast("⛔ Le visualiseur .docx n'a pas pu se charger.", "error");
+        return;
+      }
+      const arrayBuffer = await blob.arrayBuffer();
+      const result = await mammoth.convertToHtml({ arrayBuffer });
+      docxContainer.innerHTML = result.value;  // mammoth's own output — not user-editable input, but see note below
+      loading.classList.add("hidden");
+      docxContainer.classList.remove("hidden");
+      if (result.messages && result.messages.length) {
+        // Non-fatal notices (an unrecognized style, an unsupported list
+        // level...) — mammoth still produced output above; just a
+        // fidelity heads-up, not an error worth interrupting the preview for.
+        console.warn("mammoth.js:", result.messages);
+      }
       return;
     }
 
@@ -1054,6 +1133,17 @@ async function printCurrentDocument(messageId) {
     } else if (viewerState.kind === "image" && viewerState.objectUrl) {
       frame.srcdoc = `<html><body style="margin:0"><img src="${viewerState.objectUrl}" ` +
                       `style="max-width:100%" onload="window.print()"></body></html>`;
+    } else if (viewerState.kind === "docx") {
+      // The already-rendered mammoth.js HTML is reused as-is — no second
+      // conversion, no network call. frame.onload below fires once this
+      // content is in place (unlike the image case, there's no async
+      // image-decode step to wait for, so no inline onload is needed here).
+      const docxHtml = document.getElementById("viewer-docx-container").innerHTML;
+      frame.srcdoc = `<html><head><style>
+        body { font-family: Georgia, 'Times New Roman', serif; padding: 24px; line-height: 1.5; }
+        table { border-collapse: collapse; } td, th { border: 1px solid #999; padding: 4px 8px; }
+        img { max-width: 100%; }
+      </style></head><body>${docxHtml}</body></html>`;
     } else {
       return;
     }

@@ -2632,3 +2632,191 @@ Aucune fonctionnalité antérieure retirée — Flask-SocketIO, `BEGIN
 IMMEDIATE`, sondage Bridge avec ETag (v2.9.0), dédoublonnage/suppression
 de l'annuaire, visualiseur de documents, module Diagnostic (v2.9.1) tous
 confirmés intacts par la régression ci-dessus.
+
+---
+
+## 31. v2.9.3 — En-tête réajusté, aperçu .docx natif, anti-doublon réseau, onglet TASHIL SCANNER (2026-10-01)
+
+⚠️ Cette version conserve intégralement le code et les fonctionnalités des
+v2.9.0 à v2.9.2 — rien n'a été retiré, uniquement ajusté ou ajouté.
+
+### 31.1 🎨 En-tête réduit
+
+L'agrandissement de la v2.9.2 (correction du doublon "TASHIL" sidebar/
+en-tête) s'est avéré trop imposant à l'usage. Recalé à une taille
+intermédiaire, nettement plus grande que l'original v2.9.1 mais sobre :
+logo 52px → 38px, titre 26px → 19px (graisse 800 → 700), sous-titre 16px
+→ 13px, rembourrage 20/28px → 14/22px. Le repli mobile (≤640px) introduit
+en v2.9.2 reste inchangé. Validé par `tinycss2` (0 erreur).
+
+### 31.2 📄 Rendu direct des fichiers .docx dans l'aperçu
+
+Le visualiseur intégré (v2.9.1) rend désormais les fichiers **.docx**
+directement, sans message invitant à convertir en PDF — via **mammoth.js
+1.8.0** (build navigateur, embarqué localement dans
+`static/js/vendor/mammoth.browser.min.js`, aucun CDN, cohérent avec la
+politique déjà en place pour Socket.IO et PDF.js).
+
+⚠️ **Limite technique, pas un choix arbitraire** : mammoth.js ne lit que
+le format **.docx** (ZIP contenant de l'OOXML) — il ne peut pas du tout
+analyser l'ancien format binaire **.doc**. Le message "convertir en PDF"
+reste donc affiché pour `.doc`, `.xls`, `.xlsx`, `.ppt`, `.pptx`, mais
+plus pour `.docx`, qui bascule maintenant sur un chemin de rendu réel.
+
+Le rendu produit une approximation sémantique du document (titres,
+paragraphes, listes, tableaux, mise en forme basique) — **pas une
+fidélité pixel-perfect à la mise en page Word d'origine**, limite
+intrinsèque et documentée de mammoth.js, pas un défaut d'intégration.
+Le bouton "🖨️ Imprimer" réutilise le HTML déjà rendu (aucune seconde
+conversion, aucun appel réseau supplémentaire) via le même mécanisme
+d'iframe caché que pour PDF/image.
+
+**Testé réellement** : un vrai fichier `.docx` généré avec
+`python-docx` (titre, paragraphe, tableau 2×2) a été converti par le
+fichier `mammoth.browser.min.js` exact destiné au paquet (exécuté dans
+Node.js) — HTML de sortie confirmé correct et fidèle au contenu
+(`<h1>`, `<p>`, `<table>` avec les bonnes cellules), aucune erreur,
+aucun message d'avertissement. ⚠️ Non testé dans ce bac à sable : le
+rendu visuel final dans une vraie fenêtre pywebview/navigateur et le
+rendu de documents `.docx` plus complexes (styles personnalisés, images
+intégrées, listes imbriquées profondes).
+
+### 31.3 🔒 Protection contre le double enregistrement d'un établissement
+
+**Problème réel** : `institution_key` est **déterministe** (wilaya +
+type + nom + rôle) depuis la v2.8.5 — deux appareils différents
+onboardant "le même" établissement+rôle calculent exactement la même
+clé. Localement, c'est sans risque (`registry.db` a déjà
+`institution_key` en **clé primaire**, désormais remonté en message
+clair plutôt qu'en erreur SQLite brute — voir ci-dessous). Mais rien
+n'empêchait un **second appareil** de créer son propre profil
+indépendant sous cette même clé, corrompant potentiellement le routage
+du Cloud Bridge, qui suppose cette clé unique sur tout le réseau.
+
+**Solution implémentée — registre d'identité réseau permanent** :
+nouveau dossier `registrations/<institution_key>.json` dans le dépôt
+Cloud Bridge, **distinct** de l'annuaire de présence éphémère
+`directory/` (que "Vider la liste", v2.9.1, peut effacer librement sans
+jamais toucher à ce registre d'identité). Il stocke uniquement un
+**hash** du code PIN en vigueur au moment de la toute première
+revendication de cette clé sur le réseau — jamais le PIN en clair.
+
+**Flux à la création d'un profil** (`POST /api/profile`) :
+1. **Vérification locale** : si `institution_key` existe déjà sur
+   *cet* appareil → message clair "déjà configuré sur cet appareil",
+   plutôt que l'ancienne `sqlite3.IntegrityError` brute non gérée.
+2. **Vérification réseau** (si le Cloud Bridge est configuré sur cet
+   appareil) : consultation de `registrations/<clé>.json`.
+   - Absent → création autorisée normalement ; la clé est aussitôt
+     revendiquée (hash du PIN choisi écrit dans le registre).
+   - Présent → le code PIN **d'origine** doit être fourni et doit
+     correspondre au hash stocké. Absent ou incorrect → requête
+     refusée (`409`/`401`, avec un indicateur `requires_original_pin`
+     pour que l'interface affiche le champ). Correct → création
+     autorisée ; l'appareil obtient son **propre** PIN local (comme
+     tout profil), le registre réseau n'est **jamais** réécrit par ce
+     second appareil — le hash d'origine reste la référence pour tout
+     appareil supplémentaire voulant rejoindre cette même identité.
+
+**⚠️ Limite honnête, documentée** : sans Cloud Bridge configuré sur
+l'appareil au moment précis de l'onboarding (cas du tout premier profil
+jamais créé sur une installation neuve — le provisioning se fait
+normalement *après*, en Paramètres), aucune vérification réseau n'est
+possible à cet instant précis. Comblé par une **auto-revendication
+rétroactive** : chaque cycle de battement de cœur (déjà existant depuis
+la v2.8.9) vérifie désormais aussi si sa propre clé a bien une entrée
+dans `registrations/` et la crée si elle manque — couvre à la fois ce
+cas et un échec réseau ponctuel au moment de la création.
+
+**Interface** : le formulaire d'onboarding affiche désormais un champ
+"Code PIN d'origine", **masqué par défaut**, révélé uniquement si le
+serveur signale `requires_original_pin` après une première tentative
+(l'utilisateur n'a jamais à le voir pour un établissement réellement
+nouveau).
+
+**Testé réellement, scénario complet à deux appareils simulés
+partageant un même faux serveur GitHub** :
+- Appareil A crée un profil sans Bridge configuré (limite honnête,
+  comportement attendu), puis configure le Bridge après coup → la
+  revendication rétroactive au premier battement de cœur confirmée.
+- Appareil B (processus totalement distinct, registre local vide) tente
+  de créer *le même* établissement : sans PIN d'origine → `409` avec
+  l'indicateur ; avec un mauvais PIN d'origine → `401` ; aucun profil
+  créé sur B entre ces deux échecs (vérifié) ; avec le **bon** PIN
+  d'origine → profil créé avec succès, et le hash d'origine dans le
+  registre réseau confirmé **inchangé** (non écrasé par B).
+
+### 31.4 📱 Nouvel onglet "TASHIL SCANNER"
+
+Nouvel onglet dans la barre latérale, juste sous "⚙️ Paramètres",
+préparant l'arrivée de l'application mobile **TASHIL SCANNER** (Kotlin
+natif, étape 2 du projet — **pas encore développée à ce jour**).
+
+- Nouvelle route `GET /api/scanner/status` : indique si
+  `static/downloads/tashil-scanner.apk` existe sur cet appareil et sa
+  taille — permet à l'interface d'afficher honnêtement "pas encore
+  disponible" plutôt qu'un QR code ou un bouton qui échouerait.
+- Nouvelle route `GET /api/scanner/qr.png` : même mécanisme déjà
+  éprouvé que le QR d'accès réseau (section 11.2) — encode l'URL LAN
+  vers la route de téléchargement ci-dessous.
+- Nouvelle route `GET /api/scanner/apk` : sert le fichier en
+  téléchargement direct (`Content-Type`
+  `application/vnd.android.package-archive`) s'il existe, sinon `404`
+  avec un message clair.
+- Dossier `static/downloads/` créé avec un `README.txt` expliquant où
+  déposer le futur `.apk` — dès que ce fichier y est placé, l'onglet le
+  détecte automatiquement (aucun redémarrage ni changement de code
+  nécessaire).
+
+**Testé réellement** : statut "non disponible" + téléchargement `404`
+propre sans fichier présent ; QR généré dans les deux cas (se résoudra
+correctement une fois l'APK déposé) ; dépôt d'un faux fichier de test →
+statut bascule à "disponible" avec la bonne taille, téléchargement
+renvoie les bons octets et le bon type MIME.
+
+### 31.5 Régression
+
+Suite complète rejouée sur le code final v2.9.3, **tout confirmé
+fonctionnel ensemble** :
+- Scénario exact de collision SQLite (v2.8.1 →) : toujours `200 OK`.
+- Cycle complet réel Flask-SocketIO + faux GitHub + vrai client JS
+  vendor : toujours `new_document` reçu et message correctement inséré.
+- Dédoublonnage/suppression/purge de l'annuaire des établissements
+  (v2.9.1) : rejoué sans modification, toujours conforme.
+- Diagnostic & Santé (v2.9.1) : rejoué sans modification, toujours
+  conforme.
+- Suppression de profil verrouillé (v2.9.2) : rejoué sans modification,
+  toujours conforme.
+- Anti-doublon réseau (nouveau, v2.9.3) : scénario à deux appareils,
+  voir 31.3.
+- Scanner APK (nouveau, v2.9.3) : voir 31.4 — un artefact de test
+  résiduel (faux `.apk` laissé par un run précédent dans l'environnement
+  de développement, hors de l'arborescence livrée) a d'abord faussé un
+  rejeu automatique ; confirmé sans rapport avec le code lui-même après
+  nettoyage, nouveau rejeu propre confirmé.
+- `py_compile` sur `app.py`/`desktop_launcher.py`, `node --check` sur
+  `app.js`, validation `tinycss2` sur `style.css` : aucune erreur.
+- **Non rejoué dans cette session** (comme à chaque version, à faire
+  avant tag de production) : la suite de régression complète v2.8.1 →
+  v2.8.9 sur les fonctionnalités que ce patch ne touche pas (HEIC,
+  appairage matériel, hiérarchie EPSP JSON...).
+
+**Fichiers modifiés :** `app.py` (vérification locale + réseau à la
+création de profil, registre `registrations/`, auto-revendication au
+battement de cœur, routes `/api/scanner/*`), `static/js/app.js` (champ
+PIN d'origine en onboarding, rendu `.docx` via mammoth.js, chargement de
+l'onglet Scanner), `templates/index.html` (onglet Scanner, section
+correspondante, champ PIN d'origine, conteneur de rendu docx, scripts
+vendor), `static/css/style.css` (en-tête réduit, styles Scanner et
+docx). **Fichiers ajoutés :** `static/js/vendor/mammoth.browser.min.js`
+(mammoth.js 1.8.0, embarqué), `static/downloads/README.txt`. Aucune
+fonctionnalité antérieure retirée — Flask-SocketIO, `BEGIN IMMEDIATE`,
+sondage Bridge avec ETag, dédoublonnage/suppression de l'annuaire,
+visualiseur PDF/image, module Diagnostic, suppression de profil
+verrouillé (v2.9.0 à v2.9.2) tous confirmés intacts par la régression
+ci-dessus.
+
+**Rappel — Étape 2 (TASHIL SCANNER, Kotlin natif)** : non démarrée dans
+cette session, comme convenu ("dès que la v2.9.3 sera validée et
+déployée"). L'onglet ajouté ici est uniquement le point d'atterrissage
+côté PC, prêt à accueillir le futur `.apk`.

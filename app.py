@@ -214,7 +214,7 @@ _LEGACY_ARCHIVE_ENTRANT = os.path.join(BASE_DIR, "archives", "Courrier_Entrant")
 os.makedirs(PROFILES_DIR, exist_ok=True)
 
 APP_ROOT = os.path.dirname(os.path.abspath(__file__))
-APP_VERSION = "2.9.2"
+APP_VERSION = "2.9.3"
 GITHUB_REPO = "Aladdinweb/TASHIL-ES"  # used by the in-app OTA update checker
 
 app = Flask(__name__,
@@ -1376,6 +1376,50 @@ def api_network_qr():
     return send_file(buf, mimetype="image/png")
 
 
+# v2.9.3: static path the TASHIL SCANNER mobile app's .apk is expected at
+# — the Android app itself (native Kotlin) is a separate project, not yet
+# built; this page is the PC-side landing spot for it, so that dropping a
+# future tashil-scanner.apk file in /static/downloads/ "just works" with
+# no further backend change.
+SCANNER_APK_PATH = os.path.join(app.static_folder, "downloads", "tashil-scanner.apk")
+
+
+@app.route("/api/scanner/qr.png")
+def api_scanner_qr():
+    """Same pattern as /api/network-qr.png — a QR encoding this device's
+    LAN URL to the APK download route below, so a phone on the same
+    Wi-Fi can scan instead of typing anything."""
+    if not _QRCODE_AVAILABLE:
+        abort(501)
+    url = f"http://{get_lan_ip()}:5000/api/scanner/apk"
+    img = qrcode.make(url)
+    buf = BytesIO()
+    img.save(buf, format="PNG")
+    buf.seek(0)
+    return send_file(buf, mimetype="image/png")
+
+
+@app.route("/api/scanner/status", methods=["GET"])
+def api_scanner_status():
+    """Lets the frontend show an honest "pas encore disponible" state
+    instead of a QR code / download button that would 404 when scanned
+    or clicked, for as long as TASHIL SCANNER (separate Kotlin project)
+    hasn't shipped an .apk yet."""
+    available = os.path.isfile(SCANNER_APK_PATH)
+    return jsonify({
+        "available": available,
+        "size_bytes": os.path.getsize(SCANNER_APK_PATH) if available else 0,
+    })
+
+
+@app.route("/api/scanner/apk", methods=["GET"])
+def api_scanner_apk():
+    if not os.path.isfile(SCANNER_APK_PATH):
+        return jsonify({"error": "TASHIL SCANNER n'est pas encore disponible sur cet appareil."}), 404
+    return send_file(SCANNER_APK_PATH, as_attachment=True, download_name="tashil-scanner.apk",
+                      mimetype="application/vnd.android.package-archive")
+
+
 # --------------------------------------------------------------------------- #
 # API — Meta / directories
 # --------------------------------------------------------------------------- #
@@ -1714,6 +1758,7 @@ def api_save_profile():
     institution_name = data.get("institution_name", "").strip()
     requested_role = data.get("role", DEFAULT_ROLE).strip().upper() or DEFAULT_ROLE
     pin = data.get("pin", "")
+    original_pin = data.get("original_pin", "")  # v2.9.3: only needed if the establishment is already claimed
 
     if not institution_name or institution_type not in INSTITUTION_TYPES:
         return jsonify({"error": "Champs invalides."}), 400
@@ -1736,6 +1781,58 @@ def api_save_profile():
     serial_key = generate_serial_key(wilaya_code, institution_type, institution_name, role)
     salt = generate_encryption_salt()
 
+    # v2.9.3, check 1/2 — LOCAL: this device's own registry.db already has
+    # institution_key as a PRIMARY KEY, so a second local attempt would
+    # otherwise surface as a raw, unfriendly sqlite3.IntegrityError.
+    if get_profile_row(key) is not None:
+        return jsonify({"error": "Cet établissement (avec ce rôle) est déjà configuré sur cet appareil. "
+                                  "Sélectionnez-le depuis l'écran de verrouillage plutôt que d'en recréer un."}), 409
+
+    # v2.9.3, check 2/2 — NETWORK-WIDE: institution_key is deterministic,
+    # so a SECOND, DIFFERENT device could otherwise freely create its own
+    # independent profile under the exact same key — corrupting Bridge
+    # routing, which assumes this key identifies one establishment on the
+    # whole network. If this device has the Cloud Bridge configured, the
+    # permanent registrations/<key>.json ledger (see _fetch_registration)
+    # is consulted first; if that key was already claimed elsewhere, the
+    # ORIGINAL pin set when it was first claimed must be re-entered here
+    # to authorize this additional device.
+    # ⚠️ Honest limitation: without Cloud Bridge configured on THIS device
+    # yet (true for the very first profile ever onboarded on a brand-new
+    # install — provisioning normally happens afterwards, in Paramètres),
+    # there is no shared ledger to check against at this exact moment;
+    # _ensure_registration_claimed() closes that gap retroactively on the
+    # first heartbeat once the Bridge does get configured.
+    bridge_owner = bridge_repo = bridge_token = None
+    cfg = get_bridge_config()
+    if cfg and cfg["enabled"]:
+        bridge_owner, bridge_repo, bridge_token = cfg["github_owner"], cfg["github_repo"], cfg["github_token"]
+        record, _sha, err = _fetch_registration(bridge_owner, bridge_repo, bridge_token, key)
+        if err is not None:
+            return jsonify({"error": f"Impossible de vérifier le registre réseau (erreur GitHub {err}). "
+                                      f"Réessayez, ou vérifiez la connexion Internet."}), 502
+        if record is not None:
+            stored_hash = record.get("pin_hash")
+            if not original_pin:
+                return jsonify({
+                    "error": "Cet établissement est déjà enregistré sur le réseau TASHIL, sur un autre "
+                             "appareil. Saisissez le code PIN d'origine (défini lors de sa première "
+                             "installation) pour autoriser cet appareil supplémentaire.",
+                    "requires_original_pin": True,
+                }), 409
+            if not stored_hash or not check_password_hash(stored_hash, original_pin):
+                return jsonify({
+                    "error": "Code PIN d'origine incorrect.",
+                    "requires_original_pin": True,
+                }), 401
+            # Correct original PIN: this device is authorized to also
+            # operate this establishment's identity — it still gets its
+            # OWN local PIN (set below) for ITS OWN local encryption/
+            # hardware pairing, exactly like every other profile; the
+            # registrations ledger itself is left untouched (the original
+            # claim's hash remains the standing proof for any FURTHER
+            # device wanting to join this same establishment later).
+
     with registry_db() as conn:
         conn.execute("""
             INSERT INTO profiles (institution_key, wilaya_code, wilaya_name,
@@ -1750,6 +1847,19 @@ def api_save_profile():
         pass
 
     updated_row = get_profile_row(key)
+
+    # v2.9.3: claim this key on the network ledger right away when we can
+    # (Bridge already configured + nobody else had claimed it above) —
+    # best-effort; if this PUT itself fails on a flaky connection,
+    # _ensure_registration_claimed() retries it on the next heartbeat
+    # rather than blocking account creation on a second network call.
+    if bridge_owner and updated_row is not None:
+        try:
+            _claim_registration(bridge_owner, bridge_repo, bridge_token, key,
+                                 dict(updated_row), updated_row["pin_hash"])
+        except Exception:
+            pass
+
     set_active_session(key, pin, updated_row)
     return jsonify({"ok": True, "profile": profile_public_dict(updated_row)})
 
@@ -2638,6 +2748,83 @@ _HEARTBEAT_STALE_AFTER_SECONDS = 180  # v2.9.1: matches the "3 minutes" already 
                                       # 3 min, so this was a real mismatch, not just a tuning choice).
 
 
+# --------------------------------------------------------------------------- #
+# v2.9.3 — Network-wide duplicate-registration guard.
+#
+# institution_key is DETERMINISTIC (wilaya + type + name + role) by design
+# since v2.8.5 — two devices onboarding "the same" establishment+role would
+# compute the IDENTICAL key. Locally that's harmless (registry.db's own
+# PRIMARY KEY already refuses a second local row with the same key — see
+# the new friendly check in api_save_profile below). Across TWO DIFFERENT
+# devices sharing one Cloud Bridge, nothing previously stopped a second PC
+# from freely creating its OWN independent profile under that same key —
+# a real problem, since Bridge delivery and routing assume institution_key
+# uniquely identifies one establishment on the whole network.
+#
+# `registrations/<institution_key>.json` is a PERMANENT identity ledger,
+# separate from the EPHEMERAL presence heartbeat in `directory/` (which
+# "Vider la liste" in v2.9.1 can freely clear without touching this at
+# all — clearing who's currently seen online must never erase who is
+# authorized to claim an identity). It stores only a HASH of the PIN that
+# was in effect when this institution_key was first claimed on the
+# network — never the PIN itself.
+def _fetch_registration(owner: str, repo: str, token: str, institution_key: str):
+    """Returns (record_dict_or_None, sha_or_None, error_status_or_None)."""
+    path = f"registrations/{institution_key}.json"
+    status, content = _github_request("GET", f"/repos/{owner}/{repo}/contents/{path}", token)
+    if status == 404:
+        return None, None, None
+    if status != 200 or "content" not in content:
+        return None, None, status
+    try:
+        record = json.loads(base64.b64decode(content["content"]).decode("utf-8"))
+    except (ValueError, KeyError):
+        return None, None, None  # corrupt entry — treat as "not registered" rather than block everyone
+    return record, content.get("sha"), None
+
+
+def _claim_registration(owner: str, repo: str, token: str, institution_key: str, profile_fields: dict, pin_hash: str):
+    """Writes registrations/<key>.json — called once, right after a NEW
+    institution_key is first created locally with a network-wide check
+    already passed (or with no Bridge configured yet — see
+    _ensure_registration_claimed for that catch-up path). Never
+    overwrites an existing record: claiming is a one-time event per key."""
+    payload = {
+        "institution_key": institution_key,
+        "institution_name": profile_fields["institution_name"],
+        "institution_type": profile_fields["institution_type"],
+        "wilaya_name": profile_fields.get("wilaya_name", ""),
+        "role": profile_fields.get("role", DEFAULT_ROLE),
+        "pin_hash": pin_hash,
+        "registered_at": datetime.now().isoformat(),
+    }
+    payload_b64 = base64.b64encode(json.dumps(payload, ensure_ascii=False).encode("utf-8")).decode("utf-8")
+    _github_request("PUT", f"/repos/{owner}/{repo}/contents/registrations/{institution_key}.json", token,
+                     {"message": f"TASHIL: claim {institution_key}", "content": payload_b64})
+
+
+def _ensure_registration_claimed(owner: str, repo: str, token: str, profile: dict):
+    """
+    v2.9.3: self-healing catch-up, run once per heartbeat cycle (cheap —
+    one conditional-ish GET). Covers two gaps that a claim-at-onboarding-
+    time-only approach would miss:
+      1. The very FIRST profile ever created on a brand-new device, before
+         the Cloud Bridge is even configured (provisioning normally
+         happens in Paramètres, AFTER onboarding) — there is nothing to
+         check against yet at that moment.
+      2. A claim PUT that failed at onboarding time (a network hiccup) —
+         Cloud Bridge already tries best-effort at creation, this is the
+         backstop.
+    Never overwrites a record that already exists — if one is already
+    there (this device's own earlier claim, or another device's), this
+    is a no-op, not a re-claim.
+    """
+    record, _sha, err = _fetch_registration(owner, repo, token, profile["institution_key"])
+    if err is not None or record is not None:
+        return  # already claimed (by us or, in principle, resolved elsewhere) — nothing to do
+    _claim_registration(owner, repo, token, profile["institution_key"], profile, profile["pin_hash"])
+
+
 def _send_heartbeat(owner: str, repo: str, token: str, profile: dict):
     payload = {
         "institution_key": profile["institution_key"],
@@ -3108,6 +3295,7 @@ def _run_bridge_poll_locked(notify: bool) -> dict:
     if last is None or now_m - last >= HEARTBEAT_EVERY_SECONDS:
         try:
             _send_heartbeat(owner, repo, token, profile)
+            _ensure_registration_claimed(owner, repo, token, profile)  # v2.9.3
         except Exception:
             pass
         _last_heartbeat[key] = now_m

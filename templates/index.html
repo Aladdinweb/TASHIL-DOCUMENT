@@ -45,6 +45,18 @@
              placeholder="····" autocomplete="new-password" class="pin-input">
       <p class="muted small-note">Ce code PIN protège l'accès à cet établissement sur cet appareil.</p>
 
+      <!-- v2.9.3: masqué par défaut — n'apparaît que si le serveur signale que cet
+           établissement est déjà enregistré sur le réseau TASHIL (voir submitOnboarding). -->
+      <div id="ob-original-pin-block" class="hidden">
+        <label>Code PIN d'origine (défini lors de la première installation)</label>
+        <input id="ob-original-pin" type="password" inputmode="numeric" pattern="\d*" maxlength="6"
+               placeholder="····" autocomplete="off" class="pin-input">
+        <p class="muted small-note">
+          Cet établissement existe déjà sur le réseau TASHIL, sur un autre appareil.
+          Saisissez son code PIN d'origine pour autoriser cet appareil supplémentaire.
+        </p>
+      </div>
+
       <button class="btn btn-primary" id="ob-submit">Activer TASHIL</button>
       <button class="btn btn-secondary hidden" id="ob-cancel">← Annuler</button>
       <p id="ob-error" class="error hidden"></p>
@@ -141,6 +153,9 @@
     </button>
     <button class="tab" data-view="parametres">
       <span class="tab-icon">⚙️</span><span class="tab-label">Paramètres</span>
+    </button>
+    <button class="tab" data-view="scanner">
+      <span class="tab-icon">📱</span><span class="tab-label">TASHIL SCANNER</span>
     </button>
   </nav>
 
@@ -407,6 +422,33 @@
       </div>
     </section>
 
+    <section id="view-scanner" class="view">
+      <h2>📱 TASHIL SCANNER</h2>
+      <div class="card scanner-card">
+        <p class="muted">
+          Scannez ce code QR avec votre smartphone, ou cliquez sur le bouton
+          ci-dessous pour télécharger directement l'application
+          <strong>TASHIL SCANNER</strong> sur le réseau local.
+        </p>
+
+        <div id="scanner-available-block" class="hidden">
+          <img id="scanner-qr-image" class="scanner-qr" src="" alt="QR Code TASHIL SCANNER">
+          <a class="btn btn-primary" id="scanner-download-link" href="/api/scanner/apk" download>
+            ⬇️ Télécharger l'APK
+          </a>
+          <p class="muted small-note" id="scanner-size-note"></p>
+        </div>
+
+        <div id="scanner-unavailable-block" class="hidden">
+          <p class="empty-state">
+            📱 TASHIL SCANNER n'est pas encore disponible sur cet appareil.
+            L'application mobile est en cours de développement — elle
+            apparaîtra ici automatiquement dès qu'elle sera installée sur ce PC.
+          </p>
+        </div>
+      </div>
+    </section>
+
     <footer class="app-footer">
       <p>© ILINE TECH BY FERAK ALADDIN</p>
     </footer>
@@ -454,6 +496,9 @@
       <p class="empty-state" id="viewer-loading">Chargement...</p>
       <canvas id="viewer-pdf-canvas" class="hidden"></canvas>
       <img id="viewer-image" class="hidden" alt="Aperçu du document">
+      <!-- v2.9.3: mammoth.js renders the .docx into this container directly
+           (semantic HTML — headings, lists, tables, basic formatting) -->
+      <div id="viewer-docx-container" class="viewer-docx hidden"></div>
       <!-- v2.9.2: le texte par défaut ci-dessous est un repli — openDocumentViewer()
            le remplace toujours par un message mentionnant l'extension réelle. -->
       <p class="empty-state hidden" id="viewer-unsupported">
@@ -468,6 +513,7 @@
 
 <script src="/static/js/vendor/socket.io.min.js"></script>
 <script src="/static/js/vendor/pdfjs/pdf.min.js"></script>
+<script src="/static/js/vendor/mammoth.browser.min.js"></script>
 <script src="/static/js/app.js"></script>
 </body>
 </html>
