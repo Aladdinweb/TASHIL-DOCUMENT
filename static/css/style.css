@@ -128,7 +128,15 @@ textarea { resize: vertical; }
 .icon-btn {
   background: transparent; border: 1px solid var(--border); border-radius: 8px;
   padding: 8px 10px; font-size: 16px; cursor: pointer; color: var(--text);
+  transition: background-color 0.15s ease, border-color 0.15s ease, transform 0.1s ease;
 }
+/* v2.9.4: "modern, clean, interactive hover" for the relocated system
+   icons (refresh/theme/lock) — a light lift + tint on hover/focus,
+   a brief press-down on click, matching the --primary accent already
+   used for the active tab. */
+.icon-btn:hover { border-color: var(--primary); color: var(--primary); transform: translateY(-1px); }
+.icon-btn:active { transform: translateY(0); }
+.icon-btn:focus-visible { outline: 2px solid var(--primary); outline-offset: 2px; }
 .icon-btn.spinning { animation: icon-spin 0.7s linear infinite; }
 @keyframes icon-spin {
   from { transform: rotate(0deg); }
@@ -177,6 +185,29 @@ textarea { resize: vertical; }
   display: flex; justify-content: space-between; align-items: center;
   padding: 12px 14px; border-bottom: 1px solid var(--border); gap: 10px;
 }
+/* v2.9.4: Activité Récente — multi-select + bulk delete */
+.section-header-row {
+  display: flex; align-items: center; justify-content: space-between;
+  flex-wrap: wrap; gap: 10px; margin-top: 24px;
+}
+.section-header-row h3 { margin: 0; }
+.bulk-toolbar { display: flex; align-items: center; gap: 14px; }
+.bulk-select-all { display: flex; align-items: center; gap: 6px; font-size: 13px; cursor: pointer; }
+.row-select { width: 16px; height: 16px; cursor: pointer; flex-shrink: 0; }
+.attachments-expand {
+  display: flex; flex-direction: column; gap: 4px; margin-top: 6px;
+  padding: 8px; border: 1px solid var(--border); border-radius: 6px; background: var(--bg);
+}
+.attachment-row { display: flex; align-items: center; justify-content: space-between; gap: 8px; font-size: 13px; }
+
+/* v2.9.4: staged multi-file list in the Envoi form (Messagerie) */
+.selected-files-list { display: flex; flex-direction: column; gap: 6px; margin-top: 10px; }
+.selected-file-row {
+  display: flex; align-items: center; gap: 10px;
+  padding: 8px 12px; border: 1px solid var(--border); border-radius: 8px; background: var(--input-bg);
+}
+.selected-file-name { flex: 1; font-size: 13px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.selected-file-size { font-size: 12px; color: var(--text-muted); flex-shrink: 0; }
 .list-row:last-child { border-bottom: none; }
 .list-row-main { display: flex; flex-direction: column; gap: 2px; overflow: hidden; flex: 1; }
 .list-row-title { font-weight: 600; font-size: 14px; }
@@ -284,14 +315,15 @@ label:first-child { margin-top: 0; }
   to { opacity: 1; transform: translateY(0); }
 }
 
-/* ---------------- Footer ---------------- */
-.app-footer {
-  text-align: center; padding: 20px 0 8px; margin-top: 12px;
-  border-top: 1px solid var(--border);
+/* ---------------- Sidebar footer (v2.9.4) ---------------- */
+/* Replaces the old .app-footer (which lived at the bottom of <main>) —
+   refresh/theme/lock now live here too, moved out of .topbar. */
+.tabbar-footer {
+  display: flex; flex-direction: column; align-items: center; gap: 10px;
+  padding-top: 16px; margin-top: 12px; border-top: 1px solid var(--border);
 }
-.app-footer p {
-  font-size: 12px; color: var(--text-muted); margin: 0;
-}
+.tabbar-icons { display: flex; gap: 8px; }
+.tabbar-copyright { font-size: 11px; color: var(--text-muted); margin: 0; text-align: center; }
 
 /* ---------------- Responsive: mobile bottom nav ---------------- */
 @media (max-width: 640px) {
@@ -348,6 +380,13 @@ label:first-child { margin-top: 0; }
     border-right: 1px solid var(--border); border-bottom: none;
     padding: 20px 12px; align-items: stretch;
   }
+  /* v2.9.4: only meaningful once .tabbar is a COLUMN (this desktop rule) —
+     pushes the icons+copyright block to the bottom of the sidebar. On the
+     mobile bottom bar (base .tabbar rule, a horizontal row) this block
+     stays inline as the last scrollable item instead — a known, accepted
+     trade-off rather than a broken layout; see the note on
+     .tabbar-footer's own rule above. */
+  .tabbar-footer { margin-top: auto; }
   /* v2.9.2: removed — the sidebar no longer repeats a plain "TASHIL" label
      above its nav items; the app's identity now lives in the single,
      enlarged header block on the right (see .topbar / .brand-* below),

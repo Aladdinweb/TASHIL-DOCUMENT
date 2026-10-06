@@ -30,7 +30,7 @@ const state = {
   pendingUnlockKey: null,   // institution_key currently shown on the PIN screen
   pendingUnlockNeedsSetup: false,
   appInitialized: false,    // event listeners wired only once (see showApp)
-  selectedFile: null,       // currently attached file in the Envoi form
+  selectedFiles: [],        // v2.9.4: files attached to the Envoi form (replaces singular selectedFile)
   bridgeEnabled: false,
   socket: null,              // v2.9.0: local realtime channel (this device <-> its own server)
   fallbackTimer: null,       // only runs while the socket is disconnected/unavailable
@@ -982,7 +982,7 @@ function guessKindFromName(name) {
   return "unsupported";
 }
 
-async function openDocumentViewer(messageId, fileName) {
+async function openDocumentViewer(messageId, fileName, attachmentId) {
   const modal = document.getElementById("viewer-modal");
   const loading = document.getElementById("viewer-loading");
   const canvas = document.getElementById("viewer-pdf-canvas");
@@ -991,8 +991,13 @@ async function openDocumentViewer(messageId, fileName) {
   const unsupported = document.getElementById("viewer-unsupported");
   const pageControls = document.getElementById("viewer-page-controls");
 
+  // v2.9.4: undefined/omitted for the common single-attachment case —
+  // attachmentQS then stays "", so every URL below is byte-for-byte what
+  // it was before multi-attachment support existed.
+  const attachmentQS = attachmentId ? `attachment=${attachmentId}` : "";
   document.getElementById("viewer-filename").textContent = fileName || "Document";
   document.getElementById("viewer-modal").dataset.messageId = messageId;
+  document.getElementById("viewer-modal").dataset.attachmentId = attachmentId || "";
   loading.classList.remove("hidden");
   canvas.classList.add("hidden");
   img.classList.add("hidden");
@@ -1029,7 +1034,7 @@ async function openDocumentViewer(messageId, fileName) {
   }
 
   try {
-    const res = await fetch(`/api/messages/${messageId}/download?inline=1`);
+    const res = await fetch(`/api/messages/${messageId}/download?inline=1${attachmentQS ? "&" + attachmentQS : ""}`);
     if (!res.ok) throw new Error(`Le serveur a répondu ${res.status}`);
     const blob = await res.blob();
 
@@ -1125,11 +1130,12 @@ function closeDocumentViewer() {
 // bytes to a hidden <iframe> and print that frame's own rendering:
 // native for a PDF (the browser's built-in PDF viewer), and a plain
 // <img> wrapper for a picture.
-async function printCurrentDocument(messageId) {
+async function printCurrentDocument(messageId, attachmentId) {
   const frame = document.getElementById("print-frame");
+  const attachmentQS = attachmentId ? `&attachment=${attachmentId}` : "";
   try {
     if (viewerState.kind === "pdf") {
-      frame.src = `/api/messages/${messageId}/download?inline=1`;
+      frame.src = `/api/messages/${messageId}/download?inline=1${attachmentQS}`;
     } else if (viewerState.kind === "image" && viewerState.objectUrl) {
       frame.srcdoc = `<html><body style="margin:0"><img src="${viewerState.objectUrl}" ` +
                       `style="max-width:100%" onload="window.print()"></body></html>`;
@@ -1184,10 +1190,12 @@ function setupDocumentViewer() {
     await renderPdfPage();
   };
   document.getElementById("viewer-print-btn").onclick = () => {
-    // The currently open message id is stashed on the modal itself by
-    // openDocumentViewer (avoids a second global just for this).
-    const id = document.getElementById("viewer-modal").dataset.messageId;
-    if (id) printCurrentDocument(id);
+    // The currently open message id (and, for a multi-attachment
+    // message, which attachment) are stashed on the modal itself by
+    // openDocumentViewer (avoids two more globals just for this).
+    const modal = document.getElementById("viewer-modal");
+    const id = modal.dataset.messageId;
+    if (id) printCurrentDocument(id, modal.dataset.attachmentId);
   };
 }
 
@@ -1251,46 +1259,155 @@ async function loadDashboard() {
   if (state.lastKnownReceived === null) state.lastKnownReceived = data.total_received;
 
   const container = document.getElementById("recent-activity");
+  const toolbar = document.getElementById("dashboard-bulk-toolbar");
+
   if (!data.recent.length) {
     container.innerHTML = `<p class="empty-state">Aucune activité pour le moment.</p>`;
+    toolbar.classList.add("hidden");
     return;
   }
+  toolbar.classList.remove("hidden");
+
   container.innerHTML = data.recent.map(row => {
     const institution = row.direction === "sortant"
       ? (row.recipient_institution || "—")
       : (row.sender_institution || "—");
+    // v2.9.4: a quick inline Accusé button — only meaningful for a
+    // RECEIVED message not yet acknowledged; a sent message has nothing
+    // to accuse (that happens on the RECIPIENT's own Inbox). Already-
+    // accused received messages show the same "✅ accusé" badge as the
+    // Inbox tab, not a redundant button.
+    let ackControl = "";
+    if (row.direction === "entrant") {
+      ackControl = row.status === "accuse"
+        ? `<span class="list-row-badge">✅ accusé</span>`
+        : `<button class="row-btn ack" data-ack="${row.id}" title="Confirmer réception">✅ Accusé</button>`;
+    }
+    // v2.9.4: "📎 N" only appears for a message with more than one
+    // attachment — a single file keeps the plain 👁️/📥 pair exactly as
+    // before (no behavior change for the common case).
+    const attachmentBadge = row.attachment_count > 1
+      ? `<button class="row-btn" data-expand-attachments="${row.id}" title="Voir les ${row.attachment_count} pièces jointes">📎 ${row.attachment_count}</button>`
+      : "";
     return `
-    <div class="list-row">
+    <div class="list-row" data-row-id="${row.id}">
+      <input type="checkbox" class="row-select" data-row-id="${row.id}">
       <div class="list-row-main">
         <span class="list-row-title">${messageStatusDot(row)} ${row.direction === "sortant" ? "📤" : "📥"} ${escapeHtml(row.subject && row.subject.trim() ? row.subject : "Sans objet")}</span>
         <span class="list-row-sub">${escapeHtml(institution)} — ${escapeHtml(messageExcerpt(row))}</span>
         <span class="tracking-badge">${escapeHtml(row.tracking_number)}</span>
+        <div class="attachments-expand hidden" id="attachments-expand-${row.id}"></div>
       </div>
       <span class="list-row-badge">${escapeHtml(row.status)}</span>
       <div class="list-row-actions">
-        ${row.file_path ? `<button class="row-btn" data-preview="${row.id}" data-name="${escapeHtml(row.file_original_name || "")}" title="Aperçu">👁️</button>` : ""}
-        ${row.file_path ? `<button class="row-btn" data-download="${row.id}" title="Télécharger">📥</button>` : ""}
+        ${attachmentBadge}
+        ${row.attachment_count === 1 ? `<button class="row-btn" data-preview="${row.id}" data-name="${escapeHtml(row.file_original_name || "")}" title="Aperçu">👁️</button>` : ""}
+        ${row.attachment_count === 1 ? `<button class="row-btn" data-download="${row.id}" title="Télécharger">📥</button>` : ""}
+        ${ackControl}
         <button class="row-btn danger" data-delete="${row.id}" data-scope="dashboard" title="Supprimer">🗑️</button>
       </div>
     </div>
   `;
   }).join("");
   wireRowActions(container, loadDashboard);
+  wireAttachmentExpand(container);
+  setupDashboardBulkSelect(container);
+}
+
+// v2.9.4: a message with 2+ attachments shows one 📎 N badge; clicking it
+// fetches the real per-file list (/api/messages/<id>/attachments) and
+// reveals its own 👁️/📥 pair per file, inline under that row.
+function wireAttachmentExpand(container) {
+  container.querySelectorAll("[data-expand-attachments]").forEach(btn => {
+    btn.addEventListener("click", async () => {
+      const id = btn.dataset.expandAttachments;
+      const box = document.getElementById(`attachments-expand-${id}`);
+      if (!box.classList.contains("hidden")) {
+        box.classList.add("hidden");
+        return;
+      }
+      try {
+        const data = await fetch(`/api/messages/${id}/attachments`).then(r => parseJsonResponse(r));
+        box.innerHTML = data.attachments.map(a => `
+          <div class="attachment-row">
+            <span>📄 ${escapeHtml(a.file_original_name)}</span>
+            <button class="row-btn" data-preview="${id}" data-attachment="${a.attachment_id}"
+                    data-name="${escapeHtml(a.file_original_name)}" title="Aperçu">👁️</button>
+            <button class="row-btn" data-download="${id}" data-attachment="${a.attachment_id}" title="Télécharger">📥</button>
+          </div>
+        `).join("");
+        wireRowActions(box, null);  // each file's own 👁️/📥, same shared handlers as any other row
+        box.classList.remove("hidden");
+      } catch (err) {
+        showToast(`⛔ ${err.message}`, "error");
+      }
+    });
+  });
+}
+
+// v2.9.4: checkboxes + "Tout sélectionner" + grouped delete for Activité Récente.
+function setupDashboardBulkSelect(container) {
+  const selectAll = document.getElementById("dashboard-select-all");
+  const bulkBtn = document.getElementById("dashboard-bulk-delete-btn");
+  const countEl = document.getElementById("dashboard-selected-count");
+
+  function refreshBulkState() {
+    const checked = container.querySelectorAll(".row-select:checked").length;
+    countEl.textContent = checked;
+    bulkBtn.disabled = checked === 0;
+    const total = container.querySelectorAll(".row-select").length;
+    selectAll.checked = total > 0 && checked === total;
+    selectAll.indeterminate = checked > 0 && checked < total;
+  }
+
+  container.querySelectorAll(".row-select").forEach(cb => {
+    cb.addEventListener("change", refreshBulkState);
+  });
+  // .onclick= (not addEventListener) — loadDashboard() rebuilds this
+  // toolbar's siblings every refresh, but the toolbar itself is static
+  // HTML (see index.html) re-wired on every call; an assignment here
+  // avoids the same stacked-listener bug documented since v2.8.6.
+  selectAll.onclick = () => {
+    container.querySelectorAll(".row-select").forEach(cb => { cb.checked = selectAll.checked; });
+    refreshBulkState();
+  };
+  bulkBtn.onclick = async () => {
+    const ids = Array.from(container.querySelectorAll(".row-select:checked")).map(cb => cb.dataset.rowId);
+    if (!ids.length) return;
+    if (!confirm(`Supprimer définitivement ${ids.length} document(s) et leurs archives ?`)) return;
+    try {
+      const res = await fetch("/api/messages/bulk-delete", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ ids }),
+      });
+      const data = await parseJsonResponse(res);
+      if (!res.ok) throw new Error(data.error || "Échec de la suppression groupée.");
+      showToast(`🗑️ ${data.deleted} document(s) supprimé(s)`, "success");
+      loadDashboard();
+    } catch (err) {
+      showToast(`⛔ ${err.message}`, "error");
+    }
+  };
+  refreshBulkState();
 }
 
 // ------------------------------------------------------------------ //
 // Shared row actions — download, delete, accusé de réception
 // ------------------------------------------------------------------ //
 function wireRowActions(container, onChanged) {
+  // v2.9.4: an optional data-attachment picks WHICH file on a message
+  // with several (see wireAttachmentExpand) — absent for the common
+  // single-attachment case, so the URL is exactly what it always was.
   container.querySelectorAll("[data-preview]").forEach(btn => {
     btn.addEventListener("click", () => {
-      openDocumentViewer(btn.dataset.preview, btn.dataset.name || "document");
+      openDocumentViewer(btn.dataset.preview, btn.dataset.name || "document", btn.dataset.attachment);
     });
   });
 
   container.querySelectorAll("[data-download]").forEach(btn => {
     btn.addEventListener("click", () => {
-      window.open(`/api/messages/${btn.dataset.download}/download`, "_blank");
+      const qs = btn.dataset.attachment ? `?attachment=${btn.dataset.attachment}` : "";
+      window.open(`/api/messages/${btn.dataset.download}/download${qs}`, "_blank");
     });
   });
 
@@ -1489,14 +1606,63 @@ async function refreshSendServiceOptions() {
 }
 
 function resetMessagingForm() {
-  state.selectedFile = null;
+  state.selectedFiles = [];
   const fileInput = document.getElementById("file-input");
   if (fileInput) fileInput.value = "";
   const dropText = document.getElementById("drop-zone-text");
-  if (dropText) dropText.textContent = "📎 Glissez un fichier ici ou cliquez pour choisir";
+  if (dropText) dropText.textContent = "📎 Glissez un ou plusieurs fichiers ici ou cliquez pour choisir (PDF, Word, Images)";
+  renderSelectedFiles();
   const statusEl = document.getElementById("msg-send-status");
   if (statusEl) { statusEl.textContent = ""; statusEl.className = "status-line"; }
   resetSendServiceOptions();
+}
+
+// v2.9.4: renders the staged-files list under the drop zone, each with
+// its own ✖ to remove before sending, and keeps the drop-zone's own
+// summary text in sync ("3 fichiers sélectionnés" etc.).
+function renderSelectedFiles() {
+  const list = document.getElementById("selected-files-list");
+  const dropText = document.getElementById("drop-zone-text");
+  if (!list) return;
+
+  if (!state.selectedFiles.length) {
+    list.innerHTML = "";
+    if (dropText) dropText.textContent = "📎 Glissez un ou plusieurs fichiers ici ou cliquez pour choisir (PDF, Word, Images)";
+    return;
+  }
+
+  if (dropText) {
+    dropText.textContent = state.selectedFiles.length === 1
+      ? `📎 ${state.selectedFiles[0].name}`
+      : `📎 ${state.selectedFiles.length} fichiers sélectionnés`;
+  }
+  list.innerHTML = state.selectedFiles.map((f, idx) => `
+    <div class="selected-file-row">
+      <span class="selected-file-name">📄 ${escapeHtml(f.name)}</span>
+      <span class="selected-file-size">${formatBytes(f.size)}</span>
+      <button type="button" class="row-btn danger" data-remove-file="${idx}" title="Retirer ce fichier">✖</button>
+    </div>
+  `).join("");
+
+  list.querySelectorAll("[data-remove-file]").forEach(btn => {
+    btn.addEventListener("click", () => {
+      state.selectedFiles.splice(parseInt(btn.dataset.removeFile, 10), 1);
+      renderSelectedFiles();
+    });
+  });
+}
+
+// v2.9.4: normalizes (HEIC->JPEG where applicable) and appends newly
+// chosen/dropped files to the staged list, instead of replacing it —
+// this is what makes picking files in two steps (or a second drag)
+// additive rather than destructive.
+async function addFilesToSelection(fileList) {
+  const dropText = document.getElementById("drop-zone-text");
+  if (dropText) dropText.textContent = "📎 Préparation…";
+  for (const f of fileList) {
+    state.selectedFiles.push(await normalizeImageForUpload(f));
+  }
+  renderSelectedFiles();
 }
 
 function setupMessaging() {
@@ -1527,9 +1693,8 @@ function setupMessaging() {
   dropZone.addEventListener("click", () => fileInput.click());
   fileInput.addEventListener("change", async () => {
     if (fileInput.files.length) {
-      document.getElementById("drop-zone-text").textContent = "📎 Préparation…";
-      state.selectedFile = await normalizeImageForUpload(fileInput.files[0]);
-      document.getElementById("drop-zone-text").textContent = `📎 ${state.selectedFile.name}`;
+      await addFilesToSelection(fileInput.files);
+      fileInput.value = "";  // lets the SAME file be re-picked later (e.g. after removing it) — change wouldn't fire otherwise
     }
   });
   dropZone.addEventListener("dragover", e => { e.preventDefault(); dropZone.classList.add("dragover"); });
@@ -1538,9 +1703,7 @@ function setupMessaging() {
     e.preventDefault();
     dropZone.classList.remove("dragover");
     if (e.dataTransfer.files.length) {
-      document.getElementById("drop-zone-text").textContent = "📎 Préparation…";
-      state.selectedFile = await normalizeImageForUpload(e.dataTransfer.files[0]);
-      document.getElementById("drop-zone-text").textContent = `📎 ${state.selectedFile.name}`;
+      await addFilesToSelection(e.dataTransfer.files);
     }
   });
 
@@ -1550,8 +1713,8 @@ function setupMessaging() {
     statusEl.textContent = "";
 
     const recipient = document.getElementById("msg-recipient").value.trim();
-    if (!state.selectedFile) {
-      statusEl.textContent = "Veuillez sélectionner un fichier.";
+    if (!state.selectedFiles.length) {
+      statusEl.textContent = "Veuillez sélectionner au moins un fichier.";
       statusEl.classList.add("err");
       return;
     }
@@ -1562,7 +1725,7 @@ function setupMessaging() {
     }
 
     const formData = new FormData();
-    formData.append("file", state.selectedFile);
+    state.selectedFiles.forEach(f => formData.append("file", f));
     formData.append("recipient", recipient);
     formData.append("service", document.getElementById("msg-service").value || "SECRETARIAT_DIRECTION");
     formData.append("subject", document.getElementById("msg-subject").value.trim());
@@ -1621,24 +1784,32 @@ async function loadInbox() {
     container.innerHTML = `<p class="empty-state">Boîte de réception vide.</p>`;
     return;
   }
-  container.innerHTML = data.messages.map(row => `
+  container.innerHTML = data.messages.map(row => {
+    const attachmentBadge = row.attachment_count > 1
+      ? `<button class="row-btn" data-expand-attachments="${row.id}" title="Voir les ${row.attachment_count} pièces jointes">📎 ${row.attachment_count}</button>`
+      : "";
+    return `
     <div class="list-row">
       <div class="list-row-main">
         <span class="list-row-title">📥 ${escapeHtml(row.subject && row.subject.trim() ? row.subject : "Sans objet")}</span>
         <span class="list-row-sub">De : ${escapeHtml(row.sender_institution || "—")} — ${escapeHtml(messageExcerpt(row))}</span>
         <span class="tracking-badge">${escapeHtml(row.tracking_number)}</span>
+        <div class="attachments-expand hidden" id="attachments-expand-${row.id}"></div>
       </div>
       <div class="list-row-actions">
         ${row.status === "accuse"
           ? `<span class="list-row-badge">✅ accusé</span>`
           : `<button class="row-btn ack" data-ack="${row.id}" title="Confirmer réception">✅ Accusé</button>`}
-        ${row.file_path ? `<button class="row-btn" data-preview="${row.id}" data-name="${escapeHtml(row.file_original_name || "")}" title="Aperçu">👁️</button>` : ""}
-        ${row.file_path ? `<button class="row-btn" data-download="${row.id}" title="Télécharger">📥</button>` : ""}
+        ${attachmentBadge}
+        ${row.attachment_count === 1 ? `<button class="row-btn" data-preview="${row.id}" data-name="${escapeHtml(row.file_original_name || "")}" title="Aperçu">👁️</button>` : ""}
+        ${row.attachment_count === 1 ? `<button class="row-btn" data-download="${row.id}" title="Télécharger">📥</button>` : ""}
         <button class="row-btn danger" data-delete="${row.id}" title="Supprimer">🗑️</button>
       </div>
     </div>
-  `).join("");
+  `;
+  }).join("");
   wireRowActions(container, loadInbox);
+  wireAttachmentExpand(container);
 }
 
 // ------------------------------------------------------------------ //
@@ -1653,23 +1824,29 @@ async function loadRegistre(filter) {
   }
   container.innerHTML = data.entries.map(row => {
     const institution = row.recipient_institution || row.sender_institution || "—";
+    const attachmentBadge = row.attachment_count > 1
+      ? `<button class="row-btn" data-expand-attachments="${row.id}" title="Voir les ${row.attachment_count} pièces jointes">📎 ${row.attachment_count}</button>`
+      : "";
     return `
     <div class="list-row">
       <div class="list-row-main">
         <span class="list-row-title">${row.direction === "sortant" ? "📤" : "📥"} ${escapeHtml(row.subject && row.subject.trim() ? row.subject : "Sans objet")}</span>
         <span class="list-row-sub">${escapeHtml(institution)} — ${escapeHtml(messageExcerpt(row))}</span>
         <span class="tracking-badge">${escapeHtml(row.tracking_number)}</span>
+        <div class="attachments-expand hidden" id="attachments-expand-${row.id}"></div>
       </div>
       <span class="list-row-badge">${row.created_at.slice(0, 16).replace("T", " ")}</span>
       <div class="list-row-actions">
-        ${row.file_path ? `<button class="row-btn" data-preview="${row.id}" data-name="${escapeHtml(row.file_original_name || "")}" title="Aperçu">👁️</button>` : ""}
-        ${row.file_path ? `<button class="row-btn" data-download="${row.id}" title="Télécharger">📥</button>` : ""}
+        ${attachmentBadge}
+        ${row.attachment_count === 1 ? `<button class="row-btn" data-preview="${row.id}" data-name="${escapeHtml(row.file_original_name || "")}" title="Aperçu">👁️</button>` : ""}
+        ${row.attachment_count === 1 ? `<button class="row-btn" data-download="${row.id}" title="Télécharger">📥</button>` : ""}
         <button class="row-btn danger" data-delete="${row.id}" title="Supprimer">🗑️</button>
       </div>
     </div>
   `;
   }).join("");
   wireRowActions(container, () => loadRegistre(filter));
+  wireAttachmentExpand(container);
 }
 
 // ------------------------------------------------------------------ //

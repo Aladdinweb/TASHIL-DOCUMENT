@@ -2820,3 +2820,176 @@ ci-dessus.
 cette session, comme convenu ("dès que la v2.9.3 sera validée et
 déployée"). L'onglet ajouté ici est uniquement le point d'atterrissage
 côté PC, prêt à accueillir le futur `.apk`.
+
+---
+
+## 32. v2.9.4 — Sélection multiple & suppression groupée, pièces jointes multiples, icônes système déplacées (2026-10-06)
+
+⚠️ Cette version conserve intégralement le code et les fonctionnalités des
+v2.9.0 à v2.9.3 — rien n'a été retiré, uniquement ajusté ou ajouté.
+
+### 32.1 ☑️ Activité Récente — sélection multiple, suppression groupée, Accusé rapide
+
+- Case à cocher par ligne + "Tout sélectionner" (case à trois états :
+  cochée/décochée/indéterminée) + bouton "🗑️ Supprimer la sélection (N)"
+  dans l'en-tête de la section.
+- Nouvelle route `POST /api/messages/bulk-delete` (liste d'ids) : chaque
+  message est supprimé dans sa **propre** transaction `BEGIN IMMEDIATE`
+  courte (boucle sur le même mécanisme que la suppression unique), plutôt
+  qu'une seule grosse transaction qui tiendrait le verrou d'écriture
+  pendant toute la durée du lot — même principe de transactions courtes
+  et isolées que partout ailleurs dans ce fichier depuis la v2.9.0.
+  Rapporte `{deleted, not_found}` ; un identifiant déjà supprimé ou
+  invalide n'interrompt pas le reste du lot.
+- Bouton "✅ Accusé" ajouté directement sur chaque ligne de l'Activité
+  Récente pour un message **reçu** non encore accusé — réutilise
+  exactement le même point d'API que la Boîte de réception
+  (`wireRowActions`, déjà générique depuis la v2.8.x) ; un message déjà
+  accusé affiche le même badge "✅ accusé" qu'en Messagerie.
+
+**Testé réellement** : suppression groupée de 3 messages + 1 identifiant
+inexistant dans le même appel → `deleted: 3, not_found: 1` confirmé,
+fichiers **et** lignes `message_attachments` associées nettoyés sur
+disque et en base.
+
+### 32.2 📎 Pièces jointes multiples par message
+
+Changement d'architecture le plus substantiel de cette version — touche
+l'envoi, la livraison locale, le Cloud Bridge (push et import), la file
+d'attente de réessai, le téléchargement/aperçu et la suppression.
+
+**Schéma** : nouvelle table `message_attachments` (message_id, file_path,
+file_original_name, sort_order). Les colonnes historiques
+`messages.file_path`/`file_original_name` sont **conservées telles
+quelles** — tout message envoyé avant cette version continue de se lire
+exactement comme avant. Un nouveau message peuple ces deux colonnes avec
+les valeurs de son **premier** fichier (compatibilité avec tout ce qui
+lirait encore ces seules colonnes) et ajoute une ligne
+`message_attachments` par fichier, premier inclus. Une fonction unique,
+`get_message_attachments()`, résout les deux formes en une liste — aucune
+autre route n'a besoin de distinguer "ancien message / nouveau message"
+elle-même.
+
+**Envoi (`POST /api/messages/send`)** : `request.files.getlist("file")`
+remplace `.get("file")` — chaque fichier est validé (rejet si vide),
+archivé et chiffré individuellement avant toute écriture en base ; si
+l'un d'eux est invalide, l'envoi entier échoue proprement, rien n'est
+écrit partiellement.
+
+**Livraison locale** : chaque pièce jointe est copiée en clair (même
+limite de conception déjà documentée depuis la v2.7.0 — le destinataire
+est verrouillé, sa clé n'est pas disponible) dans le dossier du
+destinataire, avec une ligne `message_attachments` par fichier.
+
+**Cloud Bridge — push** (`push_to_bridge`) : la métadonnée JSON contient
+désormais une liste `attachments` (chemin + nom par fichier). Les
+**anciennes clés singulières** `attachment_path_in_repo`/
+`file_original_name` sont **toujours écrites en plus**, dupliquant les
+informations du premier fichier — pour qu'un établissement encore sur un
+build pré-v2.9.4, qui ne lit que ces deux clés, continue de recevoir au
+moins le premier fichier au lieu de rien silencieusement.
+
+**Cloud Bridge — import** (`run_bridge_poll`) : lit `meta["attachments"]`
+si présent, sinon retombe sur l'ancienne paire singulière (message poussé
+par un expéditeur pré-v2.9.4 ailleurs sur le réseau) — testé explicitement
+dans les deux cas. Un échec de téléchargement en cours de route (un
+fichier sur trois, par exemple) nettoie les fichiers déjà téléchargés
+localement et laisse l'entrée sur le Bridge pour un nouveau passage,
+plutôt que d'importer un message à pièces jointes incomplètes.
+
+**File d'attente de réessai** (`bridge_pending_push`) : le payload stocke
+désormais une liste `attachments` (chemin+nom par fichier) au lieu d'une
+paire singulière — repli sur l'ancienne forme si une entrée pré-v2.9.4
+se trouvait encore dans la file au moment d'une mise à jour.
+
+**Téléchargement/aperçu** : `GET /api/messages/<id>/download` accepte un
+paramètre `?attachment=<id>` optionnel — absent, il sert toujours le
+premier fichier (0), donc **tout lien existant continue de fonctionner à
+l'identique, sans aucun changement**. Nouvelle route
+`GET /api/messages/<id>/attachments` pour lister les pièces jointes d'un
+message. Le visualiseur intégré (v2.9.1) et le bouton Imprimer
+transmettent désormais cet identifiant de pièce jointe.
+
+**Suppression** : la logique de nettoyage (unique et groupée) passe par
+`get_message_attachments()` et supprime désormais **tous** les fichiers
+d'un message, pas uniquement l'ancienne colonne unique.
+
+**Interface** : un badge "📎 N" apparaît sur les lignes (Tableau de Bord,
+Messagerie, Registre) dès qu'un message a plus d'une pièce jointe ; un
+clic déplie la liste réelle (`/api/messages/<id>/attachments`) avec son
+propre 👁️/📥 par fichier. Une seule pièce jointe garde l'affichage
+d'origine (👁️/📥 directement sur la ligne), **aucun changement visuel
+pour le cas courant**. Le formulaire d'envoi (`<input type="file"
+multiple>`, zone de dépôt multi-fichiers) affiche une liste dynamique des
+fichiers en attente avec un ✖ par fichier pour le retirer avant envoi ;
+plusieurs sélections successives s'additionnent au lieu de se remplacer.
+
+**Testé réellement, cycle complet** :
+- Envoi de 2 fichiers avec livraison locale → confirmés présents et
+  corrects (en clair) côté destinataire, téléchargement par index
+  implicite (fichier 0) et explicite vérifié.
+- Envoi de 3 fichiers **via le Cloud Bridge** (faux serveur GitHub, deux
+  "appareils" distincts) → métadonnées confirmées avec la liste
+  `attachments` ET le repli singulier cohérent ; import côté
+  destinataire confirmé (3 fichiers présents, contenu déchiffré correct
+  vérifié sur le 2ᵉ fichier) ; **nettoyage Bridge confirmé complet**
+  (les 3 fichiers + le JSON de métadonnées disparaissent du dépôt après
+  import).
+- Import d'un message simulant un expéditeur **pré-v2.9.4** (ancien
+  format singulier, sans clé `attachments`) → toujours importé
+  correctement via le repli.
+
+### 32.3 🎛️ Icônes système déplacées vers le pied de la barre latérale
+
+Les boutons 🔄 Actualiser, 🌓 Thème et 🔒 Verrouiller quittent l'en-tête
+(`<header class="topbar">`) pour un nouveau bloc `.tabbar-footer` en bas
+de la barre latérale, juste au-dessus du copyright "© ILINE TECH BY FERAK
+ALADDIN" — qui a lui-même été déplacé du pied de `<main>` vers ce même
+bloc, pour que "juste au-dessus du copyright" ait un sens concret dans
+l'interface. `margin-top: auto` pousse ce bloc en bas de la sidebar en
+disposition desktop (colonne). Mêmes identifiants (`refresh-btn`,
+`theme-toggle`, `lock-btn`) qu'auparavant — **aucun câblage JavaScript
+à modifier**, le déplacement est purement DOM/CSS.
+
+Nouveaux effets de survol sur `.icon-btn` : légère élévation + teinte vers
+la couleur d'accent au survol, retour au clic, anneau de focus visible au
+clavier.
+
+⚠️ **Limite assumée, pas cachée** : sur la barre mobile en bas d'écran
+(disposition en ligne, <900px), ce même bloc reste affiché mais comme
+dernier élément de la rangée déroulante plutôt que distinctement ancré en
+bas — un compromis accepté plutôt qu'une réorganisation mobile séparée,
+non visuellement vérifié dans ce bac à sable sans navigateur réel.
+
+### 32.4 Régression
+
+Suite complète rejouée sur le code final v2.9.4, **tout confirmé
+fonctionnel ensemble** : collision SQLite (v2.8.1→), cycle Flask-SocketIO
++ faux GitHub + vrai client JS vendor, dédoublonnage/suppression/purge de
+l'annuaire (v2.9.1), Diagnostic & Santé (v2.9.1), suppression de profil
+verrouillé (v2.9.2), anti-doublon réseau à deux appareils (v2.9.3),
+Scanner APK (v2.9.3), et les quatre nouveaux scénarios multi-pièces-
+jointes + suppression groupée (v2.9.4) détaillés ci-dessus. `py_compile`
+sur `app.py`/`desktop_launcher.py`, `node --check` sur `app.js`,
+validation `tinycss2` sur `style.css` : aucune erreur.
+
+**Non testé dans ce bac à sable** (pas d'environnement graphique) : le
+rendu visuel réel du glisser-déposer multi-fichiers, les effets de survol
+CSS, et la disposition du pied de sidebar sur un vrai écran mobile étroit.
+
+**Fichiers modifiés :** `app.py` (table `message_attachments`,
+`get_message_attachments`, `attach_attachment_counts`, envoi/livraison/
+push/import/réessai/téléchargement/suppression tous étendus au
+multi-fichiers, route `bulk-delete`), `static/js/app.js`
+(sélection multiple + Accusé rapide sur Activité Récente, badge
+pièces jointes + expansion sur les 3 vues, formulaire d'envoi
+multi-fichiers avec liste dynamique), `templates/index.html` (icônes
+déplacées vers `.tabbar-footer`, copyright déplacé, toolbar de sélection,
+zone de dépôt multi-fichiers), `static/css/style.css` (icônes avec effets
+de survol, pied de sidebar, listes de pièces jointes/fichiers
+sélectionnés). Aucune dépendance Python ajoutée — aucun changement à
+`requirements.txt`/`tashil_web.spec`. Aucune fonctionnalité antérieure
+retirée — Flask-SocketIO, `BEGIN IMMEDIATE`, sondage Bridge avec ETag,
+annuaire, visualiseur PDF/image/docx, module Diagnostic, suppression de
+profil verrouillé, anti-doublon réseau (v2.9.0 à v2.9.3) tous confirmés
+intacts par la régression ci-dessus.

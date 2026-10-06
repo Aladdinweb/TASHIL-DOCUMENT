@@ -133,9 +133,6 @@
         <span class="brand-subtitle" id="institution-name">—</span>
       </div>
     </div>
-    <button id="refresh-btn" class="icon-btn" title="Actualiser">🔄</button>
-    <button id="theme-toggle" class="icon-btn" title="Changer le thème">🌓</button>
-    <button id="lock-btn" class="icon-btn" title="Verrouiller">🔒</button>
   </header>
 
   <nav class="tabbar" id="tabbar">
@@ -157,6 +154,21 @@
     <button class="tab" data-view="scanner">
       <span class="tab-icon">📱</span><span class="tab-label">TASHIL SCANNER</span>
     </button>
+
+    <!-- v2.9.4: moved here from .topbar — same 3 buttons, same ids, same
+         JS wiring (setupTopbarActions in app.js is untouched by this
+         move). margin-top:auto in the desktop sidebar (column) layout
+         pushes this to the bottom; on the mobile bottom bar (row layout)
+         it simply sits as the last scrollable item — see the CSS note
+         next to .tabbar-footer for the honest limit on that fallback. -->
+    <div class="tabbar-footer">
+      <div class="tabbar-icons">
+        <button id="refresh-btn" class="icon-btn" title="Actualiser">🔄</button>
+        <button id="theme-toggle" class="icon-btn" title="Changer le thème">🌓</button>
+        <button id="lock-btn" class="icon-btn" title="Verrouiller">🔒</button>
+      </div>
+      <p class="tabbar-copyright">© ILINE TECH BY FERAK ALADDIN</p>
+    </div>
   </nav>
 
   <main class="content">
@@ -181,7 +193,18 @@
           <span class="stat-label">En Attente</span>
         </div>
       </div>
-      <h3>Activité Récente</h3>
+      <div class="section-header-row">
+        <h3>Activité Récente</h3>
+        <!-- v2.9.4: hidden until there is at least one row — see renderDashboardRecent() -->
+        <div id="dashboard-bulk-toolbar" class="bulk-toolbar hidden">
+          <label class="bulk-select-all">
+            <input type="checkbox" id="dashboard-select-all"> Tout sélectionner
+          </label>
+          <button class="btn btn-danger" id="dashboard-bulk-delete-btn" disabled>
+            🗑️ Supprimer la sélection (<span id="dashboard-selected-count">0</span>)
+          </button>
+        </div>
+      </div>
       <div class="card list-card" id="recent-activity">
         <p class="empty-state">Aucune activité pour le moment.</p>
       </div>
@@ -199,9 +222,18 @@
       <div id="sub-envoi" class="subview active">
         <div class="card">
           <div class="drop-zone" id="drop-zone">
-            <span id="drop-zone-text">📎 Glissez un fichier ici ou cliquez pour choisir</span>
-            <input type="file" id="file-input" hidden>
+            <span id="drop-zone-text">📎 Glissez un ou plusieurs fichiers ici ou cliquez pour choisir (PDF, Word, Images)</span>
+            <!-- v2.9.4: multiple + an accept hint for the native file picker.
+                 accept is a UI hint only (drag-and-drop ignores it, and the
+                 backend itself never restricts by extension) — it narrows
+                 what the picker dialog shows without blocking anything
+                 TASHIL already accepts (xlsx registry exports, etc.). -->
+            <input type="file" id="file-input" hidden multiple
+                   accept=".pdf,.doc,.docx,.png,.jpg,.jpeg,.gif,.webp,.bmp">
           </div>
+          <!-- v2.9.4: dynamic list of files staged for this send, each with
+               its own ✖ to remove before sending — see renderSelectedFiles() -->
+          <div id="selected-files-list" class="selected-files-list"></div>
           <label>Institution destinataire</label>
           <input type="text" id="msg-recipient" list="institutions-list"
                  placeholder="Tapez pour rechercher (ex: EPH, Polyclinique...)" autocomplete="off">
@@ -448,10 +480,6 @@
         </div>
       </div>
     </section>
-
-    <footer class="app-footer">
-      <p>© ILINE TECH BY FERAK ALADDIN</p>
-    </footer>
 
   </main>
 </div>

@@ -869,8 +869,56 @@ def get_profile_db(institution_key: str) -> sqlite3.Connection:
             created_at TEXT NOT NULL
         )
     """)
+    # v2.9.4: multiple attachments per message. messages.file_path /
+    # file_original_name (the original, v1 columns) are LEFT AS-IS for
+    # backward compatibility — every message sent before this version
+    # keeps working exactly as before, read straight from those columns.
+    # A NEW message (this version onward) instead gets one row per
+    # attachment here, and its own messages.file_path/file_original_name
+    # are populated with the FIRST attachment's values too (so anything
+    # that still only reads the old single-file columns — an older build
+    # talking to this same database, a saved link — still shows at least
+    # that first file; the authoritative full list lives here).
+    # get_message_attachments() below is the one place that resolves
+    # either shape into a single list, so every other route only has to
+    # call that, never branch on "old vs new message" itself.
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS message_attachments (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            message_id INTEGER NOT NULL REFERENCES messages(id),
+            file_path TEXT NOT NULL,
+            file_original_name TEXT NOT NULL,
+            sort_order INTEGER NOT NULL DEFAULT 0
+        )
+    """)
     conn.commit()
     return conn
+
+
+def get_message_attachments(conn, message_row) -> list:
+    """
+    v2.9.4: returns this message's attachments as a list of
+    {"attachment_id", "file_path", "file_original_name"} dicts, in a
+    stable order — regardless of whether this message predates multi-
+    attachment support (falls back to its single legacy file_path/
+    file_original_name columns, attachment_id 0) or was sent with
+    several files (reads message_attachments, real row ids). Every route
+    that touches attachments (download, preview, delete, Cloud Bridge
+    push/pull) goes through this one function rather than re-deriving
+    "old vs new message" logic itself.
+    """
+    rows = conn.execute(
+        "SELECT id, file_path, file_original_name FROM message_attachments "
+        "WHERE message_id = ? ORDER BY sort_order ASC, id ASC",
+        (message_row["id"],)
+    ).fetchall()
+    if rows:
+        return [{"attachment_id": r["id"], "file_path": r["file_path"],
+                  "file_original_name": r["file_original_name"]} for r in rows]
+    if message_row["file_path"]:
+        return [{"attachment_id": 0, "file_path": message_row["file_path"],
+                  "file_original_name": message_row["file_original_name"] or "document"}]
+    return []
 
 
 @contextmanager
@@ -1118,13 +1166,46 @@ def bridge_slug(institution_name: str, role: str = None) -> str:
 
 def push_to_bridge(cfg: dict, recipient_name: str, recipient_role: str, sender_name: str,
                     sender_institution_key: str, subject: str,
-                    body: str, tracking: str, file_bytes: bytes, original_filename: str) -> bool:
+                    body: str, tracking: str, attachments: list) -> bool:
+    """
+    v2.9.4: `attachments` is a list of {"bytes": bytes, "original_filename": str}
+    — one or more. The metadata's new "attachments" key (a list of
+    {"path_in_repo", "file_original_name"}) replaces the old singular
+    "attachment_path_in_repo"/"file_original_name" pair. The OLD singular
+    keys are ALSO still written, duplicating the first attachment's
+    entry — so an institution still running a pre-v2.9.4 build, which
+    only ever reads those two old keys, keeps receiving at least the
+    first file exactly as before instead of silently getting nothing;
+    only a v2.9.4+ importer reads the fuller "attachments" list.
+    """
     owner, repo, token = cfg["github_owner"], cfg["github_repo"], cfg["github_token"]
     key = bridge_slug(recipient_name, recipient_role)
-
-    file_ext = os.path.splitext(original_filename)[1]
-    attachment_repo_path = f"bridge/{key}/{tracking}{file_ext}"
     meta_repo_path = f"bridge/{key}/{tracking}.json"
+
+    attachment_entries = []
+    all_files_ok = True
+    for idx, att in enumerate(attachments):
+        file_ext = os.path.splitext(att["original_filename"])[1]
+        suffix = "" if idx == 0 else f"_{idx}"
+        attachment_repo_path = f"bridge/{key}/{tracking}{suffix}{file_ext}"
+        # att["bytes"] are the ORIGINAL plaintext (see api_send_message) —
+        # never the sender's own encrypted archive copy, which only the
+        # sender's key could ever open. The Cloud Bridge itself provides
+        # no encryption of its own (see the module-level security note
+        # above); the recipient applies its own encryption independently
+        # when it later imports this.
+        file_b64 = base64.b64encode(att["bytes"]).decode("utf-8")
+        status_file, _ = _github_request(
+            "PUT", f"/repos/{owner}/{repo}/contents/{attachment_repo_path}", token,
+            {"message": f"TASHIL bridge: {tracking} (attachment {idx + 1}/{len(attachments)})",
+             "content": file_b64}
+        )
+        if status_file not in (200, 201):
+            all_files_ok = False
+        attachment_entries.append({
+            "path_in_repo": attachment_repo_path,
+            "file_original_name": att["original_filename"],
+        })
 
     meta = {
         "tracking_number": tracking,
@@ -1134,18 +1215,13 @@ def push_to_bridge(cfg: dict, recipient_name: str, recipient_role: str, sender_n
         "recipient_role": recipient_role,
         "subject": subject,
         "body": body,
-        "file_original_name": original_filename,
-        "attachment_path_in_repo": attachment_repo_path,
+        "attachments": attachment_entries,
+        # Back-compat duplicates for any pre-v2.9.4 importer still reading
+        # the old singular keys — see docstring above.
+        "file_original_name": attachment_entries[0]["file_original_name"],
+        "attachment_path_in_repo": attachment_entries[0]["path_in_repo"],
         "created_at": datetime.now().isoformat(),
     }
-
-    # file_bytes are the ORIGINAL plaintext (see api_send_message) — never
-    # the sender's own encrypted archive copy, which only the sender's key
-    # could ever open. The Cloud Bridge itself provides no encryption of
-    # its own (see the module-level security note above); the recipient
-    # applies its own encryption independently when it later imports this.
-    file_b64 = base64.b64encode(file_bytes).decode("utf-8")
-
     meta_b64 = base64.b64encode(
         json.dumps(meta, ensure_ascii=False, indent=2).encode("utf-8")
     ).decode("utf-8")
@@ -1154,11 +1230,7 @@ def push_to_bridge(cfg: dict, recipient_name: str, recipient_role: str, sender_n
         "PUT", f"/repos/{owner}/{repo}/contents/{meta_repo_path}", token,
         {"message": f"TASHIL bridge: {tracking} (metadata)", "content": meta_b64}
     )
-    status_file, _ = _github_request(
-        "PUT", f"/repos/{owner}/{repo}/contents/{attachment_repo_path}", token,
-        {"message": f"TASHIL bridge: {tracking} (attachment)", "content": file_b64}
-    )
-    return status_meta in (200, 201) and status_file in (200, 201)
+    return status_meta in (200, 201) and all_files_ok
 
 
 def get_lan_ip() -> str:
@@ -1344,6 +1416,28 @@ def decrypt_message_row(row: dict) -> dict:
     row["subject"] = decrypt_text(row.get("subject") or "")
     row["body"] = decrypt_text(row.get("body") or "")
     return row
+
+
+def attach_attachment_counts(conn, rows: list) -> list:
+    """
+    v2.9.4: adds an "attachment_count" field to each message dict, so the
+    dashboard/inbox/registre lists can show "📎 N fichiers" and expand to
+    the full list only when there's more than one — without every list
+    endpoint re-deriving "old vs new message" logic itself (that's
+    get_message_attachments()'s job; this is the lightweight COUNT-only
+    sibling for list views, which never need the full file list).
+    """
+    if not rows:
+        return rows
+    ids = [r["id"] for r in rows]
+    placeholders = ",".join("?" * len(ids))
+    counted = {r["message_id"]: r["c"] for r in conn.execute(
+        f"SELECT message_id, COUNT(*) c FROM message_attachments "
+        f"WHERE message_id IN ({placeholders}) GROUP BY message_id", ids
+    ).fetchall()}
+    for row in rows:
+        row["attachment_count"] = counted.get(row["id"], 1 if row.get("file_path") else 0)
+    return rows
 
 
 # --------------------------------------------------------------------------- #
@@ -1912,7 +2006,7 @@ def api_dashboard():
             "SELECT COUNT(*) c FROM messages WHERE direction='sortant' AND status != 'accuse'"
         ).fetchone()["c"]
         recent = conn.execute("SELECT * FROM messages ORDER BY created_at DESC LIMIT 15").fetchall()
-        recent = [decrypt_message_row(r) for r in recent]
+        recent = attach_attachment_counts(conn, [decrypt_message_row(r) for r in recent])
 
     return jsonify({
         "total_sent": sent,
@@ -1935,7 +2029,7 @@ def api_list_messages():
             "SELECT * FROM messages WHERE direction = ? ORDER BY created_at DESC",
             (direction,)
         ).fetchall()
-        rows = [decrypt_message_row(r) for r in rows]
+        rows = attach_attachment_counts(conn, [decrypt_message_row(r) for r in rows])
 
     # v2.8.4: consulting the inbox marks its unread entrant messages as
     # read — this is what actually clears the desktop system-tray badge
@@ -1981,54 +2075,67 @@ def api_send_message():
     recipient_role = (request.form.get("service", "") or "").strip().upper() or DEFAULT_ROLE
     subject = request.form.get("subject", "").strip()
     body = request.form.get("body", "").strip()
-    file = request.files.get("file")
+    # v2.9.4: multiple attachments — getlist("file") returns every file
+    # under that field name; the frontend's <input multiple> appends them
+    # all under the same "file" key, exactly like a single-file form did
+    # before, so this is backward compatible with that older form too
+    # (one file -> a list of one).
+    uploaded_files = [f for f in request.files.getlist("file") if f and f.filename]
 
     if not recipient:
         return jsonify({"error": "Institution destinataire requise."}), 400
-    if not file or file.filename == "":
-        return jsonify({"error": "Un fichier est requis."}), 400
+    if not uploaded_files:
+        return jsonify({"error": "Au moins un fichier est requis."}), 400
 
     profile = get_profile_row(_active_key)
     sender = profile["institution_name"] if profile else "TASHIL"
     paths = profile_paths(_active_key)
 
-    # Read the original plaintext bytes ONCE. Only the SENDER's own
-    # archived copy gets encrypted below, with the sender's own key — any
-    # copy handed to a different security domain (local delivery, Cloud
-    # Bridge) must use these original bytes, never the sender's encrypted
-    # file, which a recipient has no way to decrypt (different key/PIN).
-    original_bytes = file.read()
-
-    # v2.8.3: reject a genuinely empty upload outright rather than
-    # silently archiving a 0-byte file that would later show as
-    # "corrupted" with no indication of why. This can't catch every
-    # possible network-level truncation (the server only ever sees what
-    # actually arrived), but an empty body specifically — an interrupted
-    # or failed upload — is easy to detect and worth failing loudly.
-    if not original_bytes:
-        return jsonify({"error": "Le fichier reçu est vide (0 octet) — "
-                                  "l'envoi a probablement été interrompu. Réessayez."}), 400
-
-    # v2.8.3: correct the filename's extension to match the file's REAL
-    # bytes (magic-byte signature) rather than blindly trusting whatever
-    # extension the client sent — see sniff_real_extension() docstring.
-    # This is a safety net, not the actual HEIC fix (that's the
-    # frontend's job, see static/js/app.js normalizeImageForUpload) —
-    # it only prevents a mislabeled file from reaching a recipient under
-    # a name that lies about what format it actually is.
-    original_filename = file.filename or "document"
-    name_root, current_ext = os.path.splitext(original_filename)
-    real_ext = sniff_real_extension(original_bytes, current_ext.lower())
-    if real_ext != current_ext.lower():
-        original_filename = f"{name_root}{real_ext}"
-
+    # v2.9.4: archive + validate EVERY file first, before touching the
+    # database at all — if any one of them is empty/invalid, the whole
+    # send fails cleanly with nothing partially written, same spirit as
+    # the single-file v2.8.3 empty-upload check this replaces.
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     tag = sanitize(sender).replace(" ", "")[:30]
-    safe_name = sanitize(secure_filename(original_filename) or "document")
-    archived_name = f"{ts}_{tag}_{safe_name}"
-    archived_path = os.path.join(paths["sortant"], archived_name)
-    with open(archived_path, "wb") as f:
-        f.write(encrypt_file_bytes(original_bytes))
+    archived_attachments = []  # [{"original_filename", "archived_path", "bytes"}, ...]
+    for idx, file in enumerate(uploaded_files):
+        # Read the original plaintext bytes ONCE. Only the SENDER's own
+        # archived copy gets encrypted below, with the sender's own key —
+        # any copy handed to a different security domain (local delivery,
+        # Cloud Bridge) must use these original bytes, never the sender's
+        # encrypted file, which a recipient has no way to decrypt
+        # (different key/PIN).
+        original_bytes = file.read()
+        if not original_bytes:
+            return jsonify({"error": f"Le fichier « {file.filename} » est vide (0 octet) — "
+                                      f"l'envoi a probablement été interrompu. Réessayez."}), 400
+
+        # v2.8.3: correct the filename's extension to match the file's
+        # REAL bytes (magic-byte signature) rather than blindly trusting
+        # whatever extension the client sent — see sniff_real_extension()
+        # docstring. Safety net only, not the HEIC fix itself (frontend's
+        # job, see normalizeImageForUpload) — just prevents a mislabeled
+        # file from reaching a recipient under a name that lies about its
+        # real format.
+        original_filename = file.filename or "document"
+        name_root, current_ext = os.path.splitext(original_filename)
+        real_ext = sniff_real_extension(original_bytes, current_ext.lower())
+        if real_ext != current_ext.lower():
+            original_filename = f"{name_root}{real_ext}"
+
+        safe_name = sanitize(secure_filename(original_filename) or "document")
+        # idx suffix keeps archived filenames distinct when several
+        # attachments in the same message happen to share a name.
+        archived_name = f"{ts}_{tag}_{idx}_{safe_name}" if idx else f"{ts}_{tag}_{safe_name}"
+        archived_path = os.path.join(paths["sortant"], archived_name)
+        with open(archived_path, "wb") as f:
+            f.write(encrypt_file_bytes(original_bytes))
+
+        archived_attachments.append({
+            "original_filename": original_filename,
+            "archived_path": archived_path,
+            "bytes": original_bytes,
+        })
 
     # Short, isolated connection: open, write, commit, close — never held
     # open across the network calls (local-delivery file copy, Cloud
@@ -2037,6 +2144,7 @@ def api_send_message():
     # never happen while a SQLite write transaction is still open,
     # because that's exactly the window where the background Cloud
     # Bridge poll (or heartbeat) can collide with it.
+    first = archived_attachments[0]
     with profile_db(_active_key) as conn:
         conn.execute("BEGIN IMMEDIATE")  # v2.9.0: SELECT (tracking) then INSERT -> take the write lock first
         # v2.8.2: defense in depth on top of next_tracking_number()'s own
@@ -2047,18 +2155,28 @@ def api_send_message():
         for attempt in range(3):
             tracking = next_tracking_number(conn, "sortant", _active_key)
             try:
-                conn.execute("""
+                cur = conn.execute("""
                     INSERT INTO messages (direction, tracking_number, sender_institution,
                                            recipient_institution, subject, body, file_path,
                                            file_original_name, status, delivery_method, created_at)
                     VALUES ('sortant', ?, ?, ?, ?, ?, ?, ?, 'envoye', NULL, ?)
                 """, (tracking, sender, recipient, encrypt_text(subject), encrypt_text(body),
-                      archived_path, original_filename, datetime.now().isoformat()))
+                      first["archived_path"], first["original_filename"], datetime.now().isoformat()))
                 break
             except sqlite3.IntegrityError:
                 if attempt == 2:
                     raise
                 continue
+        # v2.9.4: one message_attachments row per file, INCLUDING the
+        # first — see get_message_attachments()'s docstring on why the
+        # legacy messages.file_path column above only ever mirrors it.
+        new_message_id = cur.lastrowid
+        for order, att in enumerate(archived_attachments):
+            conn.execute(
+                "INSERT INTO message_attachments (message_id, file_path, file_original_name, sort_order) "
+                "VALUES (?, ?, ?, ?)",
+                (new_message_id, att["archived_path"], att["original_filename"], order)
+            )
 
     # --------------------------------------------------------------- #
     # Local delivery: if the recipient happens to be another profile
@@ -2073,40 +2191,67 @@ def api_send_message():
         try:
             recipient_key = recipient_profile["institution_key"]
             recipient_paths = profile_paths(recipient_key)
-            recipient_archived_path = os.path.join(recipient_paths["entrant"], archived_name)
-            # Plaintext, deliberately — see the encryption scope limitation
+
+            # v2.9.4: copy EVERY attachment's original (plaintext) bytes
+            # into the recipient's own archive folder. Plaintext,
+            # deliberately — see the encryption scope limitation
             # documented above set_active_session(): we don't have the
             # recipient's PIN/key at this point (they're locked), so we
-            # cannot encrypt on their behalf. This writes the ORIGINAL
-            # bytes, never the sender's encrypted copy (which only the
-            # sender's own key could ever open).
-            with open(recipient_archived_path, "wb") as f:
-                f.write(original_bytes)
+            # cannot encrypt on their behalf.
+            recipient_attachments = []
+            for att in archived_attachments:
+                recipient_archived_path = os.path.join(
+                    recipient_paths["entrant"], os.path.basename(att["archived_path"]))
+                with open(recipient_archived_path, "wb") as f:
+                    f.write(att["bytes"])
+                recipient_attachments.append({
+                    "archived_path": recipient_archived_path,
+                    "original_filename": att["original_filename"],
+                })
+            recipient_first = recipient_attachments[0]
 
             recipient_tracking = tracking
             try:
                 with profile_db(recipient_key) as recipient_conn:
-                    recipient_conn.execute("""
+                    recipient_conn.execute("BEGIN IMMEDIATE")
+                    rcur = recipient_conn.execute("""
                         INSERT INTO messages (direction, tracking_number, sender_institution,
                                                recipient_institution, subject, body, file_path,
                                                file_original_name, status, delivery_method, is_read,
                                                sender_institution_key, created_at)
                         VALUES ('entrant', ?, ?, ?, ?, ?, ?, ?, 'envoye', 'local', 0, ?, ?)
                     """, (recipient_tracking, sender, recipient, subject, body,
-                          recipient_archived_path, original_filename, _active_key, datetime.now().isoformat()))
+                          recipient_first["archived_path"], recipient_first["original_filename"],
+                          _active_key, datetime.now().isoformat()))
+                    recipient_message_id = rcur.lastrowid
+                    for order, att in enumerate(recipient_attachments):
+                        recipient_conn.execute(
+                            "INSERT INTO message_attachments (message_id, file_path, file_original_name, sort_order) "
+                            "VALUES (?, ?, ?, ?)",
+                            (recipient_message_id, att["archived_path"], att["original_filename"], order)
+                        )
             except sqlite3.IntegrityError:
                 # Extremely rare tracking-number collision across two
                 # independent institution databases — disambiguate and retry.
                 recipient_tracking = f"{tracking}-{uuid.uuid4().hex[:4].upper()}"
                 with profile_db(recipient_key) as recipient_conn:
-                    recipient_conn.execute("""
+                    recipient_conn.execute("BEGIN IMMEDIATE")
+                    rcur = recipient_conn.execute("""
                         INSERT INTO messages (direction, tracking_number, sender_institution,
                                                recipient_institution, subject, body, file_path,
                                                file_original_name, status, delivery_method, is_read,
                                                sender_institution_key, created_at)
                         VALUES ('entrant', ?, ?, ?, ?, ?, ?, ?, 'envoye', 'local', 0, ?, ?)
                     """, (recipient_tracking, sender, recipient, subject, body,
-                          recipient_archived_path, original_filename, _active_key, datetime.now().isoformat()))
+                          recipient_first["archived_path"], recipient_first["original_filename"],
+                          _active_key, datetime.now().isoformat()))
+                    recipient_message_id = rcur.lastrowid
+                    for order, att in enumerate(recipient_attachments):
+                        recipient_conn.execute(
+                            "INSERT INTO message_attachments (message_id, file_path, file_original_name, sort_order) "
+                            "VALUES (?, ?, ?, ?)",
+                            (recipient_message_id, att["archived_path"], att["original_filename"], order)
+                        )
             delivered_locally = True
         except Exception:
             # Never fail the whole send just because local delivery hit an
@@ -2129,7 +2274,8 @@ def api_send_message():
             try:
                 delivered_via_bridge = push_to_bridge(
                     bridge_cfg, recipient, recipient_role, sender, _active_key, subject, body,
-                    tracking, original_bytes, original_filename
+                    tracking, [{"bytes": att["bytes"], "original_filename": att["original_filename"]}
+                               for att in archived_attachments]
                 )
             except Exception:
                 delivered_via_bridge = False
@@ -2139,9 +2285,12 @@ def api_send_message():
                 # failures no longer leave this document permanently
                 # stuck "En attente" with no further attempt — it's
                 # queued for automatic retry on the next poll cycle
-                # (~20s later), reading the archived file fresh from
-                # disk at retry time rather than duplicating its bytes
-                # into the queue now.
+                # (~20s later), reading the archived file(s) fresh from
+                # disk at retry time rather than duplicating their bytes
+                # into the queue now. v2.9.4: "attachments" (plural, a
+                # list of {file_path, file_original_name}) replaces the
+                # old singular file_path/file_original_name pair —
+                # _retry_pending_message_push() reads this new shape.
                 with profile_db(_active_key) as queue_conn:
                     _queue_pending_push(queue_conn, "message", {
                         "recipient": recipient,
@@ -2151,8 +2300,9 @@ def api_send_message():
                         "subject": subject,
                         "body": body,
                         "tracking": tracking,
-                        "file_path": archived_path,
-                        "file_original_name": original_filename,
+                        "attachments": [{"file_path": att["archived_path"],
+                                          "file_original_name": att["original_filename"]}
+                                         for att in archived_attachments],
                     })
 
     delivery_method = "local" if delivered_locally else ("bridge" if delivered_via_bridge else None)
@@ -2177,7 +2327,22 @@ def api_download_message(message_id):
         return locked_response()
     with profile_db(_active_key, commit=False) as conn:
         row = conn.execute("SELECT * FROM messages WHERE id = ?", (message_id,)).fetchone()
-    if row is None or not row["file_path"] or not os.path.exists(row["file_path"]):
+        if row is None:
+            abort(404)
+        attachments = get_message_attachments(conn, row)
+
+    # v2.9.4: ?attachment=<id> picks WHICH file, for a message with
+    # several — attachment_id 0 is always either the legacy single-file
+    # column (old messages) or the first upload (new messages), so an
+    # OLD link/bookmark with no ?attachment= at all keeps working exactly
+    # as before, unchanged.
+    requested_id = request.args.get("attachment", type=int, default=None)
+    chosen = None
+    for att in attachments:
+        if requested_id is None or att["attachment_id"] == requested_id:
+            chosen = att
+            break
+    if chosen is None or not os.path.exists(chosen["file_path"]):
         abort(404)
 
     # decrypt_file_bytes is safe to call unconditionally: files written by
@@ -2186,19 +2351,38 @@ def api_download_message(message_id):
     # raises InvalidToken, which decrypt_file_bytes catches and returns
     # the original bytes unchanged. The ciphertext format itself is the
     # only "is this encrypted" flag needed — no separate per-file marker.
-    with open(row["file_path"], "rb") as f:
+    with open(chosen["file_path"], "rb") as f:
         raw = f.read()
     plaintext = decrypt_file_bytes(raw)
 
     # v2.9.1: ?inline=1 serves the SAME bytes for the in-app preview modal
-    # (PDF.js / <img>) instead of forcing a download — same decryption,
-    # same access check, just a different Content-Disposition and a real
-    # mimetype guess so the browser renders it instead of saving it.
+    # (PDF.js / mammoth.js / <img>) instead of forcing a download — same
+    # decryption, same access check, just a different Content-Disposition
+    # and a real mimetype guess so the browser renders it instead of
+    # saving it.
     inline = request.args.get("inline") == "1"
-    guessed_type, _ = mimetypes.guess_type(row["file_original_name"] or "")
+    guessed_type, _ = mimetypes.guess_type(chosen["file_original_name"] or "")
     return send_file(BytesIO(plaintext), as_attachment=not inline,
-                      download_name=row["file_original_name"] or "document",
+                      download_name=chosen["file_original_name"] or "document",
                       mimetype=guessed_type if inline else None)
+
+
+@app.route("/api/messages/<int:message_id>/attachments", methods=["GET"])
+def api_message_attachments(message_id):
+    """v2.9.4: lists a message's attachments (id + filename), so the
+    frontend can render one 👁️/📥 pair per file instead of assuming
+    there is exactly one."""
+    if _active_key is None:
+        return locked_response()
+    with profile_db(_active_key, commit=False) as conn:
+        row = conn.execute("SELECT * FROM messages WHERE id = ?", (message_id,)).fetchone()
+        if row is None:
+            return jsonify({"error": "Message introuvable."}), 404
+        attachments = get_message_attachments(conn, row)
+    return jsonify({"attachments": [
+        {"attachment_id": a["attachment_id"], "file_original_name": a["file_original_name"]}
+        for a in attachments
+    ]})
 
 
 @app.route("/api/messages/<int:message_id>/status", methods=["POST"])
@@ -2321,26 +2505,72 @@ def push_receipt_to_bridge(cfg: dict, sender_name: str, sender_key: str, trackin
     return status in (200, 201)
 
 
+def _delete_message_and_files(conn, message_id: int) -> bool:
+    """Shared by the single and bulk delete routes below. Must be called
+    with `conn` already inside a BEGIN IMMEDIATE transaction on the
+    caller's own connection. v2.9.4: cleans up EVERY attachment (via
+    get_message_attachments — old single-file messages included, not
+    just rows that have message_attachments entries), not only a single
+    legacy file_path. Returns False if the message doesn't exist."""
+    row = conn.execute("SELECT * FROM messages WHERE id = ?", (message_id,)).fetchone()
+    if row is None:
+        return False
+    attachments = get_message_attachments(conn, row)
+    conn.execute("DELETE FROM message_attachments WHERE message_id = ?", (message_id,))
+    conn.execute("DELETE FROM messages WHERE id = ?", (message_id,))
+    for att in attachments:
+        if att["file_path"] and os.path.exists(att["file_path"]):
+            try:
+                os.remove(att["file_path"])
+            except OSError:
+                pass  # DB record is already gone; a leftover file is not fatal
+    return True
+
+
 @app.route("/api/messages/<int:message_id>", methods=["DELETE"])
 def api_delete_message(message_id):
     if _active_key is None:
         return locked_response()
     with profile_db(_active_key) as conn:
         conn.execute("BEGIN IMMEDIATE")  # v2.9.0: SELECT then DELETE
-        row = conn.execute("SELECT * FROM messages WHERE id = ?", (message_id,)).fetchone()
-        if row is None:
+        if not _delete_message_and_files(conn, message_id):
             return jsonify({"error": "Message introuvable."}), 404
-
-        file_path = row["file_path"]
-        conn.execute("DELETE FROM messages WHERE id = ?", (message_id,))
-
-    if file_path and os.path.exists(file_path):
-        try:
-            os.remove(file_path)
-        except OSError:
-            pass  # DB record is already gone; a leftover file is not fatal
-
     return jsonify({"ok": True})
+
+
+@app.route("/api/messages/bulk-delete", methods=["POST"])
+def api_bulk_delete_messages():
+    """
+    v2.9.4: Activité Récente's multi-select "Supprimer la sélection".
+    Each message is deleted in its OWN short BEGIN IMMEDIATE transaction
+    (looping this route's own single-delete helper) rather than one giant
+    transaction holding the write lock for the whole batch — same
+    short-transaction principle as everywhere else in this file, so a
+    large selection never blocks the background Cloud Bridge loop (or a
+    concurrent send) for longer than one row at a time.
+    """
+    if _active_key is None:
+        return locked_response()
+    data = request.get_json(force=True)
+    ids = data.get("ids", [])
+    if not isinstance(ids, list) or not ids:
+        return jsonify({"error": "Aucun document sélectionné."}), 400
+
+    deleted, not_found = 0, 0
+    for message_id in ids:
+        try:
+            message_id = int(message_id)
+        except (TypeError, ValueError):
+            not_found += 1
+            continue
+        with profile_db(_active_key) as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            if _delete_message_and_files(conn, message_id):
+                deleted += 1
+            else:
+                not_found += 1
+
+    return jsonify({"ok": True, "deleted": deleted, "not_found": not_found})
 
 
 # --------------------------------------------------------------------------- #
@@ -2359,7 +2589,7 @@ def api_registre():
                 "SELECT * FROM messages WHERE direction = ? ORDER BY created_at DESC",
                 (direction,)
             ).fetchall()
-        rows = [decrypt_message_row(r) for r in rows]
+        rows = attach_attachment_counts(conn, [decrypt_message_row(r) for r in rows])
     return jsonify({"entries": rows})
 
 
@@ -2703,24 +2933,34 @@ def _flush_pending_pushes(key: str, owner: str, repo: str, token: str) -> int:
 
 def _retry_pending_message_push(payload: dict, owner: str, repo: str, token: str, key: str) -> bool:
     """
-    Rebuilds and retries a queued message send. Reads the archived file
+    Rebuilds and retries a queued message send. Reads each archived file
     fresh from disk (no duplicated bytes in the queue) and decrypts it with
     the active session key — this only ever runs while that same profile is
     unlocked. v2.9.0: the delivery_method update goes through _db_write on
     the profile `key` (no second connection racing the caller's).
+    v2.9.4: payload["attachments"] (a list) replaces the old singular
+    payload["file_path"]/["file_original_name"] pair — the old shape is
+    still read as a one-item fallback, in case a queue entry written by a
+    pre-v2.9.4 build is still sitting here across an upgrade.
     """
-    try:
-        with open(payload["file_path"], "rb") as f:
-            raw = f.read()
-        file_bytes = decrypt_file_bytes(raw)
-    except OSError:
-        return False  # archived file missing/moved — nothing to retry with
+    attachment_specs = payload.get("attachments") or [
+        {"file_path": payload["file_path"], "file_original_name": payload["file_original_name"]}
+    ]
+    attachments = []
+    for spec in attachment_specs:
+        try:
+            with open(spec["file_path"], "rb") as f:
+                raw = f.read()
+            attachments.append({"bytes": decrypt_file_bytes(raw),
+                                 "original_filename": spec["file_original_name"]})
+        except OSError:
+            return False  # one archived file missing/moved — nothing complete to retry with
 
     cfg = {"github_owner": owner, "github_repo": repo, "github_token": token}
     success = push_to_bridge(
         cfg, payload["recipient"], payload["recipient_role"], payload["sender"],
         payload.get("sender_institution_key"), payload["subject"], payload["body"],
-        payload["tracking"], file_bytes, payload["file_original_name"]
+        payload["tracking"], attachments
     )
     if success:
         _db_write(key, "UPDATE messages SET delivery_method = 'bridge' WHERE tracking_number = ?",
@@ -3328,28 +3568,69 @@ def _run_bridge_poll_locked(notify: bool) -> dict:
         if already_have:
             continue  # imported earlier; leftover cleanup is handled by the pending-cleanup queue
 
-        attach_status, attach_content = _github_request(
-            "GET", f"/repos/{owner}/{repo}/contents/{meta['attachment_path_in_repo']}", token)
-        if attach_status != 200 or "content" not in attach_content:
-            continue
-        file_bytes = base64.b64decode(attach_content["content"])
+        # v2.9.4: meta["attachments"] (a list of {path_in_repo,
+        # file_original_name}) replaces the old singular
+        # attachment_path_in_repo/file_original_name pair. A message
+        # pushed by a PRE-v2.9.4 sender elsewhere on the network won't
+        # have that key at all — push_to_bridge() on THIS build always
+        # writes both for exactly this reason, but a peer still running
+        # an older build only ever wrote the old singular pair, so this
+        # falls back to treating that as a one-item list.
+        attachment_specs = meta.get("attachments") or (
+            [{"path_in_repo": meta["attachment_path_in_repo"],
+              "file_original_name": meta.get("file_original_name", "document")}]
+            if "attachment_path_in_repo" in meta else []
+        )
+        if not attachment_specs:
+            continue  # malformed/legacy entry with no attachment info at all — nothing to import
 
-        if not _session_is(key, fernet):   # locked/switched while downloading: do NOT write with the wrong key
-            break
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
         tag = sanitize(meta.get("sender_institution", "DISTANT")).replace(" ", "")[:30]
-        safe_name = sanitize(meta.get("file_original_name", "document"))
-        local_path = os.path.join(paths["entrant"], f"{ts}_{tag}_{safe_name}")
-        try:
-            with open(local_path, "wb") as f:
-                f.write(encrypt_file_bytes(file_bytes))
-        except OSError:
-            continue
+        downloaded = []  # [{"local_path", "original_filename", "repo_path", "sha"}, ...]
+        all_attachments_ok = True
+        for a_idx, spec in enumerate(attachment_specs):
+            attach_status, attach_content = _github_request(
+                "GET", f"/repos/{owner}/{repo}/contents/{spec['path_in_repo']}", token)
+            if attach_status != 200 or "content" not in attach_content:
+                all_attachments_ok = False
+                break
+            file_bytes = base64.b64decode(attach_content["content"])
 
+            if not _session_is(key, fernet):   # locked/switched mid-download: never write with the wrong key
+                all_attachments_ok = False
+                break
+            safe_name = sanitize(spec.get("file_original_name", "document"))
+            suffix = "" if a_idx == 0 else f"_{a_idx}"
+            local_path = os.path.join(paths["entrant"], f"{ts}_{tag}{suffix}_{safe_name}")
+            try:
+                with open(local_path, "wb") as f:
+                    f.write(encrypt_file_bytes(file_bytes))
+            except OSError:
+                all_attachments_ok = False
+                break
+            downloaded.append({"local_path": local_path,
+                                "original_filename": spec.get("file_original_name", "document"),
+                                "repo_path": spec["path_in_repo"], "sha": attach_content["sha"]})
+
+        if not all_attachments_ok:
+            # Partial download — clean up whatever DID land locally rather
+            # than leaving an orphaned file with no message row pointing
+            # to it, and leave the entry on the Bridge for a later retry
+            # (it was never marked imported, so the next poll tries again).
+            for d in downloaded:
+                try:
+                    os.remove(d["local_path"])
+                except OSError:
+                    pass
+            continue
+        if not _session_is(key, fernet):
+            break
+
+        first = downloaded[0]
         try:
             with profile_db(key) as wconn:
                 wconn.execute("BEGIN IMMEDIATE")
-                wconn.execute("""
+                wcur = wconn.execute("""
                     INSERT INTO messages (direction, tracking_number, sender_institution,
                                            recipient_institution, subject, body, file_path,
                                            file_original_name, status, delivery_method, is_read,
@@ -3358,14 +3639,22 @@ def _run_bridge_poll_locked(notify: bool) -> dict:
                 """, (tracking, meta.get("sender_institution", "?"),
                       meta.get("recipient_institution", profile["institution_name"]),
                       encrypt_text(meta.get("subject", "")), encrypt_text(meta.get("body", "")),
-                      local_path, meta.get("file_original_name", "document"),
+                      first["local_path"], first["original_filename"],
                       meta.get("sender_institution_key"),
                       meta.get("created_at", datetime.now().isoformat())))
+                new_msg_id = wcur.lastrowid
+                for order, d in enumerate(downloaded):
+                    wconn.execute(
+                        "INSERT INTO message_attachments (message_id, file_path, file_original_name, sort_order) "
+                        "VALUES (?, ?, ?, ?)",
+                        (new_msg_id, d["local_path"], d["original_filename"], order)
+                    )
         except sqlite3.IntegrityError:
-            try:
-                os.remove(local_path)
-            except OSError:
-                pass
+            for d in downloaded:
+                try:
+                    os.remove(d["local_path"])
+                except OSError:
+                    pass
             continue
 
         imported.append({"tracking_number": tracking, "sender": meta.get("sender_institution", "?")})
@@ -3374,9 +3663,10 @@ def _run_bridge_poll_locked(notify: bool) -> dict:
 
         # Consume the entries (queued for retry if the DELETE fails).
         _delete_bridge_entry_or_queue(key, owner, repo, token, entry["url"], entry["sha"])
-        _delete_bridge_entry_or_queue(
-            key, owner, repo, token,
-            f"/repos/{owner}/{repo}/contents/{meta['attachment_path_in_repo']}", attach_content["sha"])
+        for d in downloaded:
+            _delete_bridge_entry_or_queue(
+                key, owner, repo, token,
+                f"/repos/{owner}/{repo}/contents/{d['repo_path']}", d["sha"])
 
     # 5) Apply read receipts.
     receipts_applied = []
