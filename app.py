@@ -136,6 +136,7 @@ import json
 import socket
 import sqlite3
 import shutil
+import secrets
 import mimetypes
 import tempfile
 import hashlib
@@ -596,6 +597,19 @@ def init_registry_db():
                 updated_at TEXT
             )
         """)
+        # v2.9.5: github_owner/repo/token above are DEAD columns, kept
+        # only so an upgrade never has to DROP anything (SQLite's DROP
+        # COLUMN support is recent/finicky) — the GitHub Bridge is fully
+        # replaced by the Cloudflare Worker Bridge below. worker_url is
+        # entered once in Paramètres; device_secret is generated locally
+        # (see ensure_device_secret()) and NEVER typed by the user — it
+        # is this DEVICE's standing credential for every Worker call it
+        # makes, for every institution profile hosted on it.
+        bc_cols = [r[1] for r in conn.execute("PRAGMA table_info(bridge_config)").fetchall()]
+        if "worker_url" not in bc_cols:
+            conn.execute("ALTER TABLE bridge_config ADD COLUMN worker_url TEXT")
+        if "device_secret" not in bc_cols:
+            conn.execute("ALTER TABLE bridge_config ADD COLUMN device_secret TEXT")
         # Schema migration for pre-v2.7.0 databases: CREATE TABLE IF NOT
         # EXISTS above won't add a new column to an already-existing
         # table, so this runs an explicit, idempotent, backward-compatible
@@ -631,6 +645,13 @@ def init_registry_db():
         # see get_hardware_fingerprint() and api_session_unlock().
         if "paired_hardware_hash" not in existing_cols:
             conn.execute("ALTER TABLE profiles ADD COLUMN paired_hardware_hash TEXT")
+        # v2.9.5: 0/NULL until this institution_key has been successfully
+        # /register'd against the Cloudflare Worker Bridge — see
+        # _ensure_worker_registration(). Lets the heartbeat loop catch up
+        # a profile created before the Worker URL was configured, same
+        # spirit as the GitHub-era _ensure_registration_claimed().
+        if "worker_registered" not in existing_cols:
+            conn.execute("ALTER TABLE profiles ADD COLUMN worker_registered INTEGER DEFAULT 0")
 
         # v2.8.6: classify any row with no role info yet (NULL — a
         # freshly-added column on a pre-v2.8.5 database) OR the legacy
@@ -845,6 +866,17 @@ def get_profile_db(institution_key: str) -> sqlite3.Connection:
         # name-based matching for those.
         if "sender_institution_key" not in existing_cols:
             conn.execute("ALTER TABLE messages ADD COLUMN sender_institution_key TEXT")
+        # v2.9.5: the Cloudflare Worker Bridge addresses every institution
+        # by bridge_slug(name, role) — not the real institution_key (the
+        # sender's free-text "Institution destinataire" field never
+        # carries enough to compute the real key; see bridge_slug's own
+        # docstring). sender_institution_key above still holds the REAL
+        # key for a LOCALLY delivered message; for a Worker-delivered one
+        # this new column instead holds the sender's Worker-side slug id,
+        # exactly as the Worker itself reported it in the message
+        # metadata — used only to address the /accuse call back to them.
+        if "sender_worker_id" not in existing_cols:
+            conn.execute("ALTER TABLE messages ADD COLUMN sender_worker_id TEXT")
     conn.execute("""
         CREATE TABLE IF NOT EXISTS bridge_pending_cleanup (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1047,83 +1079,95 @@ def find_local_profile_by_recipient(recipient_text: str, recipient_role: str = N
 # from making a private repo public later, or from over-sharing repo
 # access. Treat the bridge token as a real credential.
 # --------------------------------------------------------------------------- #
-GITHUB_API_BASE = "https://api.github.com"
+# --------------------------------------------------------------------------- #
+# v2.9.5 — Cloudflare Worker Bridge (replaces the GitHub Bridge entirely).
+#
+# ⚠️ Security model, read before changing anything here: the Worker URL is
+# PUBLIC (it ships inside every TASHIL install) — Cloudflare provides no
+# authentication of its own for it. Every protected Worker route instead
+# requires a per-institution secret_key, checked server-side on EVERY
+# call (see the Worker's own requireValidSecret()), never just once at
+# "login". device_secret below is THIS DEVICE's standing credential —
+# generated locally, once, the first time it's needed, and reused for
+# every institution profile this device hosts. To add a SECOND legitimate
+# device for an institution ALREADY claimed elsewhere, that institution's
+# original secret must be supplied once (see api_save_profile's
+# original_secret_key handling) — this device then ADOPTS it as its own
+# device_secret going forward, so every subsequent call from it
+# authenticates consistently. This mirrors, and replaces, the GitHub-era
+# shared-token model — just scoped per establishment instead of per repo.
+# --------------------------------------------------------------------------- #
+def ensure_device_secret() -> str:
+    """Generates this device's Worker credential once, lazily, the first
+    time it's needed — independent of whether a Worker URL has even been
+    entered yet in Paramètres, so it's always ready. Never regenerated
+    once it exists (that would silently orphan every institution this
+    device had already registered)."""
+    with registry_db() as conn:
+        row = conn.execute("SELECT device_secret FROM bridge_config WHERE id = 1").fetchone()
+        if row and row["device_secret"]:
+            return row["device_secret"]
+        secret = secrets.token_hex(32)
+        conn.execute("""
+            INSERT INTO bridge_config (id, device_secret, enabled, updated_at)
+            VALUES (1, ?, 0, ?)
+            ON CONFLICT(id) DO UPDATE SET device_secret = excluded.device_secret
+        """, (secret, datetime.now().isoformat()))
+        return secret
 
 
-# v2.9.0: conditional GETs. A 304 answer does not count against GitHub's primary
-# rate limit (the token is SHARED by every institution, 5000 req/h in total),
-# which is what makes a 10 s poll affordable. Only used for directory listings.
-_ETAG_CACHE = {}  # url -> (etag, parsed_payload)
+def adopt_device_secret(new_secret: str):
+    """Called once an original_secret_key supplied during onboarding is
+    confirmed correct by the Worker — see api_save_profile. From this
+    point on, THIS device authenticates with the shared secret instead
+    of (silently discarding) its own independently generated one."""
+    with registry_db() as conn:
+        conn.execute("UPDATE bridge_config SET device_secret = ? WHERE id = 1", (new_secret,))
 
 
-def _github_request(method: str, url_or_path: str, token: str, json_body: dict = None,
-                    _max_retries: int = 2, use_etag: bool = False):
+def get_bridge_config():
+    with registry_db(commit=False) as conn:
+        row = conn.execute("SELECT * FROM bridge_config WHERE id = 1").fetchone()
+    if row is None or not row["worker_url"]:
+        return None
+    return {
+        "worker_url": row["worker_url"].rstrip("/"),
+        "device_secret": row["device_secret"] or ensure_device_secret(),
+        "enabled": bool(row["enabled"]),
+    }
+
+
+def _worker_request(worker_url: str, method: str, path: str, body: dict = None,
+                    query: dict = None, _max_retries: int = 2):
     """
-    Minimal GitHub REST API client using urllib only. Accepts either a
-    path (starting with '/') or a full URL (as returned in listing
-    responses' 'url' field) — both are used by the polling logic below.
-    Returns (status_code, parsed_json_or_empty_dict).
-
-    Explicitly uses certifi's CA bundle for SSL verification rather than
-    relying on urllib's default context. This is a real, known issue with
-    PyInstaller-frozen Windows executables: the frozen exe often can't
-    locate the OS certificate store the way a normal Python installation
-    does, producing "SSL: CERTIFICATE_VERIFY_FAILED — unable to get local
-    issuer certificate" even when the network connection itself is fine.
-    Bundling and pointing at certifi's own cacert.pem sidesteps that
-    entirely — confirmed as the cause via a real error report.
-
-    v2.8.9: status 0 ("Erreur GitHub (0)" on screen) means the request
-    never got a real HTTP response at all — a network-level exception
-    (brief connectivity drop, DNS hiccup, a timed-out read on a slow
-    link) caught by the bare `except Exception` below, NOT an
-    authentication or permissions problem (those come back as real HTTP
-    codes — 401, 403, 404 — from the `except HTTPError` branch instead,
-    which is deliberately NOT retried here since retrying a real "your
-    token is wrong" response can't ever succeed). A brief network drop
-    very often DOES succeed on an immediate retry, so this now retries
-    up to `_max_retries` times with a short backoff before giving up and
-    returning status 0 to the caller — which itself now also queues the
-    attempted operation for automatic retry a few seconds later (see
-    bridge_pending_push) rather than losing it outright.
+    Minimal JSON HTTP client (urllib only) for the Cloudflare Worker
+    Bridge — same certifi-pinned SSL context and same network-failure
+    retry policy as the GitHub-era _github_request() (see that function's
+    history: status 0 = no real HTTP response at all, i.e. a network
+    hiccup worth retrying; any real HTTP status — including a 401 from a
+    wrong secret — is returned as-is, never retried, since retrying can't
+    change a real answer). Returns (status_code, parsed_json_or_{}).
     """
     import urllib.request
     import urllib.error
+    import urllib.parse
     import ssl
 
-    url = url_or_path if url_or_path.startswith("http") else f"{GITHUB_API_BASE}{url_or_path}"
-    headers = {
-        "Authorization": f"Bearer {token}",
-        "Accept": "application/vnd.github+json",
-        "User-Agent": "TASHIL-DOCUMENT-HUB",
-        "X-GitHub-Api-Version": "2022-11-28",
-    }
-    body = json.dumps(json_body).encode("utf-8") if json_body is not None else None
+    url = f"{worker_url}{path}"
+    if query:
+        url += "?" + urllib.parse.urlencode(query)
+    headers = {"Content-Type": "application/json", "Accept": "application/json"}
+    data = json.dumps(body).encode("utf-8") if body is not None else None
     ssl_context = ssl.create_default_context(cafile=certifi.where()) if _CERTIFI_AVAILABLE else None
-    etag_on = use_etag and method == "GET"
-    cached = _ETAG_CACHE.get(url) if etag_on else None
-    if cached:
-        headers["If-None-Match"] = cached[0]
 
     last_exc = None
     for attempt in range(_max_retries + 1):
-        req = urllib.request.Request(url, data=body, headers=headers, method=method)
+        req = urllib.request.Request(url, data=data, headers=headers, method=method)
         try:
             with urllib.request.urlopen(req, timeout=20, context=ssl_context) as resp:
                 raw = resp.read()
-                parsed = json.loads(raw.decode("utf-8")) if raw else {}
-                if etag_on and resp.headers.get("ETag"):
-                    _ETAG_CACHE[url] = (resp.headers.get("ETag"), parsed)
-                return resp.status, parsed
+                return resp.status, (json.loads(raw.decode("utf-8")) if raw else {})
         except urllib.error.HTTPError as e:
-            if etag_on and e.code == 304 and cached:
-                # Nothing changed since last time: reuse the previous body.
-                return 200, list(cached[1]) if isinstance(cached[1], list) else cached[1]
-            if etag_on and e.code == 404:
-                _ETAG_CACHE.pop(url, None)
-            # A real response from GitHub (even an error one) — retrying
-            # immediately can't change an auth/permissions/not-found
-            # answer, so return it as-is rather than burning retries.
             try:
                 payload = json.loads(e.read().decode("utf-8"))
             except Exception:
@@ -1134,13 +1178,7 @@ def _github_request(method: str, url_or_path: str, token: str, json_body: dict =
             if attempt < _max_retries:
                 time.sleep(1.5 * (attempt + 1))  # 1.5s, then 3s
                 continue
-    return 0, {"message": str(last_exc)}
-
-
-def get_bridge_config():
-    with registry_db(commit=False) as conn:
-        row = conn.execute("SELECT * FROM bridge_config WHERE id = 1").fetchone()
-    return dict(row) if row else None
+    return 0, {"error": str(last_exc)}
 
 
 def bridge_slug(institution_name: str, role: str = None) -> str:
@@ -1164,73 +1202,56 @@ def bridge_slug(institution_name: str, role: str = None) -> str:
     return base[:80]
 
 
-def push_to_bridge(cfg: dict, recipient_name: str, recipient_role: str, sender_name: str,
-                    sender_institution_key: str, subject: str,
-                    body: str, tracking: str, attachments: list) -> bool:
+def push_to_worker_bridge(cfg: dict, recipient_name: str, recipient_role: str, sender_name: str,
+                          sender_role: str, sender_institution_key: str, subject: str,
+                          body: str, tracking: str, attachments: list) -> bool:
     """
-    v2.9.4: `attachments` is a list of {"bytes": bytes, "original_filename": str}
-    — one or more. The metadata's new "attachments" key (a list of
-    {"path_in_repo", "file_original_name"}) replaces the old singular
-    "attachment_path_in_repo"/"file_original_name" pair. The OLD singular
-    keys are ALSO still written, duplicating the first attachment's
-    entry — so an institution still running a pre-v2.9.4 build, which
-    only ever reads those two old keys, keeps receiving at least the
-    first file exactly as before instead of silently getting nothing;
-    only a v2.9.4+ importer reads the fuller "attachments" list.
+    v2.9.5 — Cloudflare Worker Bridge. `attachments` is a list of
+    {"bytes": bytes, "original_filename": str}. Replaces push_to_bridge()
+    (GitHub) entirely: one POST /send instead of N GitHub PUTs (one file +
+    one JSON per attachment) — the Worker accepts the whole message,
+    metadata and every attachment's base64 content, in a single call.
+
+    Addressing: both sender and recipient are identified to the Worker by
+    bridge_slug(name, role) — the SAME scheme the GitHub Bridge used
+    (see bridge_slug's docstring for its one pre-existing limitation,
+    unchanged here). sender_institution_key (the REAL institution_key,
+    not a slug) travels only as metadata, for route_read_receipt()'s own
+    precision routing on the recipient's LOCAL database — it is never
+    used to address the Worker itself.
     """
-    owner, repo, token = cfg["github_owner"], cfg["github_repo"], cfg["github_token"]
-    key = bridge_slug(recipient_name, recipient_role)
-    meta_repo_path = f"bridge/{key}/{tracking}.json"
+    worker_url, secret = cfg["worker_url"], cfg["device_secret"]
+    recipient_id = bridge_slug(recipient_name, recipient_role)
+    sender_id = bridge_slug(sender_name, sender_role)
 
-    attachment_entries = []
-    all_files_ok = True
-    for idx, att in enumerate(attachments):
-        file_ext = os.path.splitext(att["original_filename"])[1]
-        suffix = "" if idx == 0 else f"_{idx}"
-        attachment_repo_path = f"bridge/{key}/{tracking}{suffix}{file_ext}"
-        # att["bytes"] are the ORIGINAL plaintext (see api_send_message) —
-        # never the sender's own encrypted archive copy, which only the
-        # sender's key could ever open. The Cloud Bridge itself provides
-        # no encryption of its own (see the module-level security note
-        # above); the recipient applies its own encryption independently
-        # when it later imports this.
-        file_b64 = base64.b64encode(att["bytes"]).decode("utf-8")
-        status_file, _ = _github_request(
-            "PUT", f"/repos/{owner}/{repo}/contents/{attachment_repo_path}", token,
-            {"message": f"TASHIL bridge: {tracking} (attachment {idx + 1}/{len(attachments)})",
-             "content": file_b64}
-        )
-        if status_file not in (200, 201):
-            all_files_ok = False
-        attachment_entries.append({
-            "path_in_repo": attachment_repo_path,
-            "file_original_name": att["original_filename"],
-        })
+    total_bytes = sum(len(a["bytes"]) for a in attachments)
+    if total_bytes > 20 * 1024 * 1024:
+        # Workers KV caps a single value at 25 MB; the message is split
+        # across several KV entries (one per attachment) so the real
+        # ceiling is per-FILE, not per-message — but a generous combined
+        # guard here fails fast with a clear reason instead of a vague
+        # Worker-side 413 on whichever attachment happens to push it over.
+        return False
 
-    meta = {
-        "tracking_number": tracking,
-        "sender_institution": sender_name,
-        "sender_institution_key": sender_institution_key,
-        "recipient_institution": recipient_name,
+    payload = {
+        "sender_institution_id": sender_id,
+        "secret_key": secret,
+        "recipient_institution_id": recipient_id,
         "recipient_role": recipient_role,
+        "sender_institution": sender_name,
+        "sender_institution_key": sender_institution_key,  # real key — metadata only, see docstring
+        "recipient_institution": recipient_name,
         "subject": subject,
         "body": body,
-        "attachments": attachment_entries,
-        # Back-compat duplicates for any pre-v2.9.4 importer still reading
-        # the old singular keys — see docstring above.
-        "file_original_name": attachment_entries[0]["file_original_name"],
-        "attachment_path_in_repo": attachment_entries[0]["path_in_repo"],
-        "created_at": datetime.now().isoformat(),
+        "tracking": tracking,
+        "attachments": [
+            {"file_original_name": att["original_filename"],
+             "content_base64": base64.b64encode(att["bytes"]).decode("utf-8")}
+            for att in attachments
+        ],
     }
-    meta_b64 = base64.b64encode(
-        json.dumps(meta, ensure_ascii=False, indent=2).encode("utf-8")
-    ).decode("utf-8")
-
-    status_meta, _ = _github_request(
-        "PUT", f"/repos/{owner}/{repo}/contents/{meta_repo_path}", token,
-        {"message": f"TASHIL bridge: {tracking} (metadata)", "content": meta_b64}
-    )
-    return status_meta in (200, 201) and all_files_ok
+    status, _ = _worker_request(worker_url, "POST", "/send", payload)
+    return status == 200
 
 
 def get_lan_ip() -> str:
@@ -1852,7 +1873,10 @@ def api_save_profile():
     institution_name = data.get("institution_name", "").strip()
     requested_role = data.get("role", DEFAULT_ROLE).strip().upper() or DEFAULT_ROLE
     pin = data.get("pin", "")
-    original_pin = data.get("original_pin", "")  # v2.9.3: only needed if the establishment is already claimed
+    # v2.9.5: field renamed from original_pin (v2.9.3's PIN-based check) —
+    # this is now a Worker device secret, not the local encryption PIN.
+    # Only needed if the establishment is already claimed elsewhere.
+    original_secret_key = data.get("original_secret_key", "")
 
     if not institution_name or institution_type not in INSTITUTION_TYPES:
         return jsonify({"error": "Champs invalides."}), 400
@@ -1882,50 +1906,57 @@ def api_save_profile():
         return jsonify({"error": "Cet établissement (avec ce rôle) est déjà configuré sur cet appareil. "
                                   "Sélectionnez-le depuis l'écran de verrouillage plutôt que d'en recréer un."}), 409
 
-    # v2.9.3, check 2/2 — NETWORK-WIDE: institution_key is deterministic,
+    # v2.9.5, check 2/2 — NETWORK-WIDE: institution_key is deterministic,
     # so a SECOND, DIFFERENT device could otherwise freely create its own
-    # independent profile under the exact same key — corrupting Bridge
-    # routing, which assumes this key identifies one establishment on the
-    # whole network. If this device has the Cloud Bridge configured, the
-    # permanent registrations/<key>.json ledger (see _fetch_registration)
-    # is consulted first; if that key was already claimed elsewhere, the
-    # ORIGINAL pin set when it was first claimed must be re-entered here
-    # to authorize this additional device.
-    # ⚠️ Honest limitation: without Cloud Bridge configured on THIS device
-    # yet (true for the very first profile ever onboarded on a brand-new
-    # install — provisioning normally happens afterwards, in Paramètres),
-    # there is no shared ledger to check against at this exact moment;
-    # _ensure_registration_claimed() closes that gap retroactively on the
-    # first heartbeat once the Bridge does get configured.
-    bridge_owner = bridge_repo = bridge_token = None
+    # independent profile addressed the same way on the Worker Bridge —
+    # corrupting delivery, which assumes bridge_slug(name, role)
+    # identifies one establishment on the whole network. Enforced by the
+    # Worker's own /register (see the Worker script's device-binding
+    # section): this device's own secret is tried first; a 401 means the
+    # Worker already has a DIFFERENT secret bound to this institution_id,
+    # and the ORIGINAL device's secret must be supplied here to authorize
+    # this additional one.
+    # ⚠️ Honest limitation, same shape as the GitHub-era one it replaces:
+    # without a Worker URL configured on THIS device yet (true for the
+    # very first profile ever onboarded on a brand-new install —
+    # provisioning normally happens afterwards, in Paramètres), there is
+    # nothing to check against at this exact moment;
+    # _ensure_worker_registration() closes that gap retroactively on the
+    # first heartbeat once the Worker does get configured.
     cfg = get_bridge_config()
+    adopted_secret = None
     if cfg and cfg["enabled"]:
-        bridge_owner, bridge_repo, bridge_token = cfg["github_owner"], cfg["github_repo"], cfg["github_token"]
-        record, _sha, err = _fetch_registration(bridge_owner, bridge_repo, bridge_token, key)
-        if err is not None:
-            return jsonify({"error": f"Impossible de vérifier le registre réseau (erreur GitHub {err}). "
-                                      f"Réessayez, ou vérifiez la connexion Internet."}), 502
-        if record is not None:
-            stored_hash = record.get("pin_hash")
-            if not original_pin:
+        worker_id = bridge_slug(institution_name, role)
+        status, resp = _worker_request(cfg["worker_url"], "POST", "/register", {
+            "institution_id": worker_id, "secret_key": cfg["device_secret"],
+            "hardware_id": get_hardware_fingerprint(),
+        })
+        if status == 401:
+            if not original_secret_key:
                 return jsonify({
                     "error": "Cet établissement est déjà enregistré sur le réseau TASHIL, sur un autre "
-                             "appareil. Saisissez le code PIN d'origine (défini lors de sa première "
-                             "installation) pour autoriser cet appareil supplémentaire.",
+                             "appareil. Saisissez sa clé secrète d'origine (visible dans Paramètres sur "
+                             "cet autre appareil) pour autoriser cet appareil supplémentaire.",
                     "requires_original_pin": True,
                 }), 409
-            if not stored_hash or not check_password_hash(stored_hash, original_pin):
+            retry_status, _ = _worker_request(cfg["worker_url"], "POST", "/register", {
+                "institution_id": worker_id, "secret_key": original_secret_key,
+                "hardware_id": get_hardware_fingerprint(),
+            })
+            if retry_status != 200:
                 return jsonify({
-                    "error": "Code PIN d'origine incorrect.",
+                    "error": "Clé secrète d'origine incorrecte.",
                     "requires_original_pin": True,
                 }), 401
-            # Correct original PIN: this device is authorized to also
-            # operate this establishment's identity — it still gets its
-            # OWN local PIN (set below) for ITS OWN local encryption/
-            # hardware pairing, exactly like every other profile; the
-            # registrations ledger itself is left untouched (the original
-            # claim's hash remains the standing proof for any FURTHER
-            # device wanting to join this same establishment later).
+            # Correct original secret: this device is now authorized for
+            # this establishment's identity — it ADOPTS that secret as
+            # its own device_secret going forward (see adopt_device_secret()
+            # docstring), so every future Worker call from this device
+            # (any institution it hosts) authenticates with it.
+            adopted_secret = original_secret_key
+        elif status != 200:
+            return jsonify({"error": f"Impossible de vérifier le registre réseau (erreur Worker {status}). "
+                                      f"Réessayez, ou vérifiez la connexion Internet."}), 502
 
     with registry_db() as conn:
         conn.execute("""
@@ -1940,20 +1971,22 @@ def api_save_profile():
     with profile_db(key):
         pass
 
+    # v2.9.5: an original_secret_key just confirmed correct above means
+    # THIS device adopts it as its own standing Worker credential, so
+    # every future call (this institution and any other hosted on this
+    # device) authenticates consistently with it from now on.
+    if adopted_secret:
+        adopt_device_secret(adopted_secret)
+        cfg = {**cfg, "device_secret": adopted_secret}
+    if cfg and cfg["enabled"]:
+        # Registration already succeeded above (either on the first try
+        # with this device's own secret, or on retry with the adopted
+        # one) — mark it so the heartbeat loop's catch-up doesn't
+        # needlessly re-call /register for this profile.
+        with registry_db() as conn:
+            conn.execute("UPDATE profiles SET worker_registered = 1 WHERE institution_key = ?", (key,))
+
     updated_row = get_profile_row(key)
-
-    # v2.9.3: claim this key on the network ledger right away when we can
-    # (Bridge already configured + nobody else had claimed it above) —
-    # best-effort; if this PUT itself fails on a flaky connection,
-    # _ensure_registration_claimed() retries it on the next heartbeat
-    # rather than blocking account creation on a second network call.
-    if bridge_owner and updated_row is not None:
-        try:
-            _claim_registration(bridge_owner, bridge_repo, bridge_token, key,
-                                 dict(updated_row), updated_row["pin_hash"])
-        except Exception:
-            pass
-
     set_active_session(key, pin, updated_row)
     return jsonify({"ok": True, "profile": profile_public_dict(updated_row)})
 
@@ -2272,10 +2305,11 @@ def api_send_message():
         if bridge_cfg and bridge_cfg["enabled"]:
             bridge_attempted = True
             try:
-                delivered_via_bridge = push_to_bridge(
-                    bridge_cfg, recipient, recipient_role, sender, _active_key, subject, body,
-                    tracking, [{"bytes": att["bytes"], "original_filename": att["original_filename"]}
-                               for att in archived_attachments]
+                delivered_via_bridge = push_to_worker_bridge(
+                    bridge_cfg, recipient, recipient_role, sender, profile["role"] if profile else DEFAULT_ROLE,
+                    _active_key, subject, body, tracking,
+                    [{"bytes": att["bytes"], "original_filename": att["original_filename"]}
+                     for att in archived_attachments]
                 )
             except Exception:
                 delivered_via_bridge = False
@@ -2296,6 +2330,7 @@ def api_send_message():
                         "recipient": recipient,
                         "recipient_role": recipient_role,
                         "sender": sender,
+                        "sender_role": profile["role"] if profile else DEFAULT_ROLE,
                         "sender_institution_key": _active_key,
                         "subject": subject,
                         "body": body,
@@ -2461,17 +2496,26 @@ def route_read_receipt(message_row):
             if cfg and cfg["enabled"]:
                 acknowledger = get_profile_row(_active_key)
                 acknowledger_name = acknowledger["institution_name"] if acknowledger else "?"
-                receipt_sent = push_receipt_to_bridge(cfg, sender_name, sender_key, tracking, acknowledger_name)
+                own_worker_id = bridge_slug(acknowledger_name, acknowledger["role"] if acknowledger else DEFAULT_ROLE)
+                # v2.9.5: sender_worker_id (not the old sender_key/
+                # sender_institution_key) is the address the Worker
+                # actually understands — see messages.sender_worker_id's
+                # own migration comment. NULL for any message imported
+                # before this column existed (necessarily a pre-v2.9.5,
+                # GitHub-era bridge message) — nothing to route a Worker
+                # receipt to for those; push_worker_receipt() still
+                # cleans up the accuser's own copy either way.
+                sender_worker_id = message_row.get("sender_worker_id")
+                receipt_sent = push_worker_receipt(cfg, own_worker_id, tracking, sender_worker_id, acknowledger_name)
                 if not receipt_sent:
                     # v2.8.9: same auto-retry treatment as a failed
-                    # message send — a transient "Erreur GitHub (0)"
-                    # here previously meant the accusé silently never
-                    # made it back to the sender, with no further
-                    # attempt ever made.
+                    # message send — a transient network failure here
+                    # previously meant the accusé silently never made it
+                    # back to the sender, with no further attempt ever made.
                     with profile_db(_active_key) as queue_conn:
                         _queue_pending_push(queue_conn, "receipt", {
-                            "sender_name": sender_name,
-                            "sender_key": sender_key,
+                            "recipient_own_worker_id": own_worker_id,
+                            "sender_worker_id": sender_worker_id,
                             "tracking": tracking,
                             "acknowledger_name": acknowledger_name,
                         })
@@ -2479,30 +2523,31 @@ def route_read_receipt(message_row):
         pass  # see docstring — a failed receipt never blocks the accusé itself
 
 
-def push_receipt_to_bridge(cfg: dict, sender_name: str, sender_key: str, tracking: str, acknowledger_name: str) -> bool:
-    owner, repo, token = cfg["github_owner"], cfg["github_repo"], cfg["github_token"]
-    # v2.8.7: address the receipt using the sender's exact
-    # institution_key when known — this is one of the addresses the
-    # sender's OWN poll loop already checks (see api_bridge_poll's
-    # keys_to_check, which includes bridge_slug(profile["institution_key"])),
-    # so no change is needed on the polling side. Falls back to the old
-    # name-based address (role-blind) for messages that predate this column.
-    key = bridge_slug(sender_key) if sender_key else bridge_slug(sender_name)
-    receipt_path = f"bridge/{key}/receipts/{tracking}.json"
+def push_worker_receipt(cfg: dict, own_worker_id: str, tracking: str,
+                        sender_worker_id: str, acknowledger_name: str) -> bool:
+    """
+    v2.9.5: one POST /accuse replaces the GitHub-era's separate
+    receipt-push — the Worker itself both deletes the ACCUSING device's
+    own KV copy of this message (see the module docstring on the new
+    "delete on accusé, not on import" lifecycle) and drops a small
+    receipt for the sender in the same call. own_worker_id is the
+    CURRENTLY ACTIVE profile's own Worker address (bridge_slug of its
+    name+role) — its secret authenticates and scopes the deletion to
+    only ITS OWN copy. sender_worker_id can be None for a message that
+    predates sender_worker_id being recorded (see route_read_receipt) —
+    the Worker still deletes the accuser's own copy in that case, it
+    just has nowhere to route a receipt to.
+    """
+    worker_url, secret = cfg["worker_url"], cfg["device_secret"]
     payload = {
-        "type": "receipt",
-        "tracking_number": tracking,
+        "institution_id": own_worker_id,
+        "secret_key": secret,
+        "tracking": tracking,
+        "sender_institution_id": sender_worker_id,
         "acknowledged_by": acknowledger_name,
-        "acknowledged_at": datetime.now().isoformat(),
     }
-    payload_b64 = base64.b64encode(
-        json.dumps(payload, ensure_ascii=False).encode("utf-8")
-    ).decode("utf-8")
-    status, _ = _github_request(
-        "PUT", f"/repos/{owner}/{repo}/contents/{receipt_path}", token,
-        {"message": f"TASHIL bridge: receipt for {tracking}", "content": payload_b64}
-    )
-    return status in (200, 201)
+    status, _ = _worker_request(worker_url, "POST", "/accuse", payload)
+    return status == 200
 
 
 def _delete_message_and_files(conn, message_id: int) -> bool:
@@ -2599,109 +2644,95 @@ def api_registre():
 @app.route("/api/bridge/network-test", methods=["GET"])
 def api_bridge_network_test():
     """
-    Diagnostic-only, no token/repo needed: checks whether THIS machine can
-    reach api.github.com over HTTPS at all — separates "GitHub itself is
-    unreachable / blocked by a firewall or proxy" from "the repo/token
-    configuration is wrong", which otherwise look identical from the
-    config form's point of view. Deliberately sends NO Authorization
-    header (unlike _github_request) — this checks pure network/SSL
-    reachability, not credentials.
+    v2.9.5: tests reachability of the CONFIGURED Worker URL's public
+    /health route — no secret_key needed (that route takes none), so
+    this separates "the Worker itself is unreachable / wrong URL /
+    blocked by a firewall" from "my secret_key is wrong", which
+    otherwise look identical from the config form's point of view.
     """
-    import time
-    import urllib.request
-    import urllib.error
-    import ssl
-
-    ssl_context = ssl.create_default_context(cafile=certifi.where()) if _CERTIFI_AVAILABLE else None
-    req = urllib.request.Request(
-        "https://api.github.com/zen",
-        headers={"User-Agent": "TASHIL-DOCUMENT-HUB", "Accept": "application/vnd.github+json"},
-    )
+    cfg = get_bridge_config()
+    if not cfg:
+        return jsonify({"ok": False, "elapsed_ms": 0, "message": "Aucune URL de Worker configurée.", "hint": ""})
 
     start = time.monotonic()
-    try:
-        with urllib.request.urlopen(req, timeout=10, context=ssl_context) as resp:
-            elapsed_ms = int((time.monotonic() - start) * 1000)
-            return jsonify({"ok": True, "elapsed_ms": elapsed_ms,
-                             "message": "Connexion à api.github.com réussie."})
-    except Exception as exc:
-        elapsed_ms = int((time.monotonic() - start) * 1000)
-        error_message = str(exc)
-        hint = ""
-        if "CERTIFICATE_VERIFY_FAILED" in error_message:
-            hint = ("Problème de certificat SSL — souvent causé par un antivirus/pare-feu "
-                    "qui inspecte le trafic HTTPS, ou un proxy d'entreprise.")
-        elif "timed out" in error_message.lower():
-            hint = "Délai dépassé — le pare-feu bloque probablement la connexion sortante."
-        elif "Name or service not known" in error_message or "getaddrinfo failed" in error_message:
-            hint = "Résolution DNS échouée — vérifiez la connexion Internet de cette machine."
-        elif "Connection refused" in error_message:
-            hint = "Connexion refusée — un pare-feu local ou réseau bloque probablement le port 443."
+    status, data = _worker_request(cfg["worker_url"], "GET", "/health", _max_retries=0)
+    elapsed_ms = int((time.monotonic() - start) * 1000)
+    if status == 200 and data.get("ok"):
+        return jsonify({"ok": True, "elapsed_ms": elapsed_ms,
+                         "message": "Connexion au Cloudflare Worker Bridge réussie."})
 
-        return jsonify({"ok": False, "elapsed_ms": elapsed_ms, "message": error_message, "hint": hint})
+    error_message = data.get("error", f"Statut HTTP {status}" if status else "réseau indisponible")
+    hint = ""
+    if status == 0:
+        hint = ("Worker injoignable — vérifiez l'URL (Paramètres), la connexion Internet de cette "
+                "machine, ou un éventuel pare-feu/proxy d'entreprise.")
+    elif status == 404:
+        hint = "URL jointe mais la route /health répond 404 — vérifiez que c'est bien l'URL du Worker TASHIL."
+    return jsonify({"ok": False, "elapsed_ms": elapsed_ms, "message": error_message, "hint": hint})
 
 
 @app.route("/api/bridge/config", methods=["GET"])
 def api_bridge_get_config():
     cfg = get_bridge_config()
+    device_secret = ensure_device_secret()  # always generated, even with no worker_url yet (see docstring)
     if cfg is None:
-        return jsonify({"configured": False, "enabled": False})
+        return jsonify({"configured": False, "enabled": False, "device_secret": device_secret})
     return jsonify({
-        "configured": bool(cfg["github_owner"] and cfg["github_repo"] and cfg["github_token"]),
+        "configured": bool(cfg["worker_url"]),
         "enabled": bool(cfg["enabled"]),
-        "github_owner": cfg["github_owner"],
-        "github_repo": cfg["github_repo"],
-        # github_token deliberately never sent back to the frontend
+        "worker_url": cfg["worker_url"],
+        # v2.9.5: unlike the GitHub token, device_secret IS sent back —
+        # the person needs to read/copy it to authorize a second device
+        # for the same establishment (see api_save_profile's
+        # original_secret_key flow). Same threat model as everything
+        # else behind an unlocked session: this route already requires
+        # one implicitly through the rest of the Paramètres screen.
+        "device_secret": device_secret,
     })
 
 
-def _validate_and_save_bridge_config(owner: str, repo: str, token: str):
+def _validate_and_save_worker_config(worker_url: str):
     """
-    Shared by both the manual entry form AND the QR/pasted-code import path
-    — guarantees the private-repo safety check applies identically no
-    matter how the credentials arrived. Returns (status_code, body_dict).
-
-    Deliberately does the (slow) GitHub network call BEFORE opening any
-    SQLite connection — the write itself is a single short INSERT/UPDATE.
+    Shared by both the manual entry form AND the QR/pasted-code import
+    path. Returns (status_code, body_dict). Does the (slow) network call
+    BEFORE opening any SQLite connection — the write itself is a single
+    short INSERT/UPDATE.
     """
-    if not owner or not repo or not token:
-        return 400, {"error": "Propriétaire, dépôt et jeton GitHub sont tous requis."}
+    worker_url = (worker_url or "").strip().rstrip("/")
+    if not worker_url:
+        return 400, {"error": "L'URL du Worker Cloudflare est requise."}
+    # http:// is accepted ONLY for localhost/127.0.0.1 — a deliberate
+    # allowance for testing against `wrangler dev` (Cloudflare's own
+    # local Worker emulator, which serves over plain HTTP), never for a
+    # real deployment: every actual Cloudflare Worker URL is HTTPS-only.
+    is_local_dev = worker_url.startswith("http://127.0.0.1") or worker_url.startswith("http://localhost")
+    if not worker_url.startswith("https://") and not is_local_dev:
+        return 400, {"error": "L'URL du Worker doit commencer par https:// "
+                               "(http:// n'est accepté que pour 127.0.0.1/localhost, en développement)."}
 
-    status, repo_info = _github_request("GET", f"/repos/{owner}/{repo}", token)
+    status, data = _worker_request(worker_url, "GET", "/health", _max_retries=1)
     if status == 0:
-        return 502, {"error": f"Impossible de contacter GitHub : {repo_info.get('message', 'réseau indisponible')}"}
-    if status == 401:
-        return 401, {"error": "Jeton GitHub invalide ou expiré."}
-    if status == 404:
-        return 404, {"error": "Dépôt introuvable (ou le jeton n'y a pas accès)."}
-    if status != 200:
-        return 502, {"error": f"Erreur GitHub inattendue ({status})."}
+        return 502, {"error": f"Impossible de contacter ce Worker : {data.get('error', 'réseau indisponible')}"}
+    if status != 200 or not data.get("ok"):
+        return 400, {"error": "Cette URL ne répond pas comme un Worker TASHIL valide "
+                               "(la route /health n'a pas répondu correctement)."}
 
-    if repo_info.get("private") is not True:
-        return 400, {
-            "error": "Ce dépôt est PUBLIC. TASHIL refuse d'y transmettre des documents. "
-                     "Utilisez un dépôt privé dédié."
-        }
-
+    ensure_device_secret()  # guarantees one exists before this device ever calls the Worker for real
     with registry_db() as conn:
         conn.execute("""
-            INSERT INTO bridge_config (id, github_owner, github_repo, github_token, enabled, updated_at)
-            VALUES (1, ?, ?, ?, 1, ?)
+            INSERT INTO bridge_config (id, worker_url, enabled, updated_at)
+            VALUES (1, ?, 1, ?)
             ON CONFLICT(id) DO UPDATE SET
-                github_owner=excluded.github_owner, github_repo=excluded.github_repo,
-                github_token=excluded.github_token, enabled=1, updated_at=excluded.updated_at
-        """, (owner, repo, token, datetime.now().isoformat()))
+                worker_url=excluded.worker_url, enabled=1, updated_at=excluded.updated_at
+        """, (worker_url, datetime.now().isoformat()))
 
-    return 200, {"ok": True, "private_verified": True}
+    return 200, {"ok": True}
 
 
 @app.route("/api/bridge/config", methods=["POST"])
 def api_bridge_save_config():
     data = request.get_json(force=True)
-    owner = data.get("github_owner", "").strip()
-    repo = data.get("github_repo", "").strip()
-    token = data.get("github_token", "").strip()
-    status, body = _validate_and_save_bridge_config(owner, repo, token)
+    status, body = _validate_and_save_worker_config(data.get("worker_url", ""))
     return jsonify(body), status
 
 
@@ -2718,17 +2749,13 @@ def api_bridge_save_config():
 # never cached or logged server-side beyond the single response.
 # --------------------------------------------------------------------------- #
 def build_provisioning_code(cfg: dict) -> str:
-    payload = {
-        "github_owner": cfg["github_owner"],
-        "github_repo": cfg["github_repo"],
-        "github_token": cfg["github_token"],
-    }
+    payload = {"worker_url": cfg["worker_url"], "device_secret": cfg["device_secret"]}
     return base64.b64encode(json.dumps(payload).encode("utf-8")).decode("ascii")
 
 
 def parse_provisioning_code(code: str) -> dict:
     payload = json.loads(base64.b64decode(code.strip().encode("ascii")).decode("utf-8"))
-    if not isinstance(payload, dict) or "github_token" not in payload:
+    if not isinstance(payload, dict) or "device_secret" not in payload:
         raise ValueError("malformed provisioning payload")
     return payload
 
@@ -2823,9 +2850,15 @@ def api_bridge_import_code():
     except Exception:
         return jsonify({"error": "Code de provisioning invalide ou corrompu."}), 400
 
-    status, body = _validate_and_save_bridge_config(
-        payload.get("github_owner", ""), payload.get("github_repo", ""), payload.get("github_token", "")
-    )
+    status, body = _validate_and_save_worker_config(payload.get("worker_url", ""))
+    if status == 200 and payload.get("device_secret"):
+        # v2.9.5: THE whole point of importing a provisioning code is to
+        # adopt the ORIGINATING device's secret — without this, the new
+        # device would keep its own independently generated one and every
+        # /register it attempts for an establishment the first device
+        # already claimed would still hit the same 401 this code was
+        # meant to avoid.
+        adopt_device_secret(payload["device_secret"])
     return jsonify(body), status
 
 
@@ -2836,53 +2869,25 @@ def api_bridge_disable():
     return jsonify({"ok": True})
 
 
-# --------------------------------------------------------------------------- #
-# Retry-on-delete-failure (v2.7.0): if a GitHub DELETE call fails right
-# after a message/receipt was successfully imported (rare transient
-# network issue), the entry is queued in bridge_pending_cleanup instead
-# of silently left behind — because once imported, its tracking_number is
-# already known locally, so future polls would otherwise skip re-checking
-# it entirely, and the stray copy would linger in the repo unnoticed.
-# --------------------------------------------------------------------------- #
-def _queue_bridge_cleanup(conn, url_or_path: str, sha: str):
-    conn.execute(
-        "INSERT INTO bridge_pending_cleanup (repo_path, sha, created_at) VALUES (?, ?, ?)",
-        (url_or_path, sha, datetime.now().isoformat())
-    )
-
-
-def _delete_bridge_entry_or_queue(key: str, owner: str, repo: str, token: str, url_or_path: str, sha: str):
-    """v2.9.0: takes the profile KEY, not a connection. The GitHub DELETE runs
-    with no SQLite connection open; only the (rare) queuing INSERT is a short
-    write of its own. 404 = already gone = nothing left to clean."""
-    status, _ = _github_request("DELETE", url_or_path, token,
-                                 {"message": "TASHIL bridge: consumed", "sha": sha})
-    if status not in (200, 204, 404):
-        _db_write(key, "INSERT INTO bridge_pending_cleanup (repo_path, sha, created_at) VALUES (?, ?, ?)",
-                  (url_or_path, sha, datetime.now().isoformat()))
-
-
-def _retry_pending_bridge_cleanup(key: str, owner: str, repo: str, token: str):
-    with profile_db(key, commit=False) as conn:
-        pending = [dict(r) for r in conn.execute("SELECT * FROM bridge_pending_cleanup").fetchall()]
-    for row in pending:
-        status, _ = _github_request("DELETE", row["repo_path"], token,
-                                     {"message": "TASHIL bridge: retried cleanup", "sha": row["sha"]})
-        if status in (200, 204, 404):
-            _db_write(key, "DELETE FROM bridge_pending_cleanup WHERE id = ?", (row["id"],))
-
-
+# v2.9.5: _delete_bridge_entry_or_queue()/_retry_pending_bridge_cleanup()
+# (GitHub-era: a DELETE on a consumed message that failed got queued in
+# bridge_pending_cleanup for retry) have no Worker equivalent needed —
+# messages are deleted synchronously by the Worker itself inside /accuse,
+# server-side, and anything never accused at all is still cleaned up on
+# its own by MESSAGE_TTL_SECONDS. The bridge_pending_cleanup TABLE is
+# left in the schema, unused, rather than risk a destructive DROP.
 # --------------------------------------------------------------------------- #
 # Auto-retry queue for FAILED OUTGOING pushes (v2.8.9) — a message send or
-# a read-receipt whose Cloud Bridge push failed (typically "Erreur GitHub
-# (0)", a transient network blip that outlasted _github_request's own
-# retries). Rather than leaving the document stuck "En attente" (orange)
-# forever with no further attempt, it's queued here and retried
-# automatically on the next poll cycle (~20s later, see the frontend's
-# background timer) — no user action needed. Once a retry succeeds, the
-# existing cleanup-after-consumption logic (_delete_bridge_entry_or_queue,
-# already used by the normal poll path) takes over exactly as it would
-# for a first-try success — no separate cleanup mechanism needed here.
+# a read-receipt whose Cloud Bridge push failed (a transient network blip
+# that outlasted _worker_request's own retries). Rather than leaving the
+# document stuck "En attente" (orange) forever with no further attempt,
+# it's queued here and retried automatically on the next poll cycle
+# (~20s later, see the frontend's background timer) — no user action
+# needed. v2.9.5: a successful retry needs no separate cleanup step of
+# its own — a retried SEND simply reaches the Worker, which stores it
+# exactly as a first-try send would have; a retried RECEIPT reaches
+# /accuse, which deletes the accuser's own KV copy synchronously, same
+# as a first-try accusé.
 # --------------------------------------------------------------------------- #
 def _queue_pending_push(conn, kind: str, payload: dict):
     conn.execute(
@@ -2891,15 +2896,13 @@ def _queue_pending_push(conn, kind: str, payload: dict):
     )
 
 
-def _flush_pending_pushes(key: str, owner: str, repo: str, token: str) -> int:
+def _flush_pending_pushes(key: str, cfg: dict) -> int:
     """
     Retries every queued push, oldest first (returns how many succeeded).
     v2.9.0: the queue is READ in one short connection, each retry then runs
-    its GitHub call with NO connection open, and each outcome is written in
-    its own short transaction. The previous version kept one connection
-    open across all retries while _retry_pending_message_push opened a
-    SECOND write connection on the same file — the poll could lock itself
-    out (and everyone else) as soon as two items were queued.
+    its Worker call with NO connection open, and each outcome is written in
+    its own short transaction. v2.9.5: `cfg` is the Worker bridge config
+    dict, replacing the GitHub owner/repo/token triple.
     """
     with profile_db(key, commit=False) as conn:
         pending = [dict(r) for r in conn.execute("SELECT * FROM bridge_pending_push ORDER BY id ASC").fetchall()]
@@ -2915,12 +2918,11 @@ def _flush_pending_pushes(key: str, owner: str, repo: str, token: str) -> int:
 
         success = False
         if row["kind"] == "message":
-            success = _retry_pending_message_push(payload, owner, repo, token, key)
+            success = _retry_pending_message_push(payload, cfg, key)
         elif row["kind"] == "receipt":
-            success = push_receipt_to_bridge(
-                {"github_owner": owner, "github_repo": repo, "github_token": token},
-                payload["sender_name"], payload.get("sender_key"),
-                payload["tracking"], payload["acknowledger_name"]
+            success = push_worker_receipt(
+                cfg, payload["recipient_own_worker_id"], payload["tracking"],
+                payload.get("sender_worker_id"), payload["acknowledger_name"]
             )
 
         if success:
@@ -2931,7 +2933,7 @@ def _flush_pending_pushes(key: str, owner: str, repo: str, token: str) -> int:
     return flushed
 
 
-def _retry_pending_message_push(payload: dict, owner: str, repo: str, token: str, key: str) -> bool:
+def _retry_pending_message_push(payload: dict, cfg: dict, key: str) -> bool:
     """
     Rebuilds and retries a queued message send. Reads each archived file
     fresh from disk (no duplicated bytes in the queue) and decrypts it with
@@ -2942,6 +2944,9 @@ def _retry_pending_message_push(payload: dict, owner: str, repo: str, token: str
     payload["file_path"]/["file_original_name"] pair — the old shape is
     still read as a one-item fallback, in case a queue entry written by a
     pre-v2.9.4 build is still sitting here across an upgrade.
+    v2.9.5: `cfg` is now the Worker bridge config dict ({worker_url,
+    device_secret, enabled}); payload["sender_role"] (added in v2.9.5)
+    falls back to DEFAULT_ROLE for any entry queued by a pre-v2.9.5 build.
     """
     attachment_specs = payload.get("attachments") or [
         {"file_path": payload["file_path"], "file_original_name": payload["file_original_name"]}
@@ -2956,11 +2961,10 @@ def _retry_pending_message_push(payload: dict, owner: str, repo: str, token: str
         except OSError:
             return False  # one archived file missing/moved — nothing complete to retry with
 
-    cfg = {"github_owner": owner, "github_repo": repo, "github_token": token}
-    success = push_to_bridge(
+    success = push_to_worker_bridge(
         cfg, payload["recipient"], payload["recipient_role"], payload["sender"],
-        payload.get("sender_institution_key"), payload["subject"], payload["body"],
-        payload["tracking"], attachments
+        payload.get("sender_role", DEFAULT_ROLE), payload.get("sender_institution_key"),
+        payload["subject"], payload["body"], payload["tracking"], attachments
     )
     if success:
         _db_write(key, "UPDATE messages SET delivery_method = 'bridge' WHERE tracking_number = ?",
@@ -2970,149 +2974,62 @@ def _retry_pending_message_push(payload: dict, owner: str, repo: str, token: str
 
 # --------------------------------------------------------------------------- #
 # "Établissements connectés" (v2.8.0) — presence directory.
+# v2.9.5: GET /presence on the Worker replaces the whole GitHub-era
+# directory/ folder mechanism — KV's own expirationTtl (90s, set in
+# _send_worker_heartbeat) means a device that stops announcing itself
+# simply stops appearing in the list, automatically, with nothing for
+# TASHIL to track, compare timestamps against, or let the person
+# manually clear (see api_bridge_directory below: the v2.9.1 single-
+# delete/"Vider la liste" actions have no equivalent anymore — there is
+# nothing stale left to clean, by construction).
 #
-# ⚠️ Real design constraint, worth understanding: the bridge repo has no
-# built-in registry of institutions — a folder under bridge/<address>/
-# only exists once someone has actually SENT a message there. There was
-# no way to answer "which institutions are configured/active on the
-# network" from the existing structure alone. This adds an explicit
-# heartbeat: each unlocked device periodically writes its own presence
-# file to directory/<institution_key>.json, piggybacked on the existing
-# bridge poll cycle (no extra timer). "Connecté" here means "has recently
-# written a heartbeat" — a device that's been closed for a while will
-# correctly show as offline once its last heartbeat goes stale, not
-# because anything failed, simply because it stopped announcing itself.
+# v2.9.3's network-wide duplicate-registration guard (the
+# "registrations/<key>.json" ledger) is likewise superseded entirely by
+# the Worker's own /register + device binding (see the Cloudflare Worker
+# Bridge section and api_save_profile below) — one mechanism doing the
+# same job, not two.
 # --------------------------------------------------------------------------- #
-_HEARTBEAT_STALE_AFTER_SECONDS = 180  # v2.9.1: matches the "3 minutes" already promised in the UI text
-                                      # (was 240s/4 missed beats since v2.9.0 — the UI copy always said
-                                      # 3 min, so this was a real mismatch, not just a tuning choice).
-
-
-# --------------------------------------------------------------------------- #
-# v2.9.3 — Network-wide duplicate-registration guard.
-#
-# institution_key is DETERMINISTIC (wilaya + type + name + role) by design
-# since v2.8.5 — two devices onboarding "the same" establishment+role would
-# compute the IDENTICAL key. Locally that's harmless (registry.db's own
-# PRIMARY KEY already refuses a second local row with the same key — see
-# the new friendly check in api_save_profile below). Across TWO DIFFERENT
-# devices sharing one Cloud Bridge, nothing previously stopped a second PC
-# from freely creating its OWN independent profile under that same key —
-# a real problem, since Bridge delivery and routing assume institution_key
-# uniquely identifies one establishment on the whole network.
-#
-# `registrations/<institution_key>.json` is a PERMANENT identity ledger,
-# separate from the EPHEMERAL presence heartbeat in `directory/` (which
-# "Vider la liste" in v2.9.1 can freely clear without touching this at
-# all — clearing who's currently seen online must never erase who is
-# authorized to claim an identity). It stores only a HASH of the PIN that
-# was in effect when this institution_key was first claimed on the
-# network — never the PIN itself.
-def _fetch_registration(owner: str, repo: str, token: str, institution_key: str):
-    """Returns (record_dict_or_None, sha_or_None, error_status_or_None)."""
-    path = f"registrations/{institution_key}.json"
-    status, content = _github_request("GET", f"/repos/{owner}/{repo}/contents/{path}", token)
-    if status == 404:
-        return None, None, None
-    if status != 200 or "content" not in content:
-        return None, None, status
-    try:
-        record = json.loads(base64.b64decode(content["content"]).decode("utf-8"))
-    except (ValueError, KeyError):
-        return None, None, None  # corrupt entry — treat as "not registered" rather than block everyone
-    return record, content.get("sha"), None
-
-
-def _claim_registration(owner: str, repo: str, token: str, institution_key: str, profile_fields: dict, pin_hash: str):
-    """Writes registrations/<key>.json — called once, right after a NEW
-    institution_key is first created locally with a network-wide check
-    already passed (or with no Bridge configured yet — see
-    _ensure_registration_claimed for that catch-up path). Never
-    overwrites an existing record: claiming is a one-time event per key."""
-    payload = {
-        "institution_key": institution_key,
-        "institution_name": profile_fields["institution_name"],
-        "institution_type": profile_fields["institution_type"],
-        "wilaya_name": profile_fields.get("wilaya_name", ""),
-        "role": profile_fields.get("role", DEFAULT_ROLE),
-        "pin_hash": pin_hash,
-        "registered_at": datetime.now().isoformat(),
-    }
-    payload_b64 = base64.b64encode(json.dumps(payload, ensure_ascii=False).encode("utf-8")).decode("utf-8")
-    _github_request("PUT", f"/repos/{owner}/{repo}/contents/registrations/{institution_key}.json", token,
-                     {"message": f"TASHIL: claim {institution_key}", "content": payload_b64})
-
-
-def _ensure_registration_claimed(owner: str, repo: str, token: str, profile: dict):
+def _ensure_worker_registration(cfg: dict, profile: dict):
     """
-    v2.9.3: self-healing catch-up, run once per heartbeat cycle (cheap —
-    one conditional-ish GET). Covers two gaps that a claim-at-onboarding-
-    time-only approach would miss:
-      1. The very FIRST profile ever created on a brand-new device, before
-         the Cloud Bridge is even configured (provisioning normally
-         happens in Paramètres, AFTER onboarding) — there is nothing to
-         check against yet at that moment.
-      2. A claim PUT that failed at onboarding time (a network hiccup) —
-         Cloud Bridge already tries best-effort at creation, this is the
-         backstop.
-    Never overwrites a record that already exists — if one is already
-    there (this device's own earlier claim, or another device's), this
-    is a no-op, not a re-claim.
+    v2.9.5: self-healing catch-up, run once per heartbeat cycle — mirrors
+    the GitHub-era _ensure_registration_claimed()'s role. Covers a profile
+    created before the Worker URL was configured (provisioning normally
+    happens in Paramètres, AFTER the first profile is onboarded — nothing
+    to register against yet at that exact moment) or a /register call that
+    failed at onboarding time (a network hiccup). profiles.worker_registered
+    tracks whether THIS device already knows it succeeded, so a healthy
+    network doesn't re-call /register every single heartbeat for nothing.
     """
-    record, _sha, err = _fetch_registration(owner, repo, token, profile["institution_key"])
-    if err is not None or record is not None:
-        return  # already claimed (by us or, in principle, resolved elsewhere) — nothing to do
-    _claim_registration(owner, repo, token, profile["institution_key"], profile, profile["pin_hash"])
+    if profile.get("worker_registered"):
+        return
+    worker_id = bridge_slug(profile["institution_name"], profile.get("role") or DEFAULT_ROLE)
+    status, _ = _worker_request(cfg["worker_url"], "POST", "/register", {
+        "institution_id": worker_id, "secret_key": cfg["device_secret"],
+        "hardware_id": get_hardware_fingerprint(),
+    })
+    if status == 200:
+        _db_write(profile["institution_key"],
+                  "UPDATE profiles SET worker_registered = 1 WHERE institution_key = ?",
+                  (profile["institution_key"],))
+    # A 401 here means this device's OWN secret doesn't match whatever is
+    # already bound to this institution_id on the Worker — nothing to
+    # retry automatically (this is exactly the case api_save_profile's
+    # original_secret_key flow exists to resolve, once, with the person's
+    # help); left unregistered, retried again next heartbeat in case the
+    # secret gets adopted correctly in the meantime.
 
 
-def _send_heartbeat(owner: str, repo: str, token: str, profile: dict):
-    payload = {
-        "institution_key": profile["institution_key"],
-        "institution_name": profile["institution_name"],
-        "institution_type": profile["institution_type"],
-        "wilaya_name": profile["wilaya_name"],
-        "last_seen": datetime.now().isoformat(),
-    }
-    payload_b64 = base64.b64encode(
-        json.dumps(payload, ensure_ascii=False).encode("utf-8")
-    ).decode("utf-8")
-    path = f"directory/{profile['institution_key']}.json"
-
-    # Need the current sha to update an existing file — GitHub's Contents
-    # API rejects an overwrite without it. A fresh heartbeat file has none.
-    status, existing = _github_request("GET", f"/repos/{owner}/{repo}/contents/{path}", token)
-    body = {"message": f"TASHIL heartbeat: {profile['institution_name']}", "content": payload_b64}
-    if status == 200 and "sha" in existing:
-        body["sha"] = existing["sha"]
-
-    _github_request("PUT", f"/repos/{owner}/{repo}/contents/{path}", token, body)
-
-
-def _fetch_directory_records(owner: str, repo: str, token: str):
-    """Returns (records, error_status). Each record is the raw heartbeat
-    JSON plus its own GitHub path/sha (needed for individual deletion)."""
-    status, listing = _github_request("GET", f"/repos/{owner}/{repo}/contents/directory", token, use_etag=True)
-    if status == 404:
-        return [], None
-    if status != 200:
-        return [], status
-
-    records = []
-    for entry in listing:
-        if not entry["name"].endswith(".json"):
-            continue
-        file_status, content = _github_request("GET", entry["url"], token)
-        if file_status != 200 or "content" not in content:
-            continue
-        try:
-            record = json.loads(base64.b64decode(content["content"]).decode("utf-8"))
-            datetime.fromisoformat(record["last_seen"])  # validate shape early
-        except (ValueError, KeyError):
-            continue
-        record["_path"] = f"directory/{entry['name']}"
-        record["_sha"] = entry["sha"]
-        records.append(record)
-    return records, None
+def _send_worker_heartbeat(cfg: dict, profile: dict):
+    """v2.9.5: one POST /heartbeat — the Worker sets the 90s KV TTL
+    itself (PRESENCE_TTL_SECONDS in the Worker script); nothing for the
+    client to manage. Addressed by bridge_slug(name, role), same as
+    every other Worker call for this profile."""
+    worker_id = bridge_slug(profile["institution_name"], profile.get("role") or DEFAULT_ROLE)
+    _worker_request(cfg["worker_url"], "POST", "/heartbeat", {
+        "institution_id": worker_id, "secret_key": cfg["device_secret"],
+        "display_name": profile["institution_name"],
+        "wilaya_name": profile["wilaya_name"], "institution_type": profile["institution_type"],
+    })
 
 
 @app.route("/api/bridge/directory", methods=["GET"])
@@ -3123,125 +3040,62 @@ def api_bridge_directory():
     if not cfg or not cfg["enabled"]:
         return jsonify({"bridge_enabled": False, "institutions": []})
 
-    owner, repo, token = cfg["github_owner"], cfg["github_repo"], cfg["github_token"]
-    records, err = _fetch_directory_records(owner, repo, token)
-    if err is not None:
-        return jsonify({"error": f"Erreur GitHub ({err})."}), 502
+    status, data = _worker_request(cfg["worker_url"], "GET", "/presence")
+    if status != 200:
+        return jsonify({"error": f"Erreur Worker ({status})."}), 502
+    records = data.get("institutions", [])
 
-    # v2.9.1: DEDUPLICATION. Before this version, every role/profile at the
-    # same institution (DIRECTEUR, DRH, DAS, SECRETARIAT_DIRECTION... each
-    # has its own institution_key since v2.8.5) wrote its own heartbeat
-    # file, so the SAME establishment name could appear several times in
-    # this list — which is what was reported as "duplicates". Grouped here
-    # by institution_name (not institution_key): one row per establishment,
-    # keeping only the MOST RECENT heartbeat (MAX(last_seen)) among its
-    # profiles/roles. The underlying per-role files are untouched — this
-    # is a display + deletion-target grouping, not a change to how
-    # heartbeats are written.
-    now = datetime.now()
+    # v2.9.1: DEDUPLICATION, kept unchanged from the GitHub-era logic —
+    # every role/profile at the same institution (DIRECTEUR, DRH, DAS,
+    # SECRETARIAT_DIRECTION... each addressed separately — see
+    # bridge_slug) still announces its own heartbeat, so the SAME
+    # establishment name can appear more than once in the raw /presence
+    # list. Grouped here by institution_name: one row per establishment,
+    # keeping the MOST RECENT last_seen among its roles.
+    #
+    # v2.9.5: online/offline filtering itself is GONE — every entry
+    # /presence returns is, by construction, within the Worker's own 90s
+    # presence TTL (an expired KV key is simply absent from the list),
+    # so there is no "online: false" case left to compute; everything
+    # shown here is inherently online right now.
     grouped = {}
     for record in records:
-        name = record.get("institution_name", "?")
+        name = record.get("display_name", "?")
         last_seen = datetime.fromisoformat(record["last_seen"])
         if name not in grouped:
-            # Bug fixed during testing: an earlier version of this loop
-            # rebuilt a brand-new dict (with an empty _paths list) every
-            # time a NEWER record for the same name arrived, which threw
-            # away every path already accumulated for that name — a
-            # multi-role establishment (DIRECTEUR + DRH, say) would then
-            # report entry_count=1 and a DELETE would miss one of its
-            # files. Now the dict is created only ONCE per name and its
-            # display fields are updated in place; _paths always grows.
             grouped[name] = {
                 "institution_name": name,
                 "institution_type": record.get("institution_type", ""),
                 "wilaya_name": record.get("wilaya_name", ""),
                 "last_seen": record["last_seen"],
                 "_last_seen_dt": last_seen,
-                "_paths": [],  # every file behind this display row — a delete removes them all
+                "entry_count": 0,
             }
         elif last_seen > grouped[name]["_last_seen_dt"]:
             grouped[name]["institution_type"] = record.get("institution_type", "")
             grouped[name]["wilaya_name"] = record.get("wilaya_name", "")
             grouped[name]["last_seen"] = record["last_seen"]
             grouped[name]["_last_seen_dt"] = last_seen
-        grouped[name]["_paths"].append({"path": record["_path"], "sha": record["_sha"]})
+        grouped[name]["entry_count"] += 1
 
-    institutions = []
-    for name, g in grouped.items():
-        age_seconds = (now - g["_last_seen_dt"]).total_seconds()
-        institutions.append({
-            "institution_name": g["institution_name"],
-            "institution_type": g["institution_type"],
-            "wilaya_name": g["wilaya_name"],
-            "last_seen": g["last_seen"],
-            "online": age_seconds <= _HEARTBEAT_STALE_AFTER_SECONDS,
-            "entry_count": len(g["_paths"]),  # >1 = several roles heartbeating under this name
-        })
-
-    institutions.sort(key=lambda i: (not i["online"], i["institution_name"]))
+    institutions = [
+        {"institution_name": g["institution_name"], "institution_type": g["institution_type"],
+         "wilaya_name": g["wilaya_name"], "last_seen": g["last_seen"], "online": True,
+         "entry_count": g["entry_count"]}
+        for g in grouped.values()
+    ]
+    institutions.sort(key=lambda i: i["institution_name"])
     return jsonify({"bridge_enabled": True, "institutions": institutions})
 
 
-@app.route("/api/bridge/directory/<path:institution_name>", methods=["DELETE"])
-def api_bridge_directory_delete(institution_name):
-    """v2.9.1: removes an establishment from the CONNECTED list only — this
-    deletes its directory/*.json heartbeat file(s), never its messages,
-    archives, or profile. It will simply reappear at its next heartbeat if
-    that device is still active; this is a display/history cleanup action,
-    not a way to disconnect or ban an institution."""
-    if _active_key is None:
-        return locked_response()
-    cfg = get_bridge_config()
-    if not cfg or not cfg["enabled"]:
-        return jsonify({"error": "Le Réseau TASHIL n'est pas configuré."}), 400
-
-    owner, repo, token = cfg["github_owner"], cfg["github_repo"], cfg["github_token"]
-    records, err = _fetch_directory_records(owner, repo, token)
-    if err is not None:
-        return jsonify({"error": f"Erreur GitHub ({err})."}), 502
-
-    matches = [r for r in records if r.get("institution_name") == institution_name]
-    if not matches:
-        return jsonify({"error": "Établissement introuvable dans l'annuaire."}), 404
-
-    deleted, failed = 0, 0
-    for r in matches:
-        status, _ = _github_request("DELETE", f"/repos/{owner}/{repo}/contents/{r['_path']}", token,
-                                     {"message": f"TASHIL: retrait annuaire ({institution_name})", "sha": r["_sha"]})
-        if status in (200, 204, 404):
-            deleted += 1
-        else:
-            failed += 1
-
-    return jsonify({"ok": failed == 0, "deleted": deleted, "failed": failed})
-
-
-@app.route("/api/bridge/directory", methods=["DELETE"])
-def api_bridge_directory_clear():
-    """v2.9.1: 'Vider la liste' — deletes every heartbeat file. Same scope
-    guarantee as the single-entry delete: history only, never messages."""
-    if _active_key is None:
-        return locked_response()
-    cfg = get_bridge_config()
-    if not cfg or not cfg["enabled"]:
-        return jsonify({"error": "Le Réseau TASHIL n'est pas configuré."}), 400
-
-    owner, repo, token = cfg["github_owner"], cfg["github_repo"], cfg["github_token"]
-    records, err = _fetch_directory_records(owner, repo, token)
-    if err is not None:
-        return jsonify({"error": f"Erreur GitHub ({err})."}), 502
-
-    deleted, failed = 0, 0
-    for r in records:
-        status, _ = _github_request("DELETE", f"/repos/{owner}/{repo}/contents/{r['_path']}", token,
-                                     {"message": "TASHIL: purge annuaire", "sha": r["_sha"]})
-        if status in (200, 204, 404):
-            deleted += 1
-        else:
-            failed += 1
-
-    return jsonify({"ok": failed == 0, "deleted": deleted, "failed": failed})
+# v2.9.5: the v2.9.1 single-delete ("🗑️" per row) and "Vider la liste"
+# routes are REMOVED — with the GitHub directory/ folder, a stale entry
+# lingered forever until manually deleted; with the Worker's 90s presence
+# TTL, nothing lingers in the first place. There is no equivalent action
+# left to perform: a listed establishment is, by definition, online right
+# now, and anything offline has already vanished on its own. The
+# corresponding 🗑️/"Vider la liste" buttons are removed from the
+# Établissements view (see templates/index.html and app.js).
 
 
 # --------------------------------------------------------------------------- #
@@ -3293,29 +3147,26 @@ def api_diagnostics_sqlite():
                     "db_size_bytes": size_bytes, "db_path": db_path})
 
 
-@app.route("/api/diagnostics/github-quota", methods=["GET"])
-def api_diagnostics_github_quota():
-    """GitHub's own /rate_limit endpoint — a plain authenticated GET that
-    costs nothing against the QUOTA it reports (GitHub explicitly excludes
-    it). Reused as-is rather than parsing rate-limit response HEADERS off
-    some other call, which would only reflect whatever endpoint happened
-    to be hit last."""
+@app.route("/api/diagnostics/bridge-status", methods=["GET"])
+def api_diagnostics_bridge_status():
+    """
+    v2.9.5: replaces the GitHub-era rate-limit display — the Cloudflare
+    Worker Bridge has no shared, rationed quota to show, so there is
+    nothing equivalent to display a NUMBER for. Instead: a live
+    Connecté/Déconnecté check against the Worker's public, unauthenticated
+    /health route (no secret_key involved — this checks reachability, not
+    credentials, same split as api_bridge_network_test above).
+    """
     if _active_key is None:
         return locked_response()
     cfg = get_bridge_config()
     if not cfg or not cfg["enabled"]:
-        return jsonify({"ok": True, "bridge_enabled": False})
+        return jsonify({"ok": True, "bridge_enabled": False, "connected": False})
 
-    status, body = _github_request("GET", "/rate_limit", cfg["github_token"])
-    if status != 200:
-        return jsonify({"error": f"Erreur GitHub ({status})."}), 502
-    core = body.get("resources", {}).get("core", {})
-    return jsonify({
-        "ok": True, "bridge_enabled": True,
-        "remaining": core.get("remaining"), "limit": core.get("limit"),
-        "reset_at": (datetime.fromtimestamp(core["reset"]).isoformat()
-                     if core.get("reset") else None),
-    })
+    status, data = _worker_request(cfg["worker_url"], "GET", "/health", _max_retries=0)
+    connected = status == 200 and data.get("ok") is True
+    return jsonify({"ok": True, "bridge_enabled": True, "connected": connected,
+                    "worker_url": cfg["worker_url"]})
 
 
 @app.route("/api/maintenance/vacuum", methods=["POST"])
@@ -3352,12 +3203,21 @@ def api_maintenance_vacuum():
 
 @app.route("/api/maintenance/clear-cache", methods=["POST"])
 def api_maintenance_clear_cache():
-    """Purges TASHIL_DATA/tmp/ only — a scratch folder this app itself may
-    write incomplete/temporary files into (e.g. an interrupted HEIC->JPEG
-    normalization or QR decode temp file). Deliberately does NOT touch
-    archives/, registry.db, or any profile's tashil.db: those are real
-    documents and real data, never "cache". If the tmp folder does not
-    exist (nothing has ever needed it), this is a safe no-op."""
+    """
+    v2.9.5: explicitly LOCAL-only maintenance — purges TASHIL_DATA/tmp/
+    (a scratch folder this app itself may write incomplete/temporary
+    files into, e.g. an interrupted HEIC->JPEG normalization or QR decode
+    temp file) and VACUUMs registry.db (compacts the file on disk — never
+    deletes a row; the device-wide list of profiles/bridge_config is
+    untouched). Deliberately does NOT touch archives/ or any profile's
+    own tashil.db (that is real data, and already has its own dedicated
+    "Optimiser la base de données" action for the ACTIVE profile).
+    There is nothing left to clean on the Cloudflare side: the Worker
+    purges a message's KV entries itself the moment it's accused (see
+    the Worker's /accuse), and MESSAGE_TTL_SECONDS is its own automatic
+    safety net for anything that never gets accused — neither needs, or
+    offers, a client-triggered cleanup call.
+    """
     tmp_dir = os.path.join(os.path.expanduser("~"), "TASHIL_DATA", "tmp")
     freed_bytes, removed = 0, 0
     if os.path.isdir(tmp_dir):
@@ -3371,7 +3231,23 @@ def api_maintenance_clear_cache():
                     removed += 1
             except OSError:
                 continue  # a file that vanished or is locked mid-use — skip, not fatal
-    return jsonify({"ok": True, "files_removed": removed, "freed_bytes": freed_bytes})
+
+    registry_vacuumed = False
+    try:
+        registry_path = os.path.join(os.path.expanduser("~"), "TASHIL_DATA", "registry.db")
+        if os.path.isfile(registry_path):
+            conn = sqlite3.connect(registry_path, timeout=DB_TIMEOUT_SECONDS)
+            try:
+                conn.execute("VACUUM;")
+                conn.commit()
+            finally:
+                conn.close()
+            registry_vacuumed = True
+    except sqlite3.Error:
+        pass  # non-fatal — the tmp purge above already ran and is reported regardless
+
+    return jsonify({"ok": True, "files_removed": removed, "freed_bytes": freed_bytes,
+                    "registry_vacuumed": registry_vacuumed})
 
 
 # --------------------------------------------------------------------------- #
@@ -3397,7 +3273,6 @@ BRIDGE_POLL_SECONDS = max(5, int(os.environ.get("TASHIL_BRIDGE_POLL_SECONDS", "1
 HEARTBEAT_EVERY_SECONDS = 60
 _POLL_LOCK = threading.Lock()
 _last_heartbeat = {}          # institution_key -> time.monotonic() of last beat
-_bridge_keep_ensured = set()  # (owner, repo) for which bridge/.keep was attempted
 _bridge_loop_started = False
 
 
@@ -3414,7 +3289,6 @@ def _emit_ui(key, event: str, payload: dict = None):
 def _ui_session_closed(key):
     """Called when a profile is locked/deleted: tell its UI, empty its room,
     and drop per-session caches so nothing leaks into the next profile."""
-    _ETAG_CACHE.clear()
     _last_heartbeat.pop(key, None)
     if socketio is not None and key:
         _emit_ui(key, "session_locked")
@@ -3450,53 +3324,6 @@ def _session_is(key, fernet) -> bool:
     return _active_key == key and _active_fernet is fernet
 
 
-def _ensure_bridge_keep(owner: str, repo: str, token: str):
-    """GitHub removes a folder when its last file is deleted, and a 404
-    listing can never be cached (it always counts against the quota). A
-    permanent bridge/.keep keeps the folder alive so the idle poll is a
-    free 304. Attempted once per process; harmless if it already exists."""
-    marker = (owner, repo)
-    if marker in _bridge_keep_ensured:
-        return
-    _bridge_keep_ensured.add(marker)
-    _github_request(
-        "PUT", f"/repos/{owner}/{repo}/contents/bridge/.keep", token,
-        {"message": "TASHIL bridge: keep folder",
-         "content": base64.b64encode(b"TASHIL bridge queue\n").decode("ascii")}
-    )
-
-
-def _list_bridge_entries(owner: str, repo: str, token: str, slugs):
-    """Returns (json_entries, receipt_entries, error_status). One cached
-    listing of bridge/ tells us which of OUR folders exist; we only list
-    those (and receipts/ only if it is really there)."""
-    st, top = _github_request("GET", f"/repos/{owner}/{repo}/contents/bridge", token, use_etag=True)
-    if st == 404:
-        _ensure_bridge_keep(owner, repo, token)
-        return [], [], None
-    if st != 200:
-        return [], [], st
-    existing_dirs = {e.get("name") for e in top if e.get("type") == "dir"}
-
-    json_entries, receipt_entries = [], []
-    for slug in slugs:
-        if slug not in existing_dirs:
-            continue
-        s, listing = _github_request("GET", f"/repos/{owner}/{repo}/contents/bridge/{slug}", token, use_etag=True)
-        if s == 200:
-            json_entries.extend(f for f in listing if f.get("name", "").endswith(".json"))
-            if any(f.get("name") == "receipts" and f.get("type") == "dir" for f in listing):
-                r_s, r_listing = _github_request(
-                    "GET", f"/repos/{owner}/{repo}/contents/bridge/{slug}/receipts", token, use_etag=True)
-                if r_s == 200:
-                    receipt_entries.extend(f for f in r_listing if f.get("name", "").endswith(".json"))
-                elif r_s != 404:
-                    return [], [], r_s
-        elif s != 404:
-            return [], [], s
-    return json_entries, receipt_entries, None
-
-
 def run_bridge_poll(notify: bool = False) -> dict:
     """One poll cycle for the CURRENTLY ACTIVE profile. Safe to call
     repeatedly; a second concurrent call returns {"busy": True}.
@@ -3522,79 +3349,74 @@ def _run_bridge_poll_locked(notify: bool) -> dict:
     profile = get_profile_row(key)
     if profile is None:
         return {"ok": True, "bridge_enabled": False, "new_messages": 0, "receipts": []}
-    owner, repo, token = cfg["github_owner"], cfg["github_repo"], cfg["github_token"]
     paths = profile_paths(key)
+    own_worker_id = bridge_slug(profile["institution_name"], profile.get("role") or DEFAULT_ROLE)
 
-    # 1) Retry failed outgoing pushes and failed cleanups (no connection held).
-    flushed = _flush_pending_pushes(key, owner, repo, token)
-    _retry_pending_bridge_cleanup(key, owner, repo, token)
+    # 1) Retry failed outgoing pushes (no connection held during the network call).
+    flushed = _flush_pending_pushes(key, cfg)
 
-    # 2) Presence heartbeat — every HEARTBEAT_EVERY_SECONDS, not every cycle.
+    # 2) Presence heartbeat + registration catch-up — every
+    # HEARTBEAT_EVERY_SECONDS, not every cycle (same cadence as before;
+    # the Worker's own 90s presence TTL relies on this staying regular).
     now_m = time.monotonic()
     last = _last_heartbeat.get(key)
     if last is None or now_m - last >= HEARTBEAT_EVERY_SECONDS:
         try:
-            _send_heartbeat(owner, repo, token, profile)
-            _ensure_registration_claimed(owner, repo, token, profile)  # v2.9.3
+            _send_worker_heartbeat(cfg, profile)
+            _ensure_worker_registration(cfg, profile)
         except Exception:
             pass
         _last_heartbeat[key] = now_m
 
-    # 3) List what is addressed to us (name form AND exact routing-ID form).
-    profile_role = profile.get("role") or DEFAULT_ROLE
-    slugs = sorted({bridge_slug(profile["institution_name"], profile_role),
-                    bridge_slug(profile["institution_key"])})
-    json_entries, receipt_entries, err = _list_bridge_entries(owner, repo, token, slugs)
-    if err is not None:
-        return {"error": f"Erreur GitHub ({err}).", "error_status": err}
+    # 3) List what is addressed to us — ONE call (GET /poll) returns
+    # every pending message's metadata (not attachment content yet).
+    # v2.9.5: unlike the GitHub Bridge, a message is NOT removed here on
+    # import — it stays in the Worker's KV (within its TTL safety net)
+    # until the person explicitly clicks "Accusé" (see route_read_receipt
+    # / push_worker_receipt). So /poll can keep returning the SAME
+    # message on every cycle until then; the already_have check below is
+    # what keeps that from re-importing it locally more than once.
+    poll_status, poll_data = _worker_request(
+        cfg["worker_url"], "GET", "/poll", query={"institution_id": own_worker_id, "secret_key": cfg["device_secret"]})
+    if poll_status != 200:
+        return {"error": f"Erreur Worker ({poll_status}).", "error_status": poll_status}
 
     # 4) Import new messages: network first, then ONE short write each.
     imported = []
-    for entry in json_entries:
+    for meta in poll_data.get("messages", []):
         if not _session_is(key, fernet):
             break
-        meta_status, meta_content = _github_request("GET", entry["url"], token)
-        if meta_status != 200 or "content" not in meta_content:
-            continue
-        try:
-            meta = json.loads(base64.b64decode(meta_content["content"]).decode("utf-8"))
-            tracking = meta["tracking_number"]
-        except (ValueError, KeyError):
+        tracking = meta.get("tracking_number")
+        if not tracking:
             continue
 
         with profile_db(key, commit=False) as rconn:
             already_have = rconn.execute(
                 "SELECT 1 FROM messages WHERE tracking_number = ?", (tracking,)).fetchone()
         if already_have:
-            continue  # imported earlier; leftover cleanup is handled by the pending-cleanup queue
+            continue  # already imported in an earlier cycle; still sits in KV until accused
 
-        # v2.9.4: meta["attachments"] (a list of {path_in_repo,
-        # file_original_name}) replaces the old singular
-        # attachment_path_in_repo/file_original_name pair. A message
-        # pushed by a PRE-v2.9.4 sender elsewhere on the network won't
-        # have that key at all — push_to_bridge() on THIS build always
-        # writes both for exactly this reason, but a peer still running
-        # an older build only ever wrote the old singular pair, so this
-        # falls back to treating that as a one-item list.
-        attachment_specs = meta.get("attachments") or (
-            [{"path_in_repo": meta["attachment_path_in_repo"],
-              "file_original_name": meta.get("file_original_name", "document")}]
-            if "attachment_path_in_repo" in meta else []
-        )
+        attachment_specs = meta.get("attachments") or []
         if not attachment_specs:
-            continue  # malformed/legacy entry with no attachment info at all — nothing to import
+            continue  # malformed entry with no attachment info at all — nothing to import
 
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
         tag = sanitize(meta.get("sender_institution", "DISTANT")).replace(" ", "")[:30]
-        downloaded = []  # [{"local_path", "original_filename", "repo_path", "sha"}, ...]
+        downloaded = []  # [{"local_path", "original_filename"}, ...]
         all_attachments_ok = True
         for a_idx, spec in enumerate(attachment_specs):
-            attach_status, attach_content = _github_request(
-                "GET", f"/repos/{owner}/{repo}/contents/{spec['path_in_repo']}", token)
-            if attach_status != 200 or "content" not in attach_content:
+            fetch_status, fetch_data = _worker_request(
+                cfg["worker_url"], "GET", "/fetch-attachment",
+                query={"institution_id": own_worker_id, "secret_key": cfg["device_secret"],
+                       "tracking": tracking, "index": a_idx})
+            if fetch_status != 200 or "content_base64" not in fetch_data:
                 all_attachments_ok = False
                 break
-            file_bytes = base64.b64decode(attach_content["content"])
+            try:
+                file_bytes = base64.b64decode(fetch_data["content_base64"])
+            except (ValueError, TypeError):
+                all_attachments_ok = False
+                break
 
             if not _session_is(key, fernet):   # locked/switched mid-download: never write with the wrong key
                 all_attachments_ok = False
@@ -3608,15 +3430,13 @@ def _run_bridge_poll_locked(notify: bool) -> dict:
             except OSError:
                 all_attachments_ok = False
                 break
-            downloaded.append({"local_path": local_path,
-                                "original_filename": spec.get("file_original_name", "document"),
-                                "repo_path": spec["path_in_repo"], "sha": attach_content["sha"]})
+            downloaded.append({"local_path": local_path, "original_filename": spec.get("file_original_name", "document")})
 
         if not all_attachments_ok:
             # Partial download — clean up whatever DID land locally rather
             # than leaving an orphaned file with no message row pointing
-            # to it, and leave the entry on the Bridge for a later retry
-            # (it was never marked imported, so the next poll tries again).
+            # to it. The entry is untouched on the Worker (nothing was
+            # ever deleted there pre-accusé) — the next poll just retries.
             for d in downloaded:
                 try:
                     os.remove(d["local_path"])
@@ -3634,13 +3454,13 @@ def _run_bridge_poll_locked(notify: bool) -> dict:
                     INSERT INTO messages (direction, tracking_number, sender_institution,
                                            recipient_institution, subject, body, file_path,
                                            file_original_name, status, delivery_method, is_read,
-                                           sender_institution_key, created_at)
-                    VALUES ('entrant', ?, ?, ?, ?, ?, ?, ?, 'envoye', 'bridge', 0, ?, ?)
+                                           sender_institution_key, sender_worker_id, created_at)
+                    VALUES ('entrant', ?, ?, ?, ?, ?, ?, ?, 'envoye', 'bridge', 0, ?, ?, ?)
                 """, (tracking, meta.get("sender_institution", "?"),
                       meta.get("recipient_institution", profile["institution_name"]),
                       encrypt_text(meta.get("subject", "")), encrypt_text(meta.get("body", "")),
                       first["local_path"], first["original_filename"],
-                      meta.get("sender_institution_key"),
+                      meta.get("sender_institution_key"), meta.get("sender_institution_id"),
                       meta.get("created_at", datetime.now().isoformat())))
                 new_msg_id = wcur.lastrowid
                 for order, d in enumerate(downloaded):
@@ -3660,29 +3480,23 @@ def _run_bridge_poll_locked(notify: bool) -> dict:
         imported.append({"tracking_number": tracking, "sender": meta.get("sender_institution", "?")})
         if notify:
             _emit_ui(key, "new_document", imported[-1])
+        # No delete here — see the v2.9.5 note above handlePoll's call.
+        # Cleanup happens exclusively in push_worker_receipt()/handleAccuse,
+        # the moment the person clicks "Accusé" in the TASHIL UI.
 
-        # Consume the entries (queued for retry if the DELETE fails).
-        _delete_bridge_entry_or_queue(key, owner, repo, token, entry["url"], entry["sha"])
-        for d in downloaded:
-            _delete_bridge_entry_or_queue(
-                key, owner, repo, token,
-                f"/repos/{owner}/{repo}/contents/{d['repo_path']}", d["sha"])
-
-    # 5) Apply read receipts.
+    # 5) Apply read receipts — ONE call (GET /poll-receipts); the Worker
+    # itself removes each receipt as it's returned (not a permanent log).
     receipts_applied = []
-    for entry in receipt_entries:
-        if _active_key != key:
-            break
-        r_status, r_content = _github_request("GET", entry["url"], token)
-        if r_status != 200 or "content" not in r_content:
-            continue
-        try:
-            receipt = json.loads(base64.b64decode(r_content["content"]).decode("utf-8"))
-        except (ValueError, KeyError):
-            continue
-
-        tracking = receipt.get("tracking_number")
-        if tracking:
+    rcpt_status, rcpt_data = _worker_request(
+        cfg["worker_url"], "GET", "/poll-receipts",
+        query={"institution_id": own_worker_id, "secret_key": cfg["device_secret"]})
+    if rcpt_status == 200:
+        for receipt in rcpt_data.get("receipts", []):
+            if _active_key != key:
+                break
+            tracking = receipt.get("tracking_number")
+            if not tracking:
+                continue
             applied = False
             with profile_db(key) as wconn:
                 wconn.execute("BEGIN IMMEDIATE")
@@ -3699,8 +3513,6 @@ def _run_bridge_poll_locked(notify: bool) -> dict:
                 receipts_applied.append(item)
                 if notify:
                     _emit_ui(key, "receipt_update", item)
-
-        _delete_bridge_entry_or_queue(key, owner, repo, token, entry["url"], entry["sha"])
 
     if notify and flushed:
         _emit_ui(key, "sync_update", {"flushed": flushed})   # a stuck "En attente" document just left

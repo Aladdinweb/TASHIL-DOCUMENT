@@ -237,7 +237,10 @@ async function submitOnboarding() {
   // absent otherwise, so a first, ordinary onboarding attempt never carries it.
   const originalPinBlock = document.getElementById("ob-original-pin-block");
   if (!originalPinBlock.classList.contains("hidden")) {
-    payload.original_pin = document.getElementById("ob-original-pin").value.trim();
+    // v2.9.5: field renamed server-side (original_secret_key) — see
+    // api_save_profile. requires_original_pin (the response flag name)
+    // is left as-is; it's just the boolean signal, not the field itself.
+    payload.original_secret_key = document.getElementById("ob-original-pin").value.trim();
   }
 
   try {
@@ -541,7 +544,6 @@ function showApp() {
     initRealtime();   // v2.9.0: sets up the local socket + its 5 min fallback once
     setupDocumentViewer();          // v2.9.1
     setupDiagnostics();             // v2.9.1
-    setupEtablissementsActions();   // v2.9.1
     state.appInitialized = true;
   }
 
@@ -866,88 +868,44 @@ async function loadScanner() {
 async function loadEtablissements() {
   const container = document.getElementById("etablissements-list");
   const offCard = document.getElementById("etablissements-bridge-off");
-  const clearBtn = document.getElementById("etablissements-clear-btn");
 
   try {
     const data = await fetch("/api/bridge/directory").then(r => parseJsonResponse(r));
     if (!data.bridge_enabled) {
       offCard.classList.remove("hidden");
-      clearBtn.classList.add("hidden");
       container.innerHTML = "";
       return;
     }
     offCard.classList.add("hidden");
 
     if (!data.institutions.length) {
-      clearBtn.classList.add("hidden");
-      container.innerHTML = `<p class="empty-state">Aucun établissement détecté pour le moment. ` +
-        `Ils apparaîtront ici après leur première synchronisation avec le Réseau TASHIL.</p>`;
+      container.innerHTML = `<p class="empty-state">Aucun établissement en ligne pour le moment. ` +
+        `Ils apparaîtront ici dès leur prochaine synchronisation avec le Réseau TASHIL.</p>`;
       return;
     }
-    clearBtn.classList.remove("hidden");
 
-    // v2.9.1: one row per establishment NAME (the backend already merges
-    // every role/profile sharing that name and keeps only the most recent
-    // heartbeat — see api_bridge_directory). A 🗑️ here removes this
-    // establishment from the CONNECTED list only (its heartbeat file(s)):
-    // it never touches messages, archives, or the profile itself, and it
-    // will simply reappear at its next heartbeat if that device is still
-    // active.
+    // v2.9.5: one row per establishment NAME (the backend still merges
+    // every role/profile sharing that name, keeping the most recent
+    // heartbeat). No 🗑️ here anymore — with the Cloudflare Worker's 90s
+    // presence TTL, everything this list shows is inherently online
+    // RIGHT NOW; a stale entry simply isn't returned at all, so there is
+    // nothing left to manually clear (see loadEtablissements' v2.9.1
+    // history for the GitHub-era mechanism this replaced).
     container.innerHTML = data.institutions.map(inst => `
       <div class="list-row">
         <div class="list-row-main">
           <span class="list-row-title">
-            <span class="bridge-dot ${inst.online ? "bridge-dot-on" : "bridge-dot-off"}"></span>
+            <span class="bridge-dot bridge-dot-on"></span>
             ${escapeHtml(inst.institution_name)}
           </span>
           <span class="list-row-sub">${escapeHtml(inst.wilaya_name)} — ${escapeHtml(inst.institution_type)}</span>
         </div>
-        <span class="list-row-badge">${inst.online ? "En ligne" : "Vu " + timeAgo(inst.last_seen)}</span>
-        <div class="list-row-actions">
-          <button class="row-btn danger" data-remove-establishment="${escapeHtml(inst.institution_name)}"
-                  title="Retirer de la liste">🗑️</button>
-        </div>
+        <span class="list-row-badge">En ligne</span>
       </div>
     `).join("");
-
-    container.querySelectorAll("[data-remove-establishment]").forEach(btn => {
-      btn.addEventListener("click", async () => {
-        const name = btn.dataset.removeEstablishment;
-        if (!confirm(`Retirer "${name}" de la liste des établissements connectés ?\n\n` +
-                     `(Ceci n'affecte ni ses messages ni son profil — il réapparaîtra ` +
-                     `automatiquement s'il est encore actif.)`)) return;
-        try {
-          const res = await fetch(`/api/bridge/directory/${encodeURIComponent(name)}`, { method: "DELETE" });
-          const d = await parseJsonResponse(res);
-          if (!res.ok) throw new Error(d.error || "Échec de la suppression.");
-          showToast(`🗑️ "${name}" retiré de la liste`, "success");
-          loadEtablissements();
-        } catch (err) {
-          showToast(`⛔ ${err.message}`, "error");
-        }
-      });
-    });
   } catch (err) {
-    clearBtn.classList.add("hidden");
     container.innerHTML = `<p class="empty-state">⛔ Impossible de charger la liste des établissements.</p>`;
   }
-}
-
-function setupEtablissementsActions() {
-  document.getElementById("etablissements-clear-btn").addEventListener("click", async () => {
-    if (!confirm("Vider entièrement la liste des établissements connectés ?\n\n" +
-                 "Ceci n'affecte ni les messages ni les profils — un établissement encore " +
-                 "actif réapparaîtra automatiquement à son prochain signal.")) return;
-    try {
-      const res = await fetch("/api/bridge/directory", { method: "DELETE" });
-      const d = await parseJsonResponse(res);
-      if (!res.ok) throw new Error(d.error || "Échec de l'opération.");
-      showToast("🗑️ Liste des établissements vidée", "success");
-      loadEtablissements();
-    } catch (err) {
-      showToast(`⛔ ${err.message}`, "error");
-    }
-  });
 }
 
 // ------------------------------------------------------------------ //
@@ -1889,19 +1847,18 @@ async function runDiagnostics() {
     rows.push(diagRow("Intégrité SQLite", `⛔ ${err.message}`, false));
   }
 
-  // 3) Quota GitHub Bridge
+  // 3) v2.9.5: Cloudflare Bridge connection status — replaces the
+  // GitHub-era rate-limit display (the Worker has no shared, rationed
+  // quota to show a number for; this checks live reachability instead).
   try {
-    const q = await fetch("/api/diagnostics/github-quota").then(r => parseJsonResponse(r));
+    const q = await fetch("/api/diagnostics/bridge-status").then(r => parseJsonResponse(r));
     if (!q.bridge_enabled) {
-      rows.push(diagRow("Quota Réseau TASHIL (GitHub)", "non configuré"));
-    } else if (q.error) {
-      rows.push(diagRow("Quota Réseau TASHIL (GitHub)", `⛔ ${q.error}`, false));
+      rows.push(diagRow("Cloudflare Bridge", "non configuré"));
     } else {
-      rows.push(diagRow("Quota Réseau TASHIL (GitHub)",
-        `${q.remaining} / ${q.limit} requêtes restantes`, q.remaining > 100));
+      rows.push(diagRow("Cloudflare Bridge", q.connected ? "🟢 Connecté" : "⚪ Déconnecté", q.connected));
     }
   } catch (err) {
-    rows.push(diagRow("Quota Réseau TASHIL (GitHub)", `⛔ ${err.message}`, false));
+    rows.push(diagRow("Cloudflare Bridge", `⛔ ${err.message}`, false));
   }
 
   out.innerHTML = rows.join("");
@@ -1929,9 +1886,13 @@ function setupDiagnostics() {
     try {
       const d = await fetch("/api/maintenance/clear-cache", { method: "POST" }).then(r => parseJsonResponse(r));
       if (d.error) throw new Error(d.error);
-      statusEl.textContent = d.files_removed > 0
-        ? `✅ ${d.files_removed} fichier(s) temporaire(s) supprimé(s) (${formatBytes(d.freed_bytes)} libérés).`
-        : "✅ Aucun fichier temporaire obsolète à nettoyer.";
+      // v2.9.5: local-only maintenance — the Cloudflare side purges
+      // itself (accusé-triggered delete + TTL safety net), nothing to
+      // clean there from this button.
+      const tmpPart = d.files_removed > 0
+        ? `${d.files_removed} fichier(s) temporaire(s) supprimé(s) (${formatBytes(d.freed_bytes)} libérés)`
+        : "aucun fichier temporaire obsolète";
+      statusEl.textContent = `✅ ${tmpPart}${d.registry_vacuumed ? ", registre local optimisé" : ""}.`;
     } catch (err) {
       statusEl.textContent = `⛔ ${err.message}`;
     }
@@ -1984,14 +1945,37 @@ function isNewer(remote, current) {
 async function checkForUpdate(ids) {
   const statusEl = document.getElementById(ids.status);
   const banner = document.getElementById(ids.banner);
+  // v2.9.5 bug fix: a re-check always fully resets both the status line
+  // AND the banner (hidden, message, link all cleared) before doing
+  // anything else — any earlier code path that returned without
+  // explicitly hiding the banner again could otherwise leave a STALE
+  // "update available" banner on screen even once the comparison below
+  // correctly finds no update, since nothing had ever un-shown it.
   statusEl.className = "status-line";
   statusEl.textContent = "Recherche en cours...";
   banner.classList.add("hidden");
+  document.getElementById(ids.message).textContent = "";
+  document.getElementById(ids.link).href = "#";
 
   try {
+    // v2.9.5 bug fix, main cause: state.meta.app_version was fetched
+    // ONCE at page load and then reused for every later re-check in the
+    // same browser session/tab — so clicking "Vérifier les mises à
+    // jour" a second time (after installing an update and relaunching
+    // TASHIL, for instance) kept comparing against the OLD version
+    // number baked into this page load, never noticing the running app
+    // had actually changed. A fresh GET /api/meta here fixes that at
+    // the root: every check now reflects the server's CURRENT
+    // app_version, not a cached one. { cache: "no-store" } on both
+    // requests additionally rules out the browser's own HTTP cache
+    // serving a stale response to a quick repeat click.
+    const meta = await fetch("/api/meta", { cache: "no-store" }).then(r => r.json());
+    state.meta.app_version = meta.app_version;
+    state.meta.github_repo = meta.github_repo;
+
     const res = await fetch(
       `https://api.github.com/repos/${state.meta.github_repo}/releases/latest`,
-      { headers: { "Accept": "application/vnd.github+json" } }
+      { headers: { "Accept": "application/vnd.github+json" }, cache: "no-store" }
     );
     if (!res.ok) throw new Error(`GitHub a répondu avec le statut ${res.status}`);
     const release = await res.json();
@@ -2008,7 +1992,8 @@ async function checkForUpdate(ids) {
       banner.classList.remove("hidden");
       statusEl.textContent = "";
     } else {
-      statusEl.textContent = "✅ TASHIL est à jour.";
+      banner.classList.add("hidden");  // explicit, not just "never shown" — covers a stale banner from an earlier check
+      statusEl.textContent = "✅ Vous utilisez déjà la dernière version.";
     }
   } catch (err) {
     statusEl.textContent = `⛔ Impossible de vérifier les mises à jour : ${err.message}`;
@@ -2116,8 +2101,8 @@ async function refreshBridgeUI() {
       disconnectedBadge.classList.add("hidden");
       configuredView.classList.remove("hidden");
       setupView.classList.add("hidden");
-      document.getElementById("bridge-repo-display").textContent =
-        `${cfg.github_owner}/${cfg.github_repo}`;
+      document.getElementById("bridge-worker-url-display").textContent = cfg.worker_url;
+      document.getElementById("bridge-device-secret-display").textContent = cfg.device_secret;
     } else {
       connectedBadge.classList.add("hidden");
       disconnectedBadge.classList.remove("hidden");
@@ -2141,13 +2126,9 @@ function toggleProvisioningQr() {
 async function saveBridgeConfig() {
   const statusEl = document.getElementById("bridge-status-line");
   statusEl.className = "status-line";
-  statusEl.textContent = "Vérification du dépôt...";
+  statusEl.textContent = "Vérification du Worker...";
 
-  const payload = {
-    github_owner: document.getElementById("bridge-owner").value.trim(),
-    github_repo: document.getElementById("bridge-repo").value.trim(),
-    github_token: document.getElementById("bridge-token").value.trim(),
-  };
+  const payload = { worker_url: document.getElementById("bridge-worker-url").value.trim() };
 
   try {
     const res = await fetch("/api/bridge/config", {
@@ -2158,10 +2139,9 @@ async function saveBridgeConfig() {
     const data = await res.json();
     if (!res.ok) throw new Error(data.error || "Échec de la configuration.");
 
-    statusEl.textContent = "✅ Dépôt privé vérifié — Réseau TASHIL connecté.";
+    statusEl.textContent = "✅ Worker joint — Réseau TASHIL connecté.";
     statusEl.classList.add("ok");
-    document.getElementById("bridge-token").value = "";
-    showToast("🌉 Réseau TASHIL connecté", "success");
+    showToast("☁️ Réseau TASHIL connecté", "success");
     await refreshBridgeUI();
   } catch (err) {
     statusEl.textContent = `⛔ ${err.message}`;

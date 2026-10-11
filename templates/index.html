@@ -45,15 +45,17 @@
              placeholder="····" autocomplete="new-password" class="pin-input">
       <p class="muted small-note">Ce code PIN protège l'accès à cet établissement sur cet appareil.</p>
 
-      <!-- v2.9.3: masqué par défaut — n'apparaît que si le serveur signale que cet
-           établissement est déjà enregistré sur le réseau TASHIL (voir submitOnboarding). -->
+      <!-- v2.9.5: masqué par défaut — n'apparaît que si le serveur signale que cet
+           établissement est déjà enregistré sur le réseau TASHIL (voir submitOnboarding).
+           Champ texte (pas un PIN numérique) depuis la migration vers le Worker
+           Cloudflare — la preuve d'autorisation est désormais une clé secrète
+           d'appareil, pas le code PIN de déverrouillage local. -->
       <div id="ob-original-pin-block" class="hidden">
-        <label>Code PIN d'origine (défini lors de la première installation)</label>
-        <input id="ob-original-pin" type="password" inputmode="numeric" pattern="\d*" maxlength="6"
-               placeholder="····" autocomplete="off" class="pin-input">
+        <label>Clé secrète d'origine (visible dans Paramètres, sur l'appareil déjà connecté)</label>
+        <input id="ob-original-pin" type="text" autocomplete="off" class="key-box-input">
         <p class="muted small-note">
           Cet établissement existe déjà sur le réseau TASHIL, sur un autre appareil.
-          Saisissez son code PIN d'origine pour autoriser cet appareil supplémentaire.
+          Saisissez sa clé secrète d'origine pour autoriser cet appareil supplémentaire.
         </p>
       </div>
 
@@ -300,9 +302,11 @@
     <section id="view-etablissements" class="view">
       <h2>Établissements Connectés</h2>
       <p class="muted">
-        Établissements ayant récemment communiqué via le Réseau TASHIL
-        (Cloud Bridge). "En ligne" signifie une présence annoncée au cours
-        des 3 dernières minutes environ.
+        Établissements actuellement en ligne sur le Réseau TASHIL
+        (Cloudflare Bridge) — la liste se met à jour automatiquement ;
+        un établissement disparaît de lui-même environ 90 secondes après
+        avoir cessé de se manifester, aucune suppression manuelle n'est
+        nécessaire.
       </p>
       <div id="etablissements-bridge-off" class="card hidden">
         <p class="empty-state">
@@ -310,7 +314,6 @@
           Paramètres pour l'activer.
         </p>
       </div>
-      <button class="btn btn-danger" id="etablissements-clear-btn">🗑️ Vider la liste</button>
       <div class="card list-card" id="etablissements-list">
         <p class="empty-state">Chargement...</p>
       </div>
@@ -344,7 +347,7 @@
       </div>
 
       <div class="card">
-        <h3>🌉 Réseau TASHIL (transmission distante)</h3>
+        <h3>☁️ Réseau TASHIL — Cloudflare Worker Bridge</h3>
 
         <div id="bridge-connected-badge" class="bridge-badge hidden">
           <span class="bridge-dot bridge-dot-on"></span> Réseau TASHIL Connecté
@@ -355,17 +358,33 @@
 
         <p id="bridge-status-line" class="status-line"></p>
 
-        <!-- Configured: show ID card + provisioning + disable -->
+        <!-- Configured: show status + device secret + provisioning + disable -->
         <div id="bridge-configured-view" class="hidden">
-          <p>Dépôt actif : <span class="key-box" id="bridge-repo-display">—</span></p>
+          <p>Worker actif : <span class="key-box" id="bridge-worker-url-display">—</span></p>
           <button class="btn btn-secondary" id="bridge-poll-btn">🔄 Vérifier les messages distants</button>
           <button class="btn btn-secondary" id="bridge-show-qr-btn">📱 Provisionner un autre appareil</button>
           <button class="btn btn-danger" id="bridge-disable-btn">🚫 Désactiver</button>
 
+          <details class="advanced-details">
+            <summary>🔑 Clé secrète de cet appareil</summary>
+            <p class="muted small-note">
+              ⚠️ Cette clé prouve que cet appareil est autorisé à
+              utiliser le Réseau TASHIL au nom des établissements qu'il
+              héberge. Elle ne doit jamais être partagée publiquement.
+              Pour autoriser un établissement DÉJÀ enregistré ailleurs
+              sur un nouvel appareil, utilisez plutôt "📱 Provisionner un
+              autre appareil" ci-dessus (ou saisissez cette clé comme
+              "clé secrète d'origine" lors de l'onboarding sur cet autre
+              appareil).
+            </p>
+            <p class="key-box" id="bridge-device-secret-display">—</p>
+          </details>
+
           <div id="bridge-qr-reveal" class="hidden qr-card">
             <p class="muted small-note">
-              ⚠️ Ce QR contient une clé d'accès réelle. Ne le montrez qu'à
-              l'appareil que vous provisionnez vous-même, en personne.
+              ⚠️ Ce QR contient la clé secrète réelle de cet appareil. Ne
+              le montrez qu'à l'appareil que vous provisionnez vous-même,
+              en personne.
             </p>
             <img id="bridge-qr-img" class="qr-image" alt="QR de provisioning Cloud Bridge">
             <p class="muted">
@@ -379,10 +398,9 @@
         <!-- Not configured: import-by-paste is the primary path -->
         <div id="bridge-setup-view">
           <p class="muted">
-            Aucune saisie de nom d'utilisateur, dépôt ou jeton n'est
-            nécessaire ici — collez simplement le code fourni par
-            l'appareil déjà connecté au Réseau TASHIL, ou déposez/chargez
-            directement l'image du QR ci-dessous.
+            Aucune saisie de clé n'est nécessaire ici — collez simplement
+            le code fourni par l'appareil déjà connecté au Réseau TASHIL,
+            ou déposez/chargez directement l'image du QR ci-dessous.
           </p>
 
           <div class="drop-zone" id="qr-drop-zone">
@@ -402,19 +420,15 @@
               créer la connexion initiale. Les appareils suivants utilisent
               "Importer un code" ci-dessus.
             </p>
-            <button class="btn btn-secondary" id="network-test-btn">🔌 Tester la connexion à GitHub</button>
+            <button class="btn btn-secondary" id="network-test-btn">🔌 Tester la connexion au Worker</button>
             <p id="network-test-status" class="status-line"></p>
-            <label>Propriétaire GitHub (utilisateur ou organisation)</label>
-            <input id="bridge-owner" type="text" placeholder="ex: Aladdinweb">
-            <label>Nom du dépôt privé dédié</label>
-            <input id="bridge-repo" type="text" placeholder="ex: TASHIL-Bridge">
-            <label>Jeton d'accès personnel GitHub (scope "repo")</label>
-            <input id="bridge-token" type="password" placeholder="ghp_..." autocomplete="off">
+            <label>URL du Cloudflare Worker</label>
+            <input id="bridge-worker-url" type="text" placeholder="https://tashil-bridge.votre-compte.workers.dev">
             <p class="muted small-note">
-              ⚠️ Le dépôt DOIT être privé — TASHIL vérifie automatiquement
-              et refuse tout dépôt public. Les documents transmis ne sont
-              pas chiffrés : la confidentialité du dépôt et le contrôle de
-              qui y a accès sont la seule protection.
+              Aucune autre information n'est nécessaire — une clé secrète
+              propre à cet appareil est générée automatiquement et
+              utilisée pour authentifier chaque établissement que vous y
+              créez.
             </p>
             <button class="btn btn-primary" id="bridge-save-btn">💾 Créer la connexion initiale</button>
           </details>
@@ -437,7 +451,7 @@
         <div id="diag-results" class="diag-results"></div>
         <div class="diag-actions">
           <button class="btn btn-secondary" id="diag-vacuum-btn">🧹 Optimiser la base de données</button>
-          <button class="btn btn-secondary" id="diag-clear-cache-btn">🗑️ Nettoyer le cache temporaire</button>
+          <button class="btn btn-secondary" id="diag-clear-cache-btn">🗑️ Nettoyer le cache local (appareil uniquement)</button>
         </div>
         <p id="diag-action-status" class="status-line"></p>
       </div>

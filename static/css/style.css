@@ -285,6 +285,14 @@ textarea { resize: vertical; }
   background: var(--input-bg); padding: 10px 14px; border-radius: 8px;
   margin-top: 6px; word-break: break-all;
 }
+/* v2.9.5: an editable counterpart to .key-box — for pasting a device
+   secret (original_secret_key, provisioning code) rather than just
+   displaying one. */
+.key-box-input {
+  font-family: monospace; width: 100%; padding: 10px 14px; border-radius: 8px;
+  border: 1px solid var(--border); background: var(--input-bg); color: var(--text);
+  box-sizing: border-box;
+}
 
 .update-banner {
   background: var(--input-bg); border: 1px solid var(--primary);

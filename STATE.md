@@ -2993,3 +2993,218 @@ retirée — Flask-SocketIO, `BEGIN IMMEDIATE`, sondage Bridge avec ETag,
 annuaire, visualiseur PDF/image/docx, module Diagnostic, suppression de
 profil verrouillé, anti-doublon réseau (v2.9.0 à v2.9.3) tous confirmés
 intacts par la régression ci-dessus.
+
+---
+
+## 33. v2.9.5 — Migration complète vers le Cloudflare Worker Bridge (remplace GitHub) (2026-10-08)
+
+⚠️ Remplacement architectural total du transport réseau — le GitHub
+Bridge (dépôt privé + jeton d'accès personnel, en place depuis la
+v2.4.0) est intégralement retiré et remplacé par un Cloudflare Worker +
+Workers KV. **Toutes les fonctionnalités UI/UX des v2.9.0 à v2.9.4
+(Flask-SocketIO, pièces jointes multiples, sélection/suppression
+groupée, accusé rapide, visualiseur intégré, icônes en pied de sidebar,
+suppression de profil verrouillé) sont intégralement conservées** — seul
+le transport de messagerie inter-établissements change.
+
+### 33.1 🔑 Modèle de clé secrète — choix de conception assumé
+
+Le cahier des charges comportait une ambiguïté réelle entre "génération
+locale au premier lancement" et "association unique via une clé secrète
+par établissement". Résolution retenue, à valider en usage réel :
+
+- Chaque **appareil** génère sa propre clé secrète aléatoire (32 octets,
+  hex) **une seule fois**, dès qu'elle est nécessaire — stockée dans
+  `registry.db` (`bridge_config.device_secret`), jamais saisie par
+  l'utilisateur, jamais régénérée automatiquement.
+- Le premier `/register` pour un `institution_id` donné (adressé par
+  `bridge_slug(nom, rôle)`, exactement comme l'ancien dépôt GitHub)
+  **scelle** cette clé comme preuve de propriété de cet identifiant.
+- Un **second appareil** légitime pour le même établissement doit
+  connaître cette **même** clé (transmise hors-bande : QR de
+  provisioning existant depuis la v2.5.0, adapté, ou saisie manuelle
+  pendant l'onboarding) — exactement l'équivalent du jeton GitHub
+  partagé qu'il remplace, mais désormais scellé par établissement
+  plutôt que par dépôt entier. Une fois la clé d'origine confirmée, cet
+  appareil l'**adopte** comme sa propre clé par défaut pour tous ses
+  appels futurs.
+
+### 33.2 ☁️ Le Worker (`cloudflare-worker/index.js`)
+
+Dix routes : `GET /` et `GET /health` (publiques, sans authentification —
+test de joignabilité uniquement), `POST /register`, `POST /auth`,
+`POST /unregister`, `POST /heartbeat`, `GET /presence` (annuaire, lecture
+seule), `POST /send`, `GET /poll`, `GET /fetch-attachment`,
+`POST /accuse`, `GET /poll-receipts`.
+
+- **Chaque** route protégée (pas seulement `/auth`) revérifie le hash de
+  la clé secrète à chaque appel — comparaison en temps constant
+  maison (`timingSafeEqualHex`), Workers n'exposant pas
+  `crypto.timingSafeEqual` de Node.
+- **Présence** : `PRESENCE_TTL_SECONDS = 90` (conforme à la demande) —
+  Workers KV exclut nativement une clé expirée des résultats de
+  `list()`, donc un établissement qui cesse d'émettre un battement de
+  cœur **disparaît de lui-même** de `/presence`, sans action manuelle.
+  Conséquence directe : les boutons "🗑️ Vider la liste" /
+  suppression unique de la v2.9.1 **n'ont plus d'équivalent et ont été
+  retirés** — il n'y a plus rien de périmé à nettoyer manuellement
+  (voir 33.5).
+- **Messages** : `MESSAGE_TTL_SECONDS = 30 jours`, filet de sécurité
+  uniquement — le nettoyage normal est déclenché par `/accuse`
+  (suppression immédiate du message et de toutes ses pièces jointes dès
+  que le destinataire clique "Accusé" dans l'interface), pas par
+  l'import. ⚠️ **Changement de comportement réel par rapport au GitHub
+  Bridge** : un message reste donc visible sur le Worker (re-listé à
+  chaque `/poll`) tant qu'il n'est pas accusé — l'idempotence locale
+  (vérification de `tracking_number` déjà connu) empêche toute
+  réimportation en double, mais le message n'est **pas** supprimé au
+  simple téléchargement comme c'était le cas avec GitHub.
+- **Pièces jointes multiples** : `POST /send` accepte directement une
+  liste `attachments` (nom + contenu base64) en un seul appel, au lieu
+  des N écritures GitHub (un fichier + un JSON) de la v2.9.4.
+
+**Testé réellement, pas seulement relu** : Node.js 22 fournit nativement
+`Request`/`Response`/`crypto.subtle`/`fetch` — le script a donc été
+**exécuté tel quel** (pas une simulation) contre un mock KV fidèle au
+comportement documenté de Cloudflare (TTL réel avec voyage dans le temps
+déterministe pour le test, exclusion des clés expirées de `list()`), puis
+hébergé sur un vrai serveur HTTP local pour un test de bout en bout avec
+le client Python. Scénarios couverts par des assertions automatisées :
+double enregistrement (bonne/mauvaise clé), auth, heartbeat + présence
+avec expiration à 90s confirmée précisément, envoi/poll/téléchargement de
+2 pièces jointes, non-suppression avant accusé puis suppression
+confirmée après, accusé consommé une seule fois côté expéditeur.
+⚠️ **Non testé** : le vrai isolat V8 de Cloudflare Workers et le vrai
+Workers KV — inaccessibles depuis ce bac à sable (pas d'accès réseau vers
+l'API Cloudflare). Le test le plus important restant : déployer tel quel
+et refaire le cycle complet entre deux vrais postes.
+
+### 33.3 🐍 `app.py` — remplacement complet de la couche Bridge
+
+- `_github_request` → `_worker_request` (urllib + certifi, même politique
+  de réessai réseau que l'ancienne fonction).
+- `push_to_bridge` → `push_to_worker_bridge` ; `push_receipt_to_bridge`
+  → `push_worker_receipt` (un seul appel `/accuse` remplace l'ancien
+  couple suppression-sur-import + push de reçu séparé).
+- `_run_bridge_poll_locked` entièrement réécrite : `/poll` (une liste en
+  un appel, fini le listing dossier-par-dossier GitHub avec ETag),
+  `/fetch-attachment` par pièce jointe, `/poll-receipts`. Plus de
+  suppression à l'import — voir 33.2.
+- Le registre d'anti-doublon GitHub (`registrations/<clé>.json`, v2.9.3)
+  est **entièrement retiré**, remplacé par le `/register` du Worker —
+  une seule source de vérité au lieu de deux mécanismes parallèles.
+  `api_save_profile` appelle désormais `/register` ; en cas de `401`,
+  le champ `original_pin` devient `original_secret_key` (même flux en
+  deux temps côté interface, nouveau nom de champ).
+- `_ensure_worker_registration`, appelée à chaque battement de cœur,
+  reprend le rôle de l'ancienne `_ensure_registration_claimed` :
+  rattrapage pour un profil créé avant la configuration du Worker, ou un
+  `/register` resté en échec à l'onboarding.
+- Nouvelles colonnes (migrations idempotentes, aucune donnée existante
+  touchée) : `bridge_config.worker_url`, `bridge_config.device_secret`,
+  `profiles.worker_registered`, `messages.sender_worker_id` (adresse
+  Worker de l'expéditeur, distincte de `sender_institution_key` qui
+  reste la clé réelle utilisée pour la livraison locale).
+- Code mort retiré : `_delete_bridge_entry_or_queue`,
+  `_retry_pending_bridge_cleanup`, `_queue_bridge_cleanup`,
+  `_fetch_directory_records`, `_ensure_bridge_keep`,
+  `_list_bridge_entries`, le cache ETag GitHub. Les colonnes
+  `github_owner`/`github_repo`/`github_token` et la table
+  `bridge_pending_cleanup` restent dans le schéma, inutilisées, par
+  prudence (pas de `DROP COLUMN`/`DROP TABLE` risqué).
+
+**Testé réellement contre le vrai serveur Worker** (lancé localement,
+HTTP réel, pas de mock côté Python) : configuration validée via
+`/health` ; génération et persistance du secret d'appareil ; cycle
+anti-doublon complet à deux "appareils" distincts (refus sans clé,
+refus avec mauvaise clé, acceptation + **adoption confirmée** du secret
+d'origine) ; envoi de 2 pièces jointes d'un troisième établissement vers
+le premier, sans profil local côté destinataire (force le passage par le
+Worker) ; import confirmé avec les 2 fichiers déchiffrés et corrects sur
+disque ; **second `/poll` avant accusé confirmant l'absence de
+réimport en double** ; accusé déclenché depuis l'interface ;
+**réception confirmée de l'accusé côté expéditeur** avec mise à jour du
+statut local. **Régression critique rejouée avec succès** : le scénario
+exact de collision SQLite (v2.8.1) a été reproduit avec le **nouveau**
+transport Worker artificiellement ralenti (1,2s de latence simulée,
+plusieurs appels HTTP d'affilée) — toujours aucune `database is locked`,
+confirmant que le correctif `BEGIN IMMEDIATE` (v2.9.0) tient aussi avec
+ce nouveau transport.
+
+### 33.4 🎛️ Interface Paramètres
+
+Carte "☁️ Réseau TASHIL — Cloudflare Worker Bridge" : un seul champ URL
+en configuration manuelle (plus de propriétaire/dépôt/jeton), clé
+secrète de l'appareil affichée (repliée, avec avertissement) pour
+transmission manuelle, même flux "Importer un code"/QR qu'auparavant
+mais encodant désormais `{worker_url, device_secret}`. Le champ
+"PIN d'origine" de l'onboarding devient "Clé secrète d'origine" (champ
+texte, plus un code PIN numérique).
+
+### 33.5 ⚖️ Trois ajustements demandés en cours de route
+
+1. **Indicateur de quota GitHub → statut de connexion Cloudflare** :
+   nouvelle route `GET /api/diagnostics/bridge-status`, interrogeant
+   `/health` en temps réel (aucune clé secrète nécessaire — teste la
+   joignabilité, pas les identifiants). Affiche "🟢 Connecté" /
+   "⚪ Déconnecté" dans la carte Diagnostic, à la place du nombre de
+   requêtes GitHub restantes (qui n'a pas d'équivalent sur le Worker :
+   pas de quota partagé à afficher).
+2. **Bouton Nettoyage recentré sur le local** : purge toujours le
+   dossier `TASHIL_DATA/tmp/`, et exécute désormais aussi un `VACUUM`
+   sur `registry.db` (compacte le fichier, **ne supprime aucune
+   ligne/profil**) — explicitement documenté comme une action 100%
+   locale. Rien à nettoyer côté Cloudflare : le Worker purge lui-même
+   un message dès l'accusé, et `MESSAGE_TTL_SECONDS` est son propre
+   filet de sécurité automatique — aucun appel de nettoyage déclenché
+   par le client n'existe ni n'est nécessaire.
+3. **Bouton de mise à jour, correctif réel appliqué** : `state.meta.app_version`
+   n'était chargé **qu'une seule fois** au premier chargement de la
+   page et jamais rafraîchi — un second clic sur "Vérifier les mises à
+   jour" comparait donc toujours contre cette version figée, même après
+   une mise à jour réelle de l'application. Corrigé : chaque clic
+   recharge d'abord `/api/meta` (avec `cache: "no-store"`, qui élimine
+   aussi toute réponse mise en cache par le navigateur sur un double
+   clic rapproché) avant de comparer. Le texte "✅ Vous utilisez déjà la
+   dernière version" et la bannière sont désormais explicitement
+   réinitialisés à chaque vérification plutôt que supposés déjà propres.
+
+### 33.6 ⚠️ Limites honnêtes, non résolues
+
+- **Jamais déployé ni testé contre le vrai Cloudflare** (isolat V8 réel,
+  vrai Workers KV, vraie latence réseau internationale) — ce bac à
+  sable n'a aucun accès à l'API Cloudflare. Tout le test ci-dessus,
+  aussi réel soit-il (vraie exécution Node, vrai serveur HTTP local),
+  reste une émulation fidèle, pas la plateforme de production elle-même.
+- **Les messages envoyés via l'ancien GitHub Bridge, non encore
+  accusés au moment de la migration, sont perdus** — ils n'existent
+  nulle part sur le nouveau Worker. Aucune migration de données
+  automatique entre les deux systèmes n'a été construite (non demandée,
+  et les deux dépôts/KV sont des systèmes de stockage fondamentalement
+  différents). À communiquer aux utilisateurs avant le déploiement :
+  s'assurer qu'aucun message important n'est en transit au moment du
+  bascule.
+- **Changement de comportement sur le délai de suppression** (33.2) : un
+  message reste visible sur le Worker jusqu'à l'accusé, pas jusqu'à
+  l'import — différence de design assumée, à vérifier qu'elle convient
+  à l'usage réel (un message jamais accusé reste consultable/re-listé
+  indéfiniment jusqu'au TTL de 30 jours).
+- Limite de taille : Workers KV plafonne une valeur à 25 Mo — une garde
+  de 20 Mo cumulés est appliquée côté `app.py` avant tout envoi
+  (`push_to_worker_bridge`), avec un message d'erreur clair plutôt
+  qu'un échec confus en cours de transmission.
+
+**Fichiers modifiés :** `app.py` (couche Bridge entièrement remplacée,
+voir 33.3), `static/js/app.js` (carte Paramètres, annuaire sans
+suppression manuelle, indicateur Cloudflare, correctif du bouton de mise
+à jour, libellé du bouton de nettoyage), `templates/index.html` (carte
+Réseau TASHIL réécrite, champ "clé secrète d'origine", libellés),
+`static/css/style.css` (`.key-box-input`). **Fichiers ajoutés :**
+`cloudflare-worker/index.js` (le Worker complet), `cloudflare-worker/README.md`
+(instructions de déploiement). Aucune dépendance Python ajoutée. Aucune
+fonctionnalité antérieure retirée en dehors du mécanisme GitHub
+lui-même (remplacé, pas simplement supprimé) — Flask-SocketIO,
+`BEGIN IMMEDIATE`, pièces jointes multiples, sélection/suppression
+groupée, accusé rapide, visualiseur PDF/image/docx, module Diagnostic,
+suppression de profil verrouillé (v2.9.0 à v2.9.4) tous confirmés
+intacts par la régression ci-dessus.
