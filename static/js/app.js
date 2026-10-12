@@ -2071,8 +2071,18 @@ async function runNetworkTest() {
   statusEl.className = "status-line";
   statusEl.textContent = "Test en cours...";
 
+  // v2.9.6 bug fix: this button sits ABOVE the URL field it's meant to
+  // test, so a natural top-to-bottom click tested whatever had been
+  // SAVED earlier (often nothing yet) instead of what's actually typed
+  // in the box right below — always reporting "Aucune URL configurée"
+  // even with a URL freshly typed in. Sending it explicitly fixes that;
+  // leaving the field empty still falls back to testing the saved
+  // config, unchanged from before.
+  const typedUrl = document.getElementById("bridge-worker-url").value.trim();
+  const qs = typedUrl ? `?worker_url=${encodeURIComponent(typedUrl)}` : "";
+
   try {
-    const res = await fetch("/api/bridge/network-test");
+    const res = await fetch(`/api/bridge/network-test${qs}`);
     const data = await res.json();
     if (data.ok) {
       statusEl.textContent = `✅ ${data.message} (${data.elapsed_ms} ms)`;

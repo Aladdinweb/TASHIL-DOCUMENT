@@ -3208,3 +3208,86 @@ lui-même (remplacé, pas simplement supprimé) — Flask-SocketIO,
 groupée, accusé rapide, visualiseur PDF/image/docx, module Diagnostic,
 suppression de profil verrouillé (v2.9.0 à v2.9.4) tous confirmés
 intacts par la régression ci-dessus.
+
+---
+
+## 34. v2.9.6 — CORS sur le Worker, correctif du vrai bug de test de connexion (2026-10-11)
+
+### 34.1 🩺 Diagnostic du signalement "Test en cours..." bloqué
+
+**Le CORS n'était pas la cause réelle** — vérifié par analyse de
+l'architecture avant toute modification : le bouton "Tester la
+connexion" appelle `fetch("/api/bridge/network-test")`, une requête vers
+le propre serveur Flask de l'application (même origine — CORS ne
+s'applique jamais à un appel same-origin). C'est ensuite `app.py`, côté
+serveur, en Python (`urllib`), qui contacte le Worker — et CORS est un
+mécanisme appliqué **uniquement par les navigateurs** ; un client HTTP
+serveur comme `urllib` ne le vérifie ni ne l'applique jamais.
+
+**🐛 Vrai bug trouvé et corrigé** : `GET /api/bridge/network-test` ne
+testait que l'URL déjà **enregistrée** en base — jamais celle tapée dans
+le champ du formulaire. Dans l'écran "Configuration manuelle", le bouton
+"Tester la connexion au Worker" se trouve **au-dessus** du champ URL
+(voir capture d'écran fournie) : un clic naturel de haut en bas teste
+donc systématiquement "rien n'est configuré", quelle que soit l'URL
+déjà tapée juste en dessous — exactement le symptôme signalé.
+
+**Correctif** : la route accepte désormais un paramètre `?worker_url=`
+optionnel pour tester une valeur **non encore sauvegardée** ; le
+frontend transmet maintenant la valeur du champ au moment du clic. Champ
+vide → repli inchangé sur la configuration déjà enregistrée.
+
+**Testé réellement** : le scénario exact (URL tapée mais non
+sauvegardée) confirmé en échec avant correctif, en succès après ;
+mauvaise URL tapée → échec correctement rapporté, pas de faux positif.
+
+### 34.2 🌐 CORS ajouté au Worker (sur demande explicite)
+
+Bien que non responsable du bug ci-dessus, les en-têtes CORS demandés
+ont été ajoutés — bonne pratique pour toute API publique (débogage
+direct depuis un navigateur, outils tiers, évolutions futures), sans
+aucun risque : chaque route reste protégée par sa propre vérification de
+`secret_key`, CORS ne change rien à cette protection.
+
+- Nouvelle gestion explicite de `OPTIONS` en tout début de `fetch()` →
+  `204` avec les en-têtes CORS.
+- `Access-Control-Allow-Origin: *`, `Access-Control-Allow-Methods: GET,
+  POST, OPTIONS`, `Access-Control-Allow-Headers: Content-Type` ajoutés
+  dans `jsonResponse()` — donc automatiquement sur **toutes** les
+  réponses, succès et erreurs confondus (`errorResponse` l'appelle en
+  interne).
+
+**Testé réellement** : le harnais de test local (`worker/serve.mjs`) ne
+relayait jusqu'ici que l'en-tête `Content-Type` — corrigé pour relayer
+tous les en-têtes, afin de pouvoir vérifier honnêtement ce qui était
+demandé. `curl -i` confirme : `OPTIONS` → `204` avec les 4 en-têtes
+CORS ; `GET /health` et une réponse d'erreur `401` les portent toutes
+deux également. L'intégralité de la suite de tests logiques du Worker
+(enregistrement, auth, heartbeat, présence, envoi, poll, pièces
+jointes, accusé, reçus) rejouée sans régression après l'ajout.
+
+### 34.3 Régression
+
+Scénario exact de collision SQLite rejoué contre le transport Worker
+(artificiellement ralenti), toujours sans erreur. Cycle complet
+envoi/poll/accusé multi-pièces-jointes à trois établissements distincts,
+rejoué contre le vrai serveur Worker local après ce patch — toujours
+intégralement fonctionnel.
+
+### 34.4 🐛 Bug trouvé en marge : `APP_VERSION` jamais mise à jour depuis la v2.9.3
+
+En préparant cette livraison, `APP_VERSION` dans `app.py` s'est révélée
+toujours fixée à `"2.9.3"` — jamais incrémentée lors des migrations
+v2.9.4 (pièces jointes multiples) ni v2.9.5 (Cloudflare Worker Bridge),
+malgré les sections correspondantes de ce document. Sans impact
+fonctionnel direct (la logique métier ne teste jamais sa propre
+version), mais cassait silencieusement le vérificateur de mise à jour
+intégré (comparaison avec les tags GitHub) et l'affichage de version
+dans l'interface. Corrigée à `"2.9.6"`.
+
+**Fichiers modifiés :** `app.py` (`/api/bridge/network-test` accepte un
+paramètre `worker_url` optionnel, `APP_VERSION` corrigée à "2.9.6"),
+`static/js/app.js` (le bouton teste la valeur tapée, pas seulement la
+configuration enregistrée), `cloudflare-worker/index.js` (gestion
+`OPTIONS`, en-têtes CORS sur toutes les réponses). Aucune fonctionnalité
+antérieure retirée.

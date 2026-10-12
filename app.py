@@ -215,7 +215,7 @@ _LEGACY_ARCHIVE_ENTRANT = os.path.join(BASE_DIR, "archives", "Courrier_Entrant")
 os.makedirs(PROFILES_DIR, exist_ok=True)
 
 APP_ROOT = os.path.dirname(os.path.abspath(__file__))
-APP_VERSION = "2.9.3"
+APP_VERSION = "2.9.6"
 GITHUB_REPO = "Aladdinweb/TASHIL-ES"  # used by the in-app OTA update checker
 
 app = Flask(__name__,
@@ -2644,18 +2644,36 @@ def api_registre():
 @app.route("/api/bridge/network-test", methods=["GET"])
 def api_bridge_network_test():
     """
-    v2.9.5: tests reachability of the CONFIGURED Worker URL's public
-    /health route — no secret_key needed (that route takes none), so
-    this separates "the Worker itself is unreachable / wrong URL /
-    blocked by a firewall" from "my secret_key is wrong", which
-    otherwise look identical from the config form's point of view.
+    Tests reachability of a Worker URL's public /health route — no
+    secret_key needed (that route takes none), so this separates "the
+    Worker itself is unreachable / wrong URL / blocked by a firewall"
+    from "my secret_key is wrong", which otherwise look identical from
+    the config form's point of view.
+
+    v2.9.6 bug fix: this previously ONLY ever tested the already-SAVED
+    worker_url — so clicking "Tester la connexion" on the setup form,
+    which sits above the URL field, before ever clicking "Créer la
+    connexion initiale" to save it, always reported "Aucune URL de
+    Worker configurée." regardless of what was typed in the box right
+    below it (this is what was actually happening in the reported bug —
+    not a CORS issue: this whole call is same-origin browser→Flask, and
+    the Flask→Worker leg is server-side Python, which CORS, a
+    browser-only mechanism, never applies to). An optional ?worker_url=
+    query param now lets the frontend test an UNSAVED value typed in the
+    form; omitted (or blank), it falls back to the saved config exactly
+    as before.
     """
-    cfg = get_bridge_config()
-    if not cfg:
-        return jsonify({"ok": False, "elapsed_ms": 0, "message": "Aucune URL de Worker configurée.", "hint": ""})
+    typed_url = (request.args.get("worker_url") or "").strip().rstrip("/")
+    if typed_url:
+        worker_url = typed_url
+    else:
+        cfg = get_bridge_config()
+        if not cfg:
+            return jsonify({"ok": False, "elapsed_ms": 0, "message": "Aucune URL de Worker configurée.", "hint": ""})
+        worker_url = cfg["worker_url"]
 
     start = time.monotonic()
-    status, data = _worker_request(cfg["worker_url"], "GET", "/health", _max_retries=0)
+    status, data = _worker_request(worker_url, "GET", "/health", _max_retries=0)
     elapsed_ms = int((time.monotonic() - start) * 1000)
     if status == 200 and data.get("ok"):
         return jsonify({"ok": True, "elapsed_ms": elapsed_ms,

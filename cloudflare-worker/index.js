@@ -40,12 +40,35 @@ const PRESENCE_TTL_SECONDS = 90;               // "en ligne" = annoncé il y a m
 const MAX_BODY_BYTES = 24 * 1024 * 1024;        // Workers KV : 25 Mo max par valeur — marge de sécurité
 
 // ------------------------------------------------------------------ //
+// CORS
+// ------------------------------------------------------------------ //
+// ⚠️ Ajouté sur demande explicite — par construction de TASHIL, app.py
+// parle à ce Worker côté SERVEUR (urllib Python), jamais depuis le
+// navigateur : CORS, un mécanisme appliqué uniquement par les
+// navigateurs, ne s'applique donc à aucun appel réel de l'application
+// actuelle. Ces en-têtes n'en restent pas moins une bonne pratique pour
+// toute API publique (débogage direct depuis un navigateur, outils
+// tiers, évolutions futures) — gardés volontairement permissifs
+// (Access-Control-Allow-Origin: *) puisque chaque route reste de toute
+// façon protégée par sa propre vérification de secret_key.
+const CORS_HEADERS = {
+  "Access-Control-Allow-Origin": "*",
+  "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+  "Access-Control-Allow-Headers": "Content-Type",
+  "Access-Control-Max-Age": "86400",
+};
+
+function handleOptions() {
+  return new Response(null, { status: 204, headers: CORS_HEADERS });
+}
+
+// ------------------------------------------------------------------ //
 // Utilitaires crypto / réponses
 // ------------------------------------------------------------------ //
 function jsonResponse(obj, status = 200) {
   return new Response(JSON.stringify(obj), {
     status,
-    headers: { "Content-Type": "application/json; charset=utf-8" },
+    headers: { "Content-Type": "application/json; charset=utf-8", ...CORS_HEADERS },
   });
 }
 
@@ -397,6 +420,7 @@ const ROUTES = {
 
 export default {
   async fetch(request, env) {
+    if (request.method === "OPTIONS") return handleOptions();
     const url = new URL(request.url);
     const key = `${request.method} ${url.pathname}`;
     const handler = ROUTES[key];
