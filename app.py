@@ -1156,7 +1156,8 @@ def _worker_request(worker_url: str, method: str, path: str, body: dict = None,
     url = f"{worker_url}{path}"
     if query:
         url += "?" + urllib.parse.urlencode(query)
-    headers = {"Content-Type": "application/json", "Accept": "application/json"}
+    headers = {"Content-Type": "application/json", "Accept": "application/json",
+               "User-Agent": "TASHIL-DOCUMENT-HUB/1.0"}  # v2.9.7: evite le blocage anti-bot Cloudflare
     data = json.dumps(body).encode("utf-8") if body is not None else None
     ssl_context = ssl.create_default_context(cafile=certifi.where()) if _CERTIFI_AVAILABLE else None
 
