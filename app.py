@@ -215,7 +215,7 @@ _LEGACY_ARCHIVE_ENTRANT = os.path.join(BASE_DIR, "archives", "Courrier_Entrant")
 os.makedirs(PROFILES_DIR, exist_ok=True)
 
 APP_ROOT = os.path.dirname(os.path.abspath(__file__))
-APP_VERSION = "2.9.6"
+APP_VERSION = "2.9.8"
 GITHUB_REPO = "Aladdinweb/TASHIL-ES"  # used by the in-app OTA update checker
 
 app = Flask(__name__,
@@ -3195,8 +3195,34 @@ def api_diagnostics_bridge_status():
 
     status, data = _worker_request(cfg["worker_url"], "GET", "/health", _max_retries=0)
     connected = status == 200 and data.get("ok") is True
-    return jsonify({"ok": True, "bridge_enabled": True, "connected": connected,
-                    "worker_url": cfg["worker_url"]})
+
+    # v2.9.9: /health seul ne prouve QUE la joignabilite reseau (route
+    # publique, sans cle secrete) - pas que les appels AUTHENTIFIES
+    # (/register, /heartbeat, /send, tous POST) passent reellement. Un
+    # etablissement signale "Connecte" ici tout en voyant ses envois
+    # echouer et n'apparaitre nulle part dans Etablissements Connectes
+    # est exactement ce decalage. Ce diagnostic retente donc en plus un
+    # VRAI /register (idempotent - sans effet s'il a deja reussi avec la
+    # meme cle) pour le profil actif, et remonte son statut HTTP brut -
+    # la seule facon de distinguer "bloque au niveau de l'edge Cloudflare"
+    # (register_status 0 ou 403) de "une vraie erreur applicative"
+    # (401/400 avec un message clair).
+    register_status, register_data = (None, {})
+    profile = get_profile_row(_active_key)
+    if profile is not None:
+        worker_id = bridge_slug(profile["institution_name"], profile.get("role") or DEFAULT_ROLE)
+        register_status, register_data = _worker_request(cfg["worker_url"], "POST", "/register", {
+            "institution_id": worker_id, "secret_key": cfg["device_secret"],
+            "hardware_id": get_hardware_fingerprint(),
+        }, _max_retries=0)
+
+    return jsonify({
+        "ok": True, "bridge_enabled": True, "connected": connected,
+        "worker_url": cfg["worker_url"],
+        "registered": register_status == 200,
+        "register_status": register_status,
+        "register_error": register_data.get("error") if register_status != 200 else None,
+    })
 
 
 @app.route("/api/maintenance/vacuum", methods=["POST"])

@@ -1856,6 +1856,15 @@ async function runDiagnostics() {
       rows.push(diagRow("Cloudflare Bridge", "non configuré"));
     } else {
       rows.push(diagRow("Cloudflare Bridge", q.connected ? "🟢 Connecté" : "⚪ Déconnecté", q.connected));
+      // v2.9.9: /health seul ne garantit pas que les appels authentifies
+      // (envoi, heartbeat) passent — ce second indicateur teste un vrai
+      // /register pour l'etablissement actif et distingue "bloque avant
+      // meme d'atteindre le Worker" (code 0 ou 403) d'une vraie erreur
+      // applicative (401/400, avec le message exact retourne).
+      const regLabel = q.registered
+        ? "✅ Réussi"
+        : `⛔ Échec (code ${q.register_status ?? "0 — aucune réponse"})${q.register_error ? " : " + q.register_error : ""}`;
+      rows.push(diagRow("Enregistrement établissement (/register)", regLabel, q.registered));
     }
   } catch (err) {
     rows.push(diagRow("Cloudflare Bridge", `⛔ ${err.message}`, false));
