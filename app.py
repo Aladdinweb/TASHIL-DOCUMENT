@@ -1624,43 +1624,54 @@ def api_session_set_pin():
     return jsonify({"ok": True, "profile": profile_public_dict(updated_row)})
 
 
+_HARDWARE_FINGERPRINT_CACHE = None  # v2.9.8: cache memoire, voir docstring ci-dessous
+
+
 def get_hardware_fingerprint() -> str:
     """
-    v2.8.5: best-effort hardware identifier for automatic device
-    pairing. Tries the Windows motherboard/product UUID first (stable
-    across reinstalls, reboots, and even OS reinstalls on the same
-    physical machine); falls back to a MAC-address-derived value
-    (uuid.getnode()) on any platform where the Windows-specific command
-    isn't available or fails — including this Linux development sandbox,
-    where the fallback path is the only one ever exercised.
-
-    ⚠️ Honesty note: the Windows path (wmic) could NOT be exercised in
-    this sandbox — there is no Windows machine here to run it against.
-    The fallback path was tested directly. wmic itself is also
-    deprecated by Microsoft in newer Windows builds in favor of
-    PowerShell's Get-CimInstance; if pairing behaves unexpectedly on a
-    very recent Windows version, this is the first place to check.
-
-    The raw fingerprint is never stored — only its SHA-256 hash (see
-    api_session_unlock) — same privacy principle already applied to PINs.
+    v2.9.8: le resultat est maintenant mis en cache en memoire des le
+    premier appel (_HARDWARE_FINGERPRINT_CACHE) - cette fonction peut
+    etre rappelee plusieurs fois par session (chaque battement de coeur
+    tant qu'un etablissement n'est pas encore enregistre aupres du
+    Worker, voir _ensure_worker_registration) ; avant ce correctif,
+    chaque appel relancait un VRAI sous-processus (wmic sur Windows), et
+    un sous-processus Windows lance sans CREATE_NO_WINDOW fait clignoter
+    une fenetre de console noire - symptome signale comme "une fenetre
+    cmd a chaque cycle de Heartbeat". Le cache elimine toute repetition ;
+    CREATE_NO_WINDOW elimine le flash meme au tout premier appel.
     """
+    global _HARDWARE_FINGERPRINT_CACHE
     try:
-        if platform.system() == "Windows":
-            output = subprocess.check_output(
-                ["wmic", "csproduct", "get", "UUID"],
-                stderr=subprocess.DEVNULL, timeout=5
-            ).decode("utf-8", errors="ignore")
-            lines = [l.strip() for l in output.splitlines() if l.strip() and "UUID" not in l.upper()]
-            if lines and lines[0]:
-                return lines[0]
-    except Exception:
-        pass  # wmic missing/deprecated/blocked — fall through to the generic fallback
+        if _HARDWARE_FINGERPRINT_CACHE is not None:
+            return _HARDWARE_FINGERPRINT_CACHE
+    except NameError:
+        pass
 
-    # Generic fallback: derived from the network interface's MAC address.
-    # Weaker than a real motherboard UUID (changes if the network adapter
-    # changes, and uuid.getnode() can fall back to a random value on some
-    # systems if no MAC is readable at all) — documented, not hidden.
-    return f"fallback-{uuid.getnode()}"
+    raw = None
+    if platform.system() == "Windows":
+        try:
+            # CREATE_NO_WINDOW (0x08000000) : empeche toute fenetre de
+            # console de s'afficher, meme brievement, pour ce
+            # sous-processus - c'est la ligne qui manquait.
+            creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
+            result = subprocess.run(
+                ["wmic", "csproduct", "get", "UUID"],
+                capture_output=True, text=True, timeout=5,
+                creationflags=creationflags,
+            )
+            lines = [l.strip() for l in result.stdout.splitlines() if l.strip() and l.strip().upper() != "UUID"]
+            if lines:
+                raw = lines[0]
+        except Exception:
+            raw = None
+
+    if not raw:
+        raw = str(uuid.getnode())  # repli multi-plateforme (MAC-derive)
+
+    fingerprint = hashlib.sha256(raw.encode("utf-8")).hexdigest()
+    _HARDWARE_FINGERPRINT_CACHE = fingerprint
+    return fingerprint
+
 
 
 def hash_hardware_fingerprint(raw_fingerprint: str) -> str:
@@ -3563,8 +3574,13 @@ def _bridge_loop():
         except Exception:
             app.logger.exception("bridge loop")
             failures += 1
-        if failures:   # exponential back-off while GitHub/network is failing
-            delay = min(120, BRIDGE_POLL_SECONDS * (2 ** min(failures, 4)))
+        # v2.9.8: un INCIDENT ISOLE (ex: un blocage reseau ponctuel chez
+        # un etablissement) ne declenche plus a lui seul un ralentissement
+        # — seules 2 anomalies CONSECUTIVES l'activent desormais, et le
+        # plafond est abaisse de 120s a 60s pour revenir plus vite a un
+        # cycle normal une fois la cause corrigee.
+        if failures >= 2:
+            delay = min(60, BRIDGE_POLL_SECONDS * (2 ** min(failures - 1, 3)))
         time.sleep(delay)
 
 
