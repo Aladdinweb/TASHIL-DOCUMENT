@@ -3291,3 +3291,93 @@ paramètre `worker_url` optionnel, `APP_VERSION` corrigée à "2.9.6"),
 configuration enregistrée), `cloudflare-worker/index.js` (gestion
 `OPTIONS`, en-têtes CORS sur toutes les réponses). Aucune fonctionnalité
 antérieure retirée.
+
+---
+
+## 35. v2.9.7 → v2.9.9 — Rattrapage de traçabilité (reconstitué depuis les commentaires de `app.py`)
+
+⚠️ Note de traçabilité : ces trois versions étaient en production mais n'avaient
+jamais été consignées ici. Cette section est **reconstituée à partir des
+commentaires du code** (`app.py`), pas d'un journal de test d'époque — à
+corriger si un détail diverge de la réalité.
+
+- **v2.9.7** — `_worker_request()` envoie désormais un en-tête
+  `User-Agent: TASHIL-DOCUMENT-HUB/1.0`, pour éviter le blocage anti-bot de
+  Cloudflare sur les requêtes Python par défaut.
+- **v2.9.8** —
+  1. `get_hardware_fingerprint()` mis en cache mémoire
+     (`_HARDWARE_FINGERPRINT_CACHE`) et `wmic` lancé avec `CREATE_NO_WINDOW` :
+     supprime la fenêtre de console qui clignotait à chaque cycle de heartbeat.
+  2. Boucle Bridge (`_bridge_loop`) : le ralentissement ne s'active plus
+     qu'après **2 échecs consécutifs** (au lieu d'un seul), plafond abaissé de
+     120 s à 60 s.
+- **v2.9.9** — `GET /api/diagnostics/bridge-status` retente en plus un vrai
+  `POST /register` (idempotent) et renvoie `registered`, `register_status`,
+  `register_error` : permet de distinguer « Worker joignable (/health) » de
+  « appels authentifiés réellement bloqués » (symptôme : « Connecté » affiché
+  mais envois en échec).
+- ⚠️ Constat : l'`app.py` examiné contenait `APP_VERSION = "2.9.8"` alors que la
+  version déployée était annoncée v2.9.9 (même dérive que celle déjà corrigée
+  en v2.9.6, §34.4).
+
+---
+
+## 36. v2.9.10 — Aperçu des documents masqué, page d'impression nettoyée (2026-10-21)
+
+⚠️ Patch minimal et volontairement réversible sur la v2.9.9 stable : **aucun
+code supprimé**, aucun changement Flask / SQLite / Cloudflare Bridge / Worker.
+
+### 36.1 Contexte
+Les fichiers téléchargés s'ouvrent parfaitement dans leurs applications natives
+(Word, Excel, PDF) ; l'aperçu intégré (mammoth.js pour `.docx`) altère parfois
+la mise en page des tableaux. Décision : ne laisser que le bouton 📥 Télécharger.
+
+### 36.2 Masquage des boutons d'aperçu (CSS uniquement)
+Tous les boutons d'aperçu portent l'attribut `data-preview` (lignes de rendu du
+Tableau de Bord, de la Messagerie/Boîte de réception, du Registre, et liste
+dépliée des pièces jointes). Une seule règle les masque partout :
+```css
+[data-preview] { display: none !important; }
+```
+- `openDocumentViewer`, le modal `#viewer-modal`, PDF.js et mammoth.js
+  (`static/js/vendor/`) sont **conservés intacts** — réactiver l'aperçu =
+  supprimer cette règle.
+- Masqués (`display:none`) et non supprimés : `wireRowActions()` retrouve
+  toujours ses éléments, aucune erreur sur un nœud `null`.
+- Le bouton 📥 (`data-download`) n'est pas concerné.
+- Conséquence : le bouton 🖨️ du visualiseur n'est plus atteignable.
+
+### 36.3 Page d'impression
+- `style.css` : `@page { margin: 0; }` (retire en-têtes/pieds automatiques :
+  titre, date, heure, URL).
+- `app.js` → `printCurrentDocument()` : `@page{margin:0}` ajouté aux iframes
+  `srcdoc` **image** et **docx** (le CSS du parent ne s'y applique pas) ;
+  `padding` du docx 24px → 15mm pour garder une marge visible.
+- ⚠️ Limite : un **PDF** est imprimé par le lecteur natif de WebView2, que
+  `@page` n'affecte pas — décocher « En-têtes et pieds de page » dans la boîte
+  d'impression.
+- ⚠️ Cette partie n'a d'effet visible que si l'aperçu est réactivé (le seul
+  chemin d'impression existant passe par le visualiseur).
+
+### 36.4 Version et fichiers
+- `APP_VERSION` → `"2.9.10"` (le vérificateur de mise à jour compare par
+  nombres : 2.9.10 > 2.9.9).
+- **Fichiers modifiés :** `static/css/style.css` (+7 lignes en fin de fichier),
+  `static/js/app.js` (2 lignes modifiées, 1 ajoutée dans `printCurrentDocument`),
+  `app.py` (une seule ligne : `APP_VERSION`).
+- **Non modifiés :** `templates/index.html`, Flask, SQLite, Cloudflare Bridge,
+  `cloudflare-worker/index.js`.
+
+### 36.5 Tests
+- ✅ Patch appliqué sur une copie des fichiers : diff limité aux lignes
+  ci-dessus ; `git apply --check` OK ; `node --check app.js` OK.
+- ⚠️ **Non testé visuellement** (pas d'environnement graphique) : à vérifier sur
+  le build — aucun 👁️ dans les 3 vues ni dans la liste « 📎 N » ; 📥 toujours
+  fonctionnel ; Ctrl+F5 si test navigateur (cache `app.js`).
+
+### 36.6 ⚠️ Point à vérifier (non modifié)
+`GITHUB_REPO = "Aladdinweb/TASHIL-ES"` dans `app.py` : si les Releases sont
+désormais publiées sur `TASHIL-DOCUMENT`, le vérificateur de mise à jour
+interroge le mauvais dépôt et ne verra jamais la v2.9.10.
+
+Aucune fonctionnalité antérieure retirée.
