@@ -96,7 +96,7 @@ a = Analysis(
       + pystray_datas + plyer_datas
       + socketio_datas + engineio_datas + pysocketio_datas + simplews_datas + wsproto_datas
       + h11_datas + bidict_datas,
-    hiddenimports=['flask', 'werkzeug', 'jinja2'] + webview_hiddenimports
+    hiddenimports=['flask', 'werkzeug', 'jinja2', 'updater'] + webview_hiddenimports
                   + qrcode_hiddenimports + pil_hiddenimports + crypto_hiddenimports
                   + certifi_hiddenimports + pyzbar_hiddenimports
                   + pystray_hiddenimports + plyer_hiddenimports

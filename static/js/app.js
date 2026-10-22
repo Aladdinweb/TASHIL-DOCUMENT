@@ -1952,6 +1952,7 @@ function isNewer(remote, current) {
 }
 
 async function checkForUpdate(ids) {
+  if (await tryZeroTouch(ids)) return;
   const statusEl = document.getElementById(ids.status);
   const banner = document.getElementById(ids.banner);
   // v2.9.5 bug fix: a re-check always fully resets both the status line
@@ -2400,3 +2401,105 @@ function escapeHtml(str) {
 }
 
 boot();
+// ===== À AJOUTER À LA FIN de static/js/app.js (rien d'autre à modifier dans le HTML) =====
+// Bannière « mise à jour disponible » + bouton « Mettre à jour maintenant ».
+// Le serveur local DÉTECTE seul (au lancement, puis toutes les 6 h) ; rien n'est
+// téléchargé ni appliqué avant le clic. Textes toujours insérés via textContent.
+(function tashilUpdateBanner() {
+  const css = `
+  #upd-banner{position:fixed;right:16px;bottom:16px;z-index:99999;max-width:360px;
+    background:#16202e;color:#eef3f9;border:1px solid #2f7de1;border-radius:14px;
+    padding:14px 16px;box-shadow:0 8px 28px rgba(0,0,0,.35);font:14px/1.4 system-ui,sans-serif;
+    display:none}
+  #upd-banner .t{font-weight:700;margin-bottom:2px}
+  #upd-banner .m{opacity:.85;margin-bottom:10px}
+  #upd-banner .r{display:flex;gap:8px;justify-content:flex-end}
+  #upd-banner button{border:0;border-radius:9px;padding:8px 13px;font:inherit;cursor:pointer}
+  #upd-banner .go{background:#2f7de1;color:#fff;font-weight:600}
+  #upd-banner .go[disabled]{opacity:.6;cursor:default}
+  #upd-banner .later{background:transparent;color:#b8c6d8}
+  @media (max-width:899px){#upd-banner{bottom:76px;left:12px;right:12px;max-width:none}}`;
+  const st = document.createElement("style"); st.textContent = css; document.head.appendChild(st);
+
+  const box = document.createElement("div"); box.id = "upd-banner"; box.setAttribute("role", "status");
+  const t = document.createElement("div"); t.className = "t";
+  const m = document.createElement("div"); m.className = "m";
+  const row = document.createElement("div"); row.className = "r";
+  const later = document.createElement("button"); later.className = "later"; later.textContent = "Plus tard";
+  const go = document.createElement("button"); go.className = "go"; go.textContent = "Mettre à jour maintenant";
+  row.append(later, go); box.append(t, m, row);
+  (document.body || document.documentElement).appendChild(box);
+
+  let dismissed = null, applying = false;     // « Plus tard » = jusqu'à la prochaine version détectée
+
+  function show(title, msg, canAct) {
+    t.textContent = title; m.textContent = msg;
+    row.style.display = canAct ? "flex" : "none";
+    box.style.display = "block";
+  }
+  window.renderUpdateBanner = function (s) {
+    if (applying) return;
+    if (s.state === "available" && dismissed !== s.latest) {
+      show(s.kind === "app" ? "Mise à jour disponible" : "Amélioration disponible",
+           s.kind === "app" ? `Nouvelle version v${s.latest}. L'application redémarrera automatiquement.`
+                            : `Interface v${s.latest}. Aucun redémarrage nécessaire.`, true);
+    } else if (s.state !== "available") {
+      box.style.display = "none";
+    }
+  };
+
+  later.onclick = () => { dismissed = (window.__updLatest || null); box.style.display = "none"; };
+
+  go.onclick = async () => {
+    applying = true; go.disabled = true; later.style.display = "none";
+    show("Mise à jour en cours", "Téléchargement...", false);
+    try { await fetch("/api/update/apply", { method: "POST", cache: "no-store" }); } catch (e) {}
+    for (let i = 0; i < 200; i++) {                 // ~5 min max (téléchargement d'un .exe)
+      await new Promise(r => setTimeout(r, 1500));
+      let s;
+      try { s = await fetch("/api/update/status", { cache: "no-store" }).then(r => r.json()); }
+      catch (e) { show("Redémarrage de TASHIL", "L'application se relance...", false); return; }
+      if (s.message) m.textContent = s.message;
+      if (s.state === "front_applied") { setTimeout(() => location.reload(), 1000); return; }
+      if (s.state === "restarting") { t.textContent = "Redémarrage de TASHIL"; continue; }
+      if (s.state === "error" || s.state === "up_to_date") {
+        applying = false; go.disabled = false; later.style.display = "";
+        t.textContent = s.state === "error" ? "Mise à jour impossible" : "Déjà à jour";
+        row.style.display = s.state === "error" ? "flex" : "none";
+        return;
+      }
+    }
+  };
+
+  async function poll() {
+    if (applying) return;
+    try {
+      const s = await fetch("/api/update/status", { cache: "no-store" }).then(r => r.json());
+      window.__updLatest = s.latest; window.renderUpdateBanner(s);
+    } catch (e) {}
+  }
+  setTimeout(poll, 8000); setInterval(poll, 30000);   // endpoint LOCAL : coût nul pour GitHub
+})();
+
+// ===== Bouton existant « Vérifier les mises à jour » =====
+// Avant "async function checkForUpdate(ids) {" ajouter cette fonction :
+async function tryZeroTouch(ids) {
+  const statusEl = document.getElementById(ids.status);
+  try {
+    const r = await fetch("/api/update/check", { method: "POST", cache: "no-store" });
+    if (!r.ok) return false;                         // ancien serveur : ancien flux
+  } catch (e) { return false; }
+  statusEl.textContent = "Recherche en cours...";
+  for (let i = 0; i < 40; i++) {
+    await new Promise(res => setTimeout(res, 1000));
+    let s;
+    try { s = await fetch("/api/update/status", { cache: "no-store" }).then(r => r.json()); }
+    catch (e) { return false; }
+    if (s.state === "checking") continue;
+    statusEl.textContent = s.state === "available" ? "Mise à jour disponible — voir la notification." : (s.message || "");
+    if (window.renderUpdateBanner) { window.__updLatest = s.latest; window.renderUpdateBanner(s); }
+    return true;
+  }
+  return true;
+}
+// puis TOUT AU DÉBUT du corps de checkForUpdate(ids) :   if (await tryZeroTouch(ids)) return;

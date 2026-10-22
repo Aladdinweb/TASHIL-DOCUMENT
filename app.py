@@ -215,12 +215,20 @@ _LEGACY_ARCHIVE_ENTRANT = os.path.join(BASE_DIR, "archives", "Courrier_Entrant")
 os.makedirs(PROFILES_DIR, exist_ok=True)
 
 APP_ROOT = os.path.dirname(os.path.abspath(__file__))
-APP_VERSION = "2.9.10"
-GITHUB_REPO = "Aladdinweb/TASHIL-ES"  # used by the in-app OTA update checker
+APP_VERSION = "2.10.0"
+GITHUB_REPO = "Aladdinweb/TASHIL-RELEASES"  # used by the in-app OTA update checker
+
+import updater  # v2.10.0 — Zero-Touch updater (updater.py, même dossier)
+
+# Si un correctif d'interface (tashil_front.zip) a été appliqué, Flask sert
+# ~/TASHIL_DATA/front_override/... en priorité ; sinon dossiers embarqués.
+_STATIC_DIR, _TEMPLATES_DIR = updater.resolve_front_dirs(
+    BASE_DIR, APP_VERSION,
+    os.path.join(APP_ROOT, "static"), os.path.join(APP_ROOT, "templates"))
 
 app = Flask(__name__,
-            template_folder=os.path.join(APP_ROOT, "templates"),
-            static_folder=os.path.join(APP_ROOT, "static"))
+            template_folder=_TEMPLATES_DIR,
+            static_folder=_STATIC_DIR)
 app.config["MAX_CONTENT_LENGTH"] = 64 * 1024 * 1024  # 64MB upload cap
 
 # v2.9.0: LOCAL real-time channel between this process and its own UI
@@ -3621,6 +3629,48 @@ def start_bridge_loop():
 # Started at import time so it also runs when the app is imported by the
 # desktop launcher (desktop_launcher.py) and not only via `python app.py`.
 start_bridge_loop()
+
+
+# --------------------------------------------------------------------------- #
+# v2.10.0 — Zero-Touch updater : détection automatique, application sur clic
+# --------------------------------------------------------------------------- #
+def _switch_front_live(static_dir, templates_dir):
+    """Repointe Flask sur le nouveau front SANS redémarrer : les prochaines
+    requêtes (rechargement de la page) servent le nouveau code."""
+    import jinja2
+    app.static_folder = static_dir
+    app.template_folder = templates_dir
+    app.jinja_env.loader = jinja2.FileSystemLoader(templates_dir)
+    app.jinja_env.cache.clear()
+
+
+updater.configure(
+    repo=GITHUB_REPO, app_version=APP_VERSION, base_dir=BASE_DIR,
+    bundled_static=os.path.join(APP_ROOT, "static"),
+    bundled_templates=os.path.join(APP_ROOT, "templates"),
+    on_front_applied=_switch_front_live,
+)
+
+
+@app.route("/api/update/status", methods=["GET"])
+def api_update_status():
+    # Volontairement accessible verrouillé (écran de verrouillage / onboarding).
+    return jsonify(updater.get_status())
+
+
+@app.route("/api/update/check", methods=["POST"])
+def api_update_check():
+    return jsonify(updater.trigger_manual_check())
+
+
+@app.route("/api/update/apply", methods=["POST"])
+def api_update_apply():
+    # Appelée uniquement par le bouton « Mettre à jour maintenant » ; ne fait
+    # rien tant qu'aucune mise à jour n'a été détectée (état "available").
+    return jsonify(updater.trigger_apply())
+
+
+updater.start_background_check()
 
 
 if __name__ == "__main__":
