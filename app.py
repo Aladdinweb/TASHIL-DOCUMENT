@@ -215,7 +215,7 @@ _LEGACY_ARCHIVE_ENTRANT = os.path.join(BASE_DIR, "archives", "Courrier_Entrant")
 os.makedirs(PROFILES_DIR, exist_ok=True)
 
 APP_ROOT = os.path.dirname(os.path.abspath(__file__))
-APP_VERSION = "2.10.0"
+APP_VERSION = "2.11.0"
 GITHUB_REPO = "Aladdinweb/TASHIL-RELEASES"  # used by the in-app OTA update checker
 
 import updater  # v2.10.0 — Zero-Touch updater (updater.py, même dossier)

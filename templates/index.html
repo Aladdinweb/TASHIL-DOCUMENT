@@ -7,10 +7,23 @@
 <link rel="manifest" href="/manifest.json">
 <link rel="icon" href="/static/assets/logo.png">
 <link rel="apple-touch-icon" href="/static/assets/logo.png">
-<meta name="theme-color" content="#0F1419">
+<meta name="theme-color" content="#070B12">
+<script>try{if(sessionStorage.getItem("v3splash")){document.documentElement.classList.add("v3-nosplash")}else{sessionStorage.setItem("v3splash","1")}}catch(e){}</script>
 <link rel="stylesheet" href="/static/css/style.css">
+<link rel="stylesheet" href="/static/css/v3.css">
 </head>
 <body>
+
+<!-- v3.0.0 — Splash screen (se retire seul : animation CSS + nettoyage v3.js) -->
+<div id="v3-splash" aria-hidden="true">
+  <div class="v3-s-logo">
+    <span class="v3-s-ring"></span><span class="v3-s-ring r2"></span>
+    <img src="/static/assets/logo.png" alt="" onerror="this.style.display='none'">
+  </div>
+  <h1 class="v3-s-title">TASHIL DOCUMENT HUB</h1>
+  <div class="v3-s-sub">ILINE TECH</div>
+  <div class="v3-s-bar"><i></i></div>
+</div>
 
 <!-- Toast notifications -->
 <div id="toast-container" class="toast-container"></div>
@@ -557,5 +570,6 @@
 <script src="/static/js/vendor/pdfjs/pdf.min.js"></script>
 <script src="/static/js/vendor/mammoth.browser.min.js"></script>
 <script src="/static/js/app.js"></script>
+<script src="/static/js/v3.js"></script>
 </body>
 </html>
